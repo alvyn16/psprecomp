@@ -283,7 +283,8 @@ const char *a_mnemonic(a_op op) {
 /* ---- helpers ------------------------------------------------------------- */
 
 static void set_branch(a_insn *in, uint32_t addr, int likely) {
-    in->target        = addr + 4 + (uint32_t)(SIMM16(in->raw) << 2);
+    /* Cast before shifting: a negative SIMM16 shifted as int is undefined. */
+    in->target        = addr + 4 + ((uint32_t)SIMM16(in->raw) << 2);
     in->has_target    = 1;
     in->is_branch     = 1;
     in->has_delay_slot= 1;

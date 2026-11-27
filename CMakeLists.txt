@@ -16,6 +16,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(psprecomp C)
 
+include(GNUInstallDirs)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -108,6 +110,33 @@ endif()
 # --- the recompiler -----------------------------------------------------------
 
 add_subdirectory(tools/allegrexrecomp)
+
+# --- install ------------------------------------------------------------------
+# A Linux host consumes psprecomp through pkg-config: a static runtime, the
+# recompiler library/CLI and the headers, all under one prefix.
+set(PSPRECOMP_VERSION "0.6.0")
+if(TARGET PkgConfig::SDL2)
+    set(PSPRECOMP_PC_REQUIRES "sdl2")
+else()
+    set(PSPRECOMP_PC_REQUIRES "")
+endif()
+configure_file(cmake/psprecomp.pc.in ${CMAKE_CURRENT_BINARY_DIR}/psprecomp.pc @ONLY)
+
+install(TARGETS psprecomp allegrex_core allegrexrecomp
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+if(TARGET psprecomp_interp)
+    install(TARGETS psprecomp_interp ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/psprecomp
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h")
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tools/allegrexrecomp/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/psprecomp
+    FILES_MATCHING PATTERN "*.h")
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/psprecomp.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # --- tests (only when psprecomp is the top-level project, not a submodule) -----
 

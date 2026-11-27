@@ -30,5 +30,36 @@ jobs:
         run: cmake --build build --config Release --parallel
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Window and audio smoke (headless SDL2)
+        if: runner.os == 'Linux'
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: ctest --test-dir build -C Release -R "window|audio_sink" --output-on-failure
+      - name: Installed-prefix consumer
+        if: runner.os == 'Linux'
+        run: ctest --test-dir build -C Release -R "install_" --output-on-failure
       - name: Repeat scheduler regression
         run: ctest --test-dir build -C Release -R "scheduler|thread_" --repeat until-fail:20 --output-on-failure
+
+  sanitizers:
+    name: ubuntu / asan+ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev pkg-config
+      - name: Configure
+        run: >-
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-san --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: ctest --test-dir build-san -C Debug --output-on-failure
