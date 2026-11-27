@@ -69,8 +69,14 @@ static void hle_LibcGettimeofday(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* General-purpose I/O pins, wired to the debug board. Nothing is connected. */
-static void hle_GetGPI(void) { psp_ret(0); }
+/* General-purpose I/O pins, wired to the debug board. Nothing is connected.
+ * GPO is write-only on hardware; keeping the last value lets a later GetGPO
+ * answer consistently, and stops the engine's start-up write from being
+ * reported as a missing firmware call. */
+static uint32_t g_gpo;
+static void hle_GetGPI(void)  { psp_ret(0); }
+static void hle_SetGPO(void)  { g_gpo = psp_arg(0) & 0xFFu; psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_GetGPO(void)  { psp_ret(g_gpo); }
 
 /* ---- StdioForUser -------------------------------------------------------- */
 /* These return the file descriptors, which sceIoWrite then recognises. */
@@ -397,6 +403,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);
     psp_hle_register(0x37FB5C42, "UtilsForUser", "sceKernelGetGPI",           hle_GetGPI);
+    psp_hle_register(0x6AD345D7, "UtilsForUser", "sceKernelSetGPO",           hle_SetGPO);
+    psp_hle_register(0xAF3616C0, "UtilsForUser", "sceKernelGetGPO",           hle_GetGPO);
 
     psp_hle_register(0x172D316E, "StdioForUser", "sceKernelStdin",  hle_Stdin);
     psp_hle_register(0xA6BAB2E9, "StdioForUser", "sceKernelStdout", hle_Stdout);
