@@ -227,16 +227,25 @@ verified.
 
 ## Getting Started
 
-Requires CMake and a C compiler (MSVC on Windows; gcc/clang elsewhere). The core
-has **no external dependencies** — a fresh clone builds with nothing installed.
+This fork is Linux-first. The runtime core still has **no external
+dependencies** — a fresh clone configures with nothing installed. On Linux the
+SDL2 window is enabled by default when SDL2 is available, so a game can actually
+be played; without it the build still succeeds and `psp_window_start()` reports
+that no window is available. The Win32/GDI/XInput backend is retained for
+Windows and needs no extra packages.
 
 ```bash
-git clone https://github.com/sp00nznet/psprecomp
+sudo apt-get install -y build-essential cmake libsdl2-dev pkg-config   # Linux
+git clone https://github.com/alvyn16/psprecomp
 cd psprecomp
 cmake -S . -B build
 cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
+
+Pass `-DPSPRECOMP_SDL2_WINDOW=OFF` for a strictly dependency-free core build, or
+`-DPSPRECOMP_REAL_THREADS=ON` to run a game that stalls on a guest semaphore.
+See [docs/LINUX.md](docs/LINUX.md) for the Linux host setup and controls.
 
 ```
 allegrexrecomp info    <file>                    identify any layer of the stack

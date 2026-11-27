@@ -63,15 +63,30 @@ if(UNIX)
     target_link_libraries(psprecomp PUBLIC m)
 endif()
 
-# The core has no dependencies by default. On non-Windows hosts the window can
-# optionally use SDL2 instead of returning -1; a game repo opts in when it wants
-# to play on Linux/macOS.
-option(PSPRECOMP_SDL2_WINDOW "Use SDL2 for the window backend on non-Windows hosts" OFF)
+# Linux is the primary host for this fork. The runtime core stays dependency
+# free, but a normal non-Windows build gets a playable window by default.
+# Windows keeps its Win32/GDI/XInput backend and needs no SDL2.
+if(WIN32)
+    option(PSPRECOMP_SDL2_WINDOW "Use SDL2 for the window backend" OFF)
+else()
+    option(PSPRECOMP_SDL2_WINDOW "Use SDL2 for the window backend" ON)
+endif()
 if(PSPRECOMP_SDL2_WINDOW AND NOT WIN32)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
-    target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2_WINDOW=1)
-    target_link_libraries(psprecomp PUBLIC PkgConfig::SDL2)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SDL2 QUIET IMPORTED_TARGET sdl2)
+    endif()
+    if(TARGET PkgConfig::SDL2)
+        target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2_WINDOW=1)
+        target_link_libraries(psprecomp PUBLIC PkgConfig::SDL2)
+    else()
+        # A fresh clone must still configure with nothing installed. The window
+        # then reports that it cannot open, exactly as before this option.
+        message(WARNING "SDL2 not found: building without a playable window. "
+                        "Install libsdl2-dev and pkg-config, or pass "
+                        "-DPSPRECOMP_SDL2_WINDOW=OFF to silence this warning.")
+        set(PSPRECOMP_SDL2_WINDOW OFF)
+    endif()
 endif()
 
 # Real scheduling is experimental; the existing inline model stays the default.
