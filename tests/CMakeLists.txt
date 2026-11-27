@@ -68,6 +68,10 @@ target_compile_definitions(test_oracle_diff PRIVATE
   ORACLE_RUNTIME="${CMAKE_BINARY_DIR}/libpsprecomp.a")
 add_test(NAME oracle_diff COMMAND test_oracle_diff)
 
+add_executable(test_window test_window.c)
+target_link_libraries(test_window PRIVATE psprecomp)
+add_test(NAME window COMMAND test_window)
+
 add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)

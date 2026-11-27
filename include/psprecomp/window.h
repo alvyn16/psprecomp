@@ -30,4 +30,9 @@ int psp_window_start(const char *title, int scale);
 /* Nonzero once the user has closed the window. */
 int psp_window_closed(void);
 
+/* Close the window, wait for its host thread and release the backend. Safe to
+ * call when no window was opened; after it, psp_window_start() may be called
+ * again. A game host should call this before it tears down its own runtime. */
+void psp_window_stop(void);
+
 #endif
