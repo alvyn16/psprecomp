@@ -711,6 +711,17 @@ int a_scan_data_pointers(const a_analysis *an,
     return found;
 }
 
+int a_keep_text_seeds(const a_analysis *an, uint32_t *seeds, int n) {
+    if (!an->scan_size) return n;
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        const uint32_t s = seeds[i];
+        if (s >= an->scan_base && s - an->scan_base < an->scan_size)
+            seeds[kept++] = s;
+    }
+    return kept;
+}
+
 void a_analysis_free(a_analysis *an) {
     free(an->funcs);
     free(an->imports);

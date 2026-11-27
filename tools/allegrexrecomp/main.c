@@ -595,6 +595,10 @@ static int load_and_discover(const char *path, uint32_t base, uint8_t **out_relo
                 nptr = a_scan_data_pointers(an, b->data + data_off, region_len,
                                             seeds + nseeds, avail);
                 if (nptr > avail) nptr = avail;
+                /* A word in .data that decodes is not evidence of code. Keep
+                 * only pointers into .text; the walk from those entries still
+                 * finds static constructors placed outside it. */
+                nptr = a_keep_text_seeds(an, seeds + nseeds, nptr);
                 nseeds += nptr;
                 if (out_scanned) *out_scanned = 1;
             }
