@@ -45,8 +45,22 @@ at 60 Hz.
 | F11 | — | Toggle fullscreen |
 
 Keys are only forwarded while the window has input focus; the controller is
-always sampled. The SDL2 renderer requests VSync for natural 60 Hz pacing and
-falls back to a fixed 16 ms tick with a software renderer.
+always sampled. Controllers are opened on hotplug and closed when removed, and
+their name/GUID is logged on open. The SDL2 renderer requests VSync for natural
+60 Hz pacing and falls back to a fixed 16 ms tick with a software renderer.
+
+A host can rebind either input source with `psp_window_set_button_map()`: the
+twelve slots are d-pad, the four face buttons, L/R, Start and Select, and the
+values are `SceCtrlData` button bits. Pass `NULL` to restore the defaults. The
+map is copied, so call it before `psp_window_start()`.
+
+## Audio
+
+The SAS mixer always writes its stereo grain into guest memory. When the SDL2
+window is enabled it also registers `psp_audio_sink_set()` and opens a 44.1 kHz
+stereo device, so the same frames are played on Linux. If no audio device is
+available the window still opens and the mix remains in memory — audio failure
+is never fatal. A different host can register its own sink without SDL2.
 
 `psp_window_closed()` reports that the user closed the window. A game host should
 call `psp_window_stop()` before tearing down its runtime: it signals the window
@@ -55,8 +69,8 @@ thread, joins it, and only then calls `SDL_Quit()`. Calling it twice is safe, an
 
 ## What is not here
 
-The window presents pixels and input only. Firmware is still implemented by the
-runtime's HLE layer; audio is mixed but not played to a Linux device, and there
-is no ImGui frontend or save-state UI. The Windows backend remains in
+The window presents pixels, input and audio. Firmware is still implemented by
+the runtime's HLE layer; there is no ImGui frontend or save-state UI. The
+Windows backend remains in
 `src/window.c` behind `#ifdef _WIN32` and is checked on a best-effort basis in
 CI; it is no longer the primary target.

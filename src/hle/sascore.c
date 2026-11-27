@@ -90,6 +90,14 @@ void psp_sas_init(void) { psp_sas_reset(); }
 uint64_t psp_sas_frames(void)   { return g_frames_rendered; }
 uint64_t psp_sas_nonzero(void)  { return g_samples_nonzero; }
 
+static psp_audio_sink_fn g_sink;
+static void *g_sink_user;
+
+void psp_audio_sink_set(psp_audio_sink_fn fn, void *user) {
+    g_sink = fn;
+    g_sink_user = user;
+}
+
 static int clamp16(int v) {
     if (v >  32767) return  32767;
     if (v < -32768) return -32768;
@@ -346,11 +354,14 @@ static void hle_GetEnvelopeHeight(void) {
 
 static void mix_to_guest(uint32_t out_addr, int add) {
     int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
+    int16_t host[SAS_MAX_GRAIN * 2];
     uint32_t n = g_grain;
     render(l, r, n);
 
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
+        host[i * 2] = (int16_t)sl;
+        host[i * 2 + 1] = (int16_t)sr;
         if (add) {
             sl = clamp16(sl + (int16_t)psp_read16(out_addr + i * 4));
             sr = clamp16(sr + (int16_t)psp_read16(out_addr + i * 4 + 2));
@@ -359,6 +370,7 @@ static void mix_to_guest(uint32_t out_addr, int add) {
         psp_write16(out_addr + i * 4 + 2, (uint16_t)(int16_t)sr);
         if (sl || sr) g_samples_nonzero++;
     }
+    if (g_sink) g_sink(host, n, g_sample_rate, g_sink_user);
     g_frames_rendered++;
     if (sas_trace() && (g_frames_rendered <= 20 || g_frames_rendered % 64 == 0)) {
         int playing = 0;

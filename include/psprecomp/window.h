@@ -24,9 +24,25 @@
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
 
+#include <stdint.h>
+
 /* Open the window, `scale` times the PSP's 480x272, or with `scale` 0 as
  * large as fits the screen. Returns 0 if it opened. */
 int psp_window_start(const char *title, int scale);
+
+/* Button slots for the rebindable map: order is d-pad, face buttons,
+ * shoulders, Start and Select. Values are PSP SceCtrlData bits. */
+enum {
+    PSP_WINDOW_UP = 0, PSP_WINDOW_RIGHT, PSP_WINDOW_DOWN, PSP_WINDOW_LEFT,
+    PSP_WINDOW_CROSS, PSP_WINDOW_CIRCLE, PSP_WINDOW_SQUARE, PSP_WINDOW_TRIANGLE,
+    PSP_WINDOW_L, PSP_WINDOW_R, PSP_WINDOW_START, PSP_WINDOW_SELECT,
+    PSP_WINDOW_BUTTON_COUNT
+};
+
+/* Override the keyboard/controller -> PSP button mapping. The array is copied;
+ * pass NULL to restore the defaults above. A host UI can use this for
+ * remapping without the toolkit depending on a GUI library. */
+void psp_window_set_button_map(const uint32_t map[PSP_WINDOW_BUTTON_COUNT]);
 
 /* Nonzero once the user has closed the window. */
 int psp_window_closed(void);

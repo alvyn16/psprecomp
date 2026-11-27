@@ -3,6 +3,8 @@
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
 
+#include <string.h>
+
 #define W 480
 #define H 272
 
@@ -13,6 +15,20 @@ enum {
     B_L = 0x0100, B_R = 0x0200,
     B_TRIANGLE = 0x1000, B_CIRCLE = 0x2000, B_CROSS = 0x4000, B_SQUARE = 0x8000
 };
+/* Default button map, indexed by the slots in window.h. Both backends read it,
+ * so a rebind applies to keyboard and controller alike. */
+static const uint32_t DEFAULT_MAP[PSP_WINDOW_BUTTON_COUNT] = {
+    B_UP, B_RIGHT, B_DOWN, B_LEFT,
+    B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE,
+    B_L, B_R, B_START, B_SELECT
+};
+static uint32_t g_button_map[PSP_WINDOW_BUTTON_COUNT];
+
+void psp_window_set_button_map(const uint32_t map[PSP_WINDOW_BUTTON_COUNT]) {
+    if (map) memcpy(g_button_map, map, sizeof g_button_map);
+    else     memcpy(g_button_map, DEFAULT_MAP, sizeof g_button_map);
+}
+
 
 #ifdef _WIN32
 
@@ -28,34 +44,32 @@ static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 
 static uint32_t keyboard(void) {
-    static const struct { int vk; uint32_t bit; } K[] = {
-        { VK_UP, B_UP }, { VK_RIGHT, B_RIGHT }, { VK_DOWN, B_DOWN }, { VK_LEFT, B_LEFT },
-        { 'Z', B_CROSS }, { 'X', B_CIRCLE }, { 'A', B_SQUARE }, { 'S', B_TRIANGLE },
-        { 'Q', B_L }, { 'W', B_R }, { VK_RETURN, B_START }, { VK_BACK, B_SELECT },
+    static const int K[] = {
+        VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT,
+        'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK
     };
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
-        if (GetAsyncKeyState(K[i].vk) & 0x8000) b |= K[i].bit;
+        if (GetAsyncKeyState(K[i]) & 0x8000) b |= g_button_map[i];
     return b;
 }
 
 /* The first XInput controller, if one is connected. */
 static uint32_t pad(uint8_t *ax, uint8_t *ay) {
-    static const struct { WORD x; uint32_t bit; } P[] = {
-        { XINPUT_GAMEPAD_DPAD_UP, B_UP }, { XINPUT_GAMEPAD_DPAD_RIGHT, B_RIGHT },
-        { XINPUT_GAMEPAD_DPAD_DOWN, B_DOWN }, { XINPUT_GAMEPAD_DPAD_LEFT, B_LEFT },
-        { XINPUT_GAMEPAD_A, B_CROSS }, { XINPUT_GAMEPAD_B, B_CIRCLE },
-        { XINPUT_GAMEPAD_X, B_SQUARE }, { XINPUT_GAMEPAD_Y, B_TRIANGLE },
-        { XINPUT_GAMEPAD_LEFT_SHOULDER, B_L }, { XINPUT_GAMEPAD_RIGHT_SHOULDER, B_R },
-        { XINPUT_GAMEPAD_START, B_START }, { XINPUT_GAMEPAD_BACK, B_SELECT },
+    static const WORD P[] = {
+        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_RIGHT,
+        XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
+        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+        XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_BACK
     };
     XINPUT_STATE s;
     if (XInputGetState(0, &s) != ERROR_SUCCESS) return 0;
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
-        if (s.Gamepad.wButtons & P[i].x) b |= P[i].bit;
-    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_L;
-    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_R;
+        if (s.Gamepad.wButtons & P[i]) b |= g_button_map[i];
+    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= g_button_map[PSP_WINDOW_L];
+    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= g_button_map[PSP_WINDOW_R];
     /* The PSP stick is 0..255 with 128 at rest and y growing downwards. */
     const int lx = s.Gamepad.sThumbLX, ly = s.Gamepad.sThumbLY;
     if (lx * lx + ly * ly > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE * XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
@@ -158,6 +172,7 @@ static DWORD WINAPI window_main(LPVOID arg) {
 }
 
 int psp_window_start(const char *title, int scale) {
+    psp_window_set_button_map(NULL);           /* host overrides come before start */
     if (title) g_title = title;
     g_scale = scale;
     HANDLE ready = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -193,15 +208,48 @@ static uint32_t g_px[W * H];
 static SDL_GameController *g_pad;
 static SDL_Thread *g_thread;
 static int g_focused;
+static SDL_JoystickID g_pad_instance = -1;
+static SDL_mutex *g_audio_lock;
+static SDL_AudioDeviceID g_audio_dev;
+static int16_t g_audio_ring[8192 * 2];
+static size_t g_audio_head, g_audio_tail;   /* indices in frames */
+
+/* The SAS mixer calls this with the same stereo grain it writes to guest
+ * memory. Buffer it for SDL's audio thread; on overrun the oldest frames are
+ * dropped rather than blocking the guest. */
+static void audio_sink(const int16_t *stereo, uint32_t frames, uint32_t rate, void *user) {
+    (void)rate; (void)user;
+    if (!g_audio_lock || !g_audio_dev) return;
+    SDL_LockMutex(g_audio_lock);
+    for (uint32_t i = 0; i < frames; i++) {
+        if ((g_audio_head + 1) % 8192 == g_audio_tail) g_audio_tail = (g_audio_tail + 1) % 8192;
+        g_audio_ring[g_audio_head * 2]     = stereo[i * 2];
+        g_audio_ring[g_audio_head * 2 + 1] = stereo[i * 2 + 1];
+        g_audio_head = (g_audio_head + 1) % 8192;
+    }
+    SDL_UnlockMutex(g_audio_lock);
+}
+
+static void audio_callback(void *user, Uint8 *stream, int len) {
+    (void)user;
+    int16_t *out = (int16_t *)stream;
+    size_t want = (size_t)len / 4;            /* stereo int16 frames */
+    if (!g_audio_lock) { memset(stream, 0, (size_t)len); return; }
+    SDL_LockMutex(g_audio_lock);
+    for (size_t i = 0; i < want; i++) {
+        if (g_audio_tail == g_audio_head) { out[i * 2] = out[i * 2 + 1] = 0; continue; }
+        out[i * 2]     = g_audio_ring[g_audio_tail * 2];
+        out[i * 2 + 1] = g_audio_ring[g_audio_tail * 2 + 1];
+        g_audio_tail = (g_audio_tail + 1) % 8192;
+    }
+    SDL_UnlockMutex(g_audio_lock);
+}
 
 static uint32_t keyboard(void) {
-    static const struct { SDL_Scancode sc; uint32_t bit; } K[] = {
-        { SDL_SCANCODE_UP, B_UP }, { SDL_SCANCODE_RIGHT, B_RIGHT },
-        { SDL_SCANCODE_DOWN, B_DOWN }, { SDL_SCANCODE_LEFT, B_LEFT },
-        { SDL_SCANCODE_Z, B_CROSS }, { SDL_SCANCODE_X, B_CIRCLE },
-        { SDL_SCANCODE_A, B_SQUARE }, { SDL_SCANCODE_S, B_TRIANGLE },
-        { SDL_SCANCODE_Q, B_L }, { SDL_SCANCODE_W, B_R },
-        { SDL_SCANCODE_RETURN, B_START }, { SDL_SCANCODE_BACKSPACE, B_SELECT },
+    static const SDL_Scancode K[] = {
+        SDL_SCANCODE_UP, SDL_SCANCODE_RIGHT, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT,
+        SDL_SCANCODE_Z, SDL_SCANCODE_X, SDL_SCANCODE_A, SDL_SCANCODE_S,
+        SDL_SCANCODE_Q, SDL_SCANCODE_W, SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE
     };
     /* Keys belong to the focused window: a game must not keep moving while
      * the player is typing into another application. The controller has no
@@ -210,28 +258,43 @@ static uint32_t keyboard(void) {
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
-        if (keys[K[i].sc]) b |= K[i].bit;
+        if (keys[K[i]]) b |= g_button_map[i];
     return b;
 }
 
 /* The first game controller, opened once on the window thread. */
 static uint32_t pad(uint8_t *ax, uint8_t *ay) {
-    if (SDL_NumJoysticks() == 0 || !SDL_IsGameController(0)) return 0;
-    if (!g_pad) g_pad = SDL_GameControllerOpen(0);
+    if (!g_pad) {
+        for (int i = 0; i < SDL_NumJoysticks(); i++) {
+            if (!SDL_IsGameController(i)) continue;
+            g_pad = SDL_GameControllerOpen(i);
+            if (g_pad) {
+                SDL_Joystick *j = SDL_GameControllerGetJoystick(g_pad);
+                g_pad_instance = j ? SDL_JoystickInstanceID(j) : -1;
+                char guid[33] = { 0 };
+                if (j) SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(j), guid, sizeof guid);
+                fprintf(stderr, "psprecomp: controller '%s' guid %s\n",
+                        SDL_GameControllerName(g_pad) ? SDL_GameControllerName(g_pad) : "?", guid);
+                break;
+            }
+        }
+    }
     if (!g_pad) return 0;
-    static const struct { SDL_GameControllerButton btn; uint32_t bit; } P[] = {
-        { SDL_CONTROLLER_BUTTON_DPAD_UP, B_UP }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, B_RIGHT },
-        { SDL_CONTROLLER_BUTTON_DPAD_DOWN, B_DOWN }, { SDL_CONTROLLER_BUTTON_DPAD_LEFT, B_LEFT },
-        { SDL_CONTROLLER_BUTTON_A, B_CROSS }, { SDL_CONTROLLER_BUTTON_B, B_CIRCLE },
-        { SDL_CONTROLLER_BUTTON_X, B_SQUARE }, { SDL_CONTROLLER_BUTTON_Y, B_TRIANGLE },
-        { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, B_L }, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, B_R },
-        { SDL_CONTROLLER_BUTTON_START, B_START }, { SDL_CONTROLLER_BUTTON_BACK, B_SELECT },
+    static const SDL_GameControllerButton P[] = {
+        SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+        SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+        SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_B,
+        SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_Y,
+        SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        SDL_CONTROLLER_BUTTON_START, SDL_CONTROLLER_BUTTON_BACK
     };
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
-        if (SDL_GameControllerGetButton(g_pad, P[i].btn)) b |= P[i].bit;
-    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8192) b |= B_L;
-    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8192) b |= B_R;
+        if (SDL_GameControllerGetButton(g_pad, P[i])) b |= g_button_map[i];
+    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8192)
+        b |= g_button_map[PSP_WINDOW_L];
+    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8192)
+        b |= g_button_map[PSP_WINDOW_R];
 
     const Sint16 lx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX);
     const Sint16 ly = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY);
@@ -295,6 +358,20 @@ static int SDLCALL window_main(void *arg) {
             } else if (e.type == SDL_WINDOWEVENT) {
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) g_focused = 1;
                 else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) g_focused = 0;
+            } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
+                /* A pad plugged in after boot becomes controller 0 on the next
+                 * poll; opening it here removes the wait for a button press. */
+                if (!g_pad) {
+                    g_pad = SDL_GameControllerOpen(e.cdevice.which);
+                    SDL_Joystick *j = g_pad ? SDL_GameControllerGetJoystick(g_pad) : NULL;
+                    g_pad_instance = j ? SDL_JoystickInstanceID(j) : -1;
+                }
+            } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+                if (g_pad && e.cdevice.which == g_pad_instance) {
+                    SDL_GameControllerClose(g_pad);
+                    g_pad = NULL;
+                    g_pad_instance = -1;
+                }
             } else if (e.type == SDL_KEYDOWN && !e.key.repeat &&
                        e.key.keysym.scancode == SDL_SCANCODE_F11) {
                 const Uint32 flags = SDL_GetWindowFlags(win);
@@ -323,8 +400,19 @@ static int SDLCALL window_main(void *arg) {
     return 0;
 }
 
+static void audio_shutdown(void) {
+    psp_audio_sink_set(NULL, NULL);
+    if (g_audio_dev) {
+        SDL_PauseAudioDevice(g_audio_dev, 1);
+        SDL_CloseAudioDevice(g_audio_dev);
+        g_audio_dev = 0;
+    }
+    if (g_audio_lock) { SDL_DestroyMutex(g_audio_lock); g_audio_lock = NULL; }
+}
+
 int psp_window_start(const char *title, int scale) {
     if (g_thread) return -1;                   /* call psp_window_stop() first */
+    psp_window_set_button_map(NULL);           /* host overrides come before start */
     if (title) g_title = title;
     g_closed = 0;
     g_scale = scale;
@@ -334,11 +422,34 @@ int psp_window_start(const char *title, int scale) {
                       ? m.h * 7 / 10 / H : 1;
         if (g_scale < 1) g_scale = 1;
     }
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) return -1;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS |
+                 SDL_INIT_AUDIO) != 0) return -1;
+
+    /* SAS keeps mixing into guest memory regardless; a host audio device just
+     * makes the same frames audible. No device is not a fatal error. */
+    g_audio_head = g_audio_tail = 0;
+    g_audio_lock = SDL_CreateMutex();
+    if (g_audio_lock) {
+        SDL_AudioSpec want;
+        memset(&want, 0, sizeof want);
+        want.freq = 44100;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 512;
+        want.callback = audio_callback;
+        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (g_audio_dev) {
+            psp_audio_sink_set(audio_sink, NULL);
+            SDL_PauseAudioDevice(g_audio_dev, 0);
+        } else {
+            fprintf(stderr, "psprecomp: no audio device; sound stays mixed in memory\n");
+        }
+    }
+
     SDL_sem *ready = SDL_CreateSemaphore(0);
-    if (!ready) { SDL_Quit(); return -1; }
+    if (!ready) { audio_shutdown(); SDL_Quit(); return -1; }
     SDL_Thread *t = SDL_CreateThread(window_main, "psprecomp-window", ready);
-    if (!t) { SDL_DestroySemaphore(ready); SDL_Quit(); return -1; }
+    if (!t) { SDL_DestroySemaphore(ready); audio_shutdown(); SDL_Quit(); return -1; }
     g_thread = t;
     SDL_SemWait(ready);                       /* window created, or failed */
     SDL_DestroySemaphore(ready);
@@ -350,6 +461,7 @@ void psp_window_stop(void) {
     g_closed = 1;                              /* the loop notices within a frame */
     SDL_WaitThread(g_thread, NULL);
     g_thread = NULL;
+    audio_shutdown();                          /* no callbacks into a torn-down ring */
     SDL_Quit();                                /* only now: the thread is gone */
 }
 
