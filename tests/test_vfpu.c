@@ -206,10 +206,11 @@ static void test_prefixes(void) {
     CHECK_F(out[3], 99.0f, "masked lane is not written");
     CHECK(psp_vfpu_trap_count() == traps, "vector ops with prefixes do not trap");
 
-    /* Matrix ops do not apply prefixes, so a pending one still traps. */
+    /* Matrix ops consume prefixes and apply their narrow last-column effects;
+     * they do not trap on a pending prefix. */
     psp_vfpu_set_prefix(0, 0x55);
     psp_vmmul(0x10, 0x00, 0x04, 4);
-    CHECK(psp_vfpu_trap_count() == traps + 1, "a prefixed matrix op traps");
+    CHECK(psp_vfpu_trap_count() == traps, "a prefixed matrix op does not trap");
     CHECK(!psp_vfpu_prefix_pending(), "and consumes the prefix");
 }
 
@@ -550,6 +551,40 @@ static void test_conversions(void) {
     }
 }
 
+/* Matrix ops have no prefix support: the hardware documentation marks rd, rs
+ * and rt as "Not supported", and the emulator oracle consumes a pending prefix
+ * without applying the general swizzle rules to the matrix. Refusing to write
+ * a value that ignored the prefix is intentional -- a plausible wrong matrix
+ * is worse than a loud trap during bring-up. Lock that decision in. */
+/* Matrix ops apply the narrow prefix effects the hardware documents through
+ * the emulator oracle: source swizzle on the last column, destination mask on
+ * the last column. They are not the general vector prefix path. */
+static void test_matrix_prefixes(void) {
+    psp_vfpu_reset();
+    float a[4][4] = {{0}}, out[4][4];
+    a[0][0] = 1; a[1][0] = 2; a[0][1] = 3; a[1][1] = 4;
+
+    set_matrix(0x08, 2, a);
+    /* vpfxs [x,x,x,x]: every lane of the last source column reads lane 0. */
+    psp_vfpu_set_prefix(0, 0x000000);
+    psp_vmmov(0x00, 0x08, 2);
+    CHECK(!psp_vfpu_prefix_pending(), "the matrix op consumes its prefix");
+    get_matrix(0x00, 2, out);
+    CHECK_F(out[0][0], 1.0f, "first column is unchanged");
+    CHECK_F(out[0][1], 3.0f, "first column row 1 unchanged");
+    CHECK_F(out[1][0], 2.0f, "last column broadcasts lane 0");
+    CHECK_F(out[1][1], 2.0f, "last column broadcasts lane 0 again");
+
+    /* vpfxd mask on lane 0: the last column's first row keeps its old value. */
+    set_matrix(0x08, 2, a);
+    set_matrix(0x00, 2, a);
+    psp_vfpu_set_prefix(2, 1u << 8);
+    psp_vmmov(0x00, 0x08, 2);
+    get_matrix(0x00, 2, out);
+    CHECK_F(out[1][0], 2.0f, "masked destination lane keeps its value");
+    CHECK_F(out[1][1], 4.0f, "unmasked destination lane is written");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -564,6 +599,7 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vmmul_orientation();
+    test_matrix_prefixes();
     test_conversions();
 
     psp_mem_free();

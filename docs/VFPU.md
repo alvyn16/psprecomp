@@ -47,8 +47,11 @@ Named and decoded:
 - `vnop`, `vsync`, `vflush` (`0xFFFF0000`, `0xFFFF0320`, `0xFFFF040D`)
 - **Vector width**, for all four widths, unit-tested
 
-Prefixes are applied by every vector op (src/vfpu.c); the matrix ops trap on a
-pending one instead.
+Prefixes are applied by every vector op (src/vfpu.c). The matrix ops take only
+the narrow prefix effects the hardware and the emulator oracle agree on: source
+swizzle/abs/negate/constants and the destination mask/saturate on the matrix's
+last column, and on the final element of a multiply or transform. They do not
+take the general vector prefix path. `tests/test_vfpu.c` pins both effects.
 
 Everything else in the VFPU encoding space decodes to `A_VFPU_UNKNOWN`.
 
