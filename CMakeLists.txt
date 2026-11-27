@@ -83,6 +83,15 @@ endif()
 
 add_subdirectory(tools/allegrexrecomp)
 
+# --- the interpreter oracle ---------------------------------------------------
+# A separate library: it reuses the toolkit decoder and the runtime state, but
+# a game host does not need to link it unless it is diffing a bring-up problem.
+add_library(psprecomp_interp STATIC src/interp.c)
+target_include_directories(psprecomp_interp PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/allegrexrecomp)
+target_link_libraries(psprecomp_interp PUBLIC psprecomp allegrex_core)
+
 # --- tests (only when psprecomp is the top-level project, not a submodule) -----
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
