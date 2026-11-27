@@ -16,6 +16,7 @@
 #include "psprecomp/cpu.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -671,6 +672,35 @@ static void test_lighting(void) {
     CHECK(pixel(240, 136) == 0xFF000000u, "light across the face: no diffuse: 0x%08X", pixel(240, 136));
 }
 
+/* The SDL2 backend blits sprites through an accelerated renderer and reads
+ * the result back into guest memory. Triangles still use the software path. */
+static void test_gpu_sprite(void) {
+#if defined(PSPRECOMP_SDL2_WINDOW) && !defined(_WIN32)
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    setenv("SDL_AUDIODRIVER", "dummy", 1);
+    CHECK(psp_render_select("gpu") == 0, "gpu backend selectable");
+    if (strcmp(psp_render_current()->name, "gpu") != 0) return;
+    CHECK(psp_render_current()->init(480, 272) == 0, "gpu backend initialises");
+    psp_render_current()->set_target(FB, 512, 3);
+
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 10, 10, 0xFF0000FFu);
+    vertex(1, 60, 60, 0xFF0000FFu);
+    cmd(0x04, (6u << 16) | 2);          /* sprites */
+    end_list();
+    psp_render_current()->finish();      /* flush the GPU target into the FB */
+    CHECK(pixel(20, 20) == 0xFF0000FFu, "gpu sprite lands at 20,20: 0x%08X", pixel(20, 20));
+    CHECK(psp_render_pixels() > 0, "gpu backend counts the pixels it drew");
+
+    psp_render_current()->shutdown();
+    CHECK(psp_render_select("software") == 0, "software restored after gpu test");
+#else
+    CHECK(psp_render_select("gpu") != 0, "no gpu backend without SDL2");
+#endif
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -681,6 +711,7 @@ int main(void) {
     test_triangle();
     test_winding();
     test_clipping();
+    test_gpu_sprite();
     test_transformed_quad();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();

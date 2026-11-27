@@ -27,6 +27,7 @@ static uint64_t g_bad_texels;
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
 void     psp_render_reset_pixels(void) { g_pixels = 0; g_bad_texels = 0; }
+void     psp_render_add_pixels(uint64_t n) { g_pixels += n; }
 uint64_t psp_render_unsupported_texels(void) { return g_bad_texels; }
 
 /* ---- colour helpers ------------------------------------------------------ */
@@ -71,7 +72,7 @@ uint32_t psp_color_expand(uint32_t px, int fmt) {
 }
 
 /* The inverse, for writing 16-bit framebuffers. */
-static uint32_t color_pack(uint32_t c, int fmt) {
+uint32_t psp_color_pack(uint32_t c, int fmt) {
     switch (fmt) {
     case 0:  return (R(c) >> 3) | ((G(c) >> 2) << 5) | ((B(c) >> 3) << 11);
     case 1:  return (R(c) >> 3) | ((G(c) >> 3) << 5) | ((B(c) >> 3) << 10) | ((A(c) >> 7) << 15);
@@ -347,7 +348,7 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
     }
 
     if (bytes == 4) psp_write32(at, c);
-    else            psp_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
+    else            psp_write16(at, (uint16_t)psp_color_pack(c, g_fb_fmt));
     g_pixels++;
 }
 
@@ -475,6 +476,9 @@ const psp_render_backend *psp_render_current(void) { return g_backend; }
 int psp_render_select(const char *name) {
     static const psp_render_backend *const all[] = {
         &psp_render_software, &psp_render_null
+#ifdef PSPRECOMP_SDL2_WINDOW
+        , &psp_render_gpu
+#endif
     };
     if (!name) return -1;
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {

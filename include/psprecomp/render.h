@@ -123,10 +123,19 @@ extern const psp_render_backend psp_render_null;
 /* Pixels written by the active backend -- the proof of life during bring-up. */
 uint64_t psp_render_pixels(void);
 void     psp_render_reset_pixels(void);
+/* Backends add to the same proof-of-life counter. */
+void     psp_render_add_pixels(uint64_t n);
 
 /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
  * formats replicate their high bits into the low ones. */
 uint32_t psp_color_expand(uint32_t px, int fmt);
+/* Pack a 0xAABBGGRR colour into a framebuffer pixel of format 0-3. */
+uint32_t psp_color_pack(uint32_t c, int fmt);
+#if defined(PSPRECOMP_SDL2_WINDOW)
+/* SDL2-accelerated backend; only available when the toolkit was built with
+ * SDL2. Sprites go through the GPU, other primitives use the software path. */
+extern const psp_render_backend psp_render_gpu;
+#endif
 
 /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.
  * Anything undecodable returns opaque magenta and is counted. */
