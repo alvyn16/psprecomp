@@ -16,8 +16,10 @@
  *   Enter               Start                   Start
  *   Backspace           Back                    Select
  *
- * Windows only for now (Win32 + GDI + XInput: no dependencies). Elsewhere
- * psp_window_start() returns -1. */
+ * The default backend is Win32 + GDI + XInput on Windows, with no dependencies.
+ * Elsewhere psp_window_start() returns -1 unless the build is configured with
+ * -DPSPRECOMP_SDL2_WINDOW=ON, which adds an SDL2 backend (window, nearest-
+ * scaled display and keyboard/controller input). */
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
 

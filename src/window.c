@@ -3,22 +3,22 @@
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
 
-#ifdef _WIN32
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <xinput.h>
-
 #define W 480
 #define H 272
 
-/* PSP button bits (SceCtrlData.Buttons). */
+/* PSP button bits (SceCtrlData.Buttons), shared by both backends. */
 enum {
     B_SELECT = 0x0001, B_START = 0x0008,
     B_UP = 0x0010, B_RIGHT = 0x0020, B_DOWN = 0x0040, B_LEFT = 0x0080,
     B_L = 0x0100, B_R = 0x0200,
     B_TRIANGLE = 0x1000, B_CIRCLE = 0x2000, B_CROSS = 0x4000, B_SQUARE = 0x8000
 };
+
+#ifdef _WIN32
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <xinput.h>
 
 static volatile LONG g_closed;
 static int g_scale;
@@ -168,10 +168,145 @@ int psp_window_start(const char *title, int scale) {
 
 int psp_window_closed(void) { return g_closed != 0; }
 
+#elif defined(PSPRECOMP_SDL2_WINDOW)
+
+#include <SDL.h>
+#include <stdint.h>
+
+static volatile int g_closed;
+static int g_scale;
+static const char *g_title = "psprecomp";
+static uint32_t g_px[W * H];
+static SDL_GameController *g_pad;
+
+static uint32_t keyboard(void) {
+    static const struct { SDL_Scancode sc; uint32_t bit; } K[] = {
+        { SDL_SCANCODE_UP, B_UP }, { SDL_SCANCODE_RIGHT, B_RIGHT },
+        { SDL_SCANCODE_DOWN, B_DOWN }, { SDL_SCANCODE_LEFT, B_LEFT },
+        { SDL_SCANCODE_Z, B_CROSS }, { SDL_SCANCODE_X, B_CIRCLE },
+        { SDL_SCANCODE_A, B_SQUARE }, { SDL_SCANCODE_S, B_TRIANGLE },
+        { SDL_SCANCODE_Q, B_L }, { SDL_SCANCODE_W, B_R },
+        { SDL_SCANCODE_RETURN, B_START }, { SDL_SCANCODE_BACKSPACE, B_SELECT },
+    };
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    uint32_t b = 0;
+    for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
+        if (keys[K[i].sc]) b |= K[i].bit;
+    return b;
+}
+
+/* The first game controller, opened once on the window thread. */
+static uint32_t pad(uint8_t *ax, uint8_t *ay) {
+    if (SDL_NumJoysticks() == 0 || !SDL_IsGameController(0)) return 0;
+    if (!g_pad) g_pad = SDL_GameControllerOpen(0);
+    if (!g_pad) return 0;
+    static const struct { SDL_GameControllerButton btn; uint32_t bit; } P[] = {
+        { SDL_CONTROLLER_BUTTON_DPAD_UP, B_UP }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, B_RIGHT },
+        { SDL_CONTROLLER_BUTTON_DPAD_DOWN, B_DOWN }, { SDL_CONTROLLER_BUTTON_DPAD_LEFT, B_LEFT },
+        { SDL_CONTROLLER_BUTTON_A, B_CROSS }, { SDL_CONTROLLER_BUTTON_B, B_CIRCLE },
+        { SDL_CONTROLLER_BUTTON_X, B_SQUARE }, { SDL_CONTROLLER_BUTTON_Y, B_TRIANGLE },
+        { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, B_L }, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, B_R },
+        { SDL_CONTROLLER_BUTTON_START, B_START }, { SDL_CONTROLLER_BUTTON_BACK, B_SELECT },
+    };
+    uint32_t b = 0;
+    for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
+        if (SDL_GameControllerGetButton(g_pad, P[i].btn)) b |= P[i].bit;
+    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8192) b |= B_L;
+    if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8192) b |= B_R;
+
+    const Sint16 lx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX);
+    const Sint16 ly = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY);
+    if ((int64_t)lx * lx + (int64_t)ly * ly > 8000LL * 8000LL) {
+        *ax = (uint8_t)((lx + 32768) >> 8);
+        *ay = (uint8_t)((ly + 32768) >> 8);   /* SDL's Y already grows downwards */
+    }
+    return b;
+}
+
+static void render(SDL_Renderer *r, SDL_Texture *tex) {
+    int cw, ch;
+    SDL_GetRendererOutputSize(r, &cw, &ch);
+    int scale = g_scale;
+    if (scale > 0 && (W * scale > cw || H * scale > ch)) scale = 0;
+    if (scale <= 0) {
+        scale = cw / W;
+        if (ch / H < scale) scale = ch / H;
+        if (scale < 1) scale = 1;
+    }
+    const SDL_Rect dst = { (cw - W * scale) / 2, (ch - H * scale) / 2, W * scale, H * scale };
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+    SDL_RenderClear(r);
+    if (psp_display_read(g_px) == 0) {
+        /* The front buffer is 0xAABBGGRR; RGBA8888 names memory bytes, which
+         * on a little-endian host are exactly RR,GG,BB,AA. */
+        SDL_UpdateTexture(tex, NULL, g_px, W * 4);
+        SDL_RenderCopy(r, tex, NULL, &dst);
+    }
+    SDL_RenderPresent(r);
+}
+
+static int SDLCALL window_main(void *arg) {
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED,
+                                       SDL_WINDOWPOS_CENTERED, W * g_scale, H * g_scale,
+                                       SDL_WINDOW_SHOWN);
+    if (!win) { g_closed = 1; return 1; }
+    SDL_Renderer *r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!r) r = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
+                                             SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
+    if (tex) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+    if (!tex) g_closed = 1;
+    SDL_SemPost((SDL_sem *)arg);              /* the window exists, or failed */
+
+    Uint32 next = SDL_GetTicks();
+    while (!g_closed && r && tex) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e))
+            if (e.type == SDL_QUIT ||
+                (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE))
+                g_closed = 1;
+        if (g_closed) break;
+        uint8_t ax = 128, ay = 128;
+        psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
+        render(r, tex);
+        next += 16;
+        const Uint32 now = SDL_GetTicks();
+        if ((int)(next - now) > 0) SDL_Delay(next - now);
+        else next = now;
+    }
+    SDL_GameControllerClose(g_pad); g_pad = NULL;
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(r);
+    SDL_DestroyWindow(win);
+    g_closed = 1;
+    return 0;
+}
+
+int psp_window_start(const char *title, int scale) {
+    if (title) g_title = title;
+    g_scale = scale;
+    if (g_scale <= 0) {
+        SDL_DisplayMode m;
+        g_scale = (SDL_GetCurrentDisplayMode(0, &m) == 0 && m.h > H)
+                      ? m.h * 7 / 10 / H : 1;
+        if (g_scale < 1) g_scale = 1;
+    }
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) return -1;
+    SDL_sem *ready = SDL_CreateSemaphore(0);
+    if (!ready) { SDL_Quit(); return -1; }
+    SDL_Thread *t = SDL_CreateThread(window_main, "psprecomp-window", ready);
+    if (!t) { SDL_DestroySemaphore(ready); SDL_Quit(); return -1; }
+    SDL_SemWait(ready);                       /* window created, or failed */
+    SDL_DestroySemaphore(ready);
+    SDL_DetachThread(t);
+    return g_closed ? -1 : 0;
+}
+
+int psp_window_closed(void) { return g_closed != 0; }
+
 #else
 
-/* ponytail: no window off Windows yet; SDL2, as ps3recomp uses there, is the
- * obvious next step. */
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
 
