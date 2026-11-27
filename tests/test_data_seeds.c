@@ -20,12 +20,6 @@ static int failures;
         }                                                       \
     } while (0)
 
-static void put32(uint8_t *img, uint32_t at, uint32_t v) {
-    uint8_t *p = img + (at - BASE);
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-
 int main(void) {
     static uint8_t img[0x100];
     memset(img, 0, sizeof img);

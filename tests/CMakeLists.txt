@@ -62,10 +62,22 @@ add_test(NAME interp COMMAND test_interp)
 
 add_executable(test_oracle_diff test_oracle_diff.c)
 target_link_libraries(test_oracle_diff PRIVATE psprecomp_interp allegrex_core)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(ORACLE_SDL QUIET sdl2)
+endif()
+if(ORACLE_SDL_FOUND)
+  set(ORACLE_SDL_LIBS "${ORACLE_SDL_LINK_LIBRARIES}")
+else()
+  set(ORACLE_SDL_LIBS "")
+endif()
 target_compile_definitions(test_oracle_diff PRIVATE
   ORACLE_CC="${CMAKE_C_COMPILER}"
   ORACLE_INCLUDE="${CMAKE_SOURCE_DIR}/include"
-  ORACLE_RUNTIME="${CMAKE_BINARY_DIR}/libpsprecomp.a")
+  ORACLE_RUNTIME="${CMAKE_BINARY_DIR}/libpsprecomp.a"
+  ORACLE_SDL_LIBS="${ORACLE_SDL_LIBS}"
+  ORACLE_CFLAGS="${CMAKE_C_FLAGS}"
+  ORACLE_LDFLAGS="${CMAKE_EXE_LINKER_FLAGS}")
 add_test(NAME oracle_diff COMMAND test_oracle_diff)
 
 add_executable(test_window test_window.c)

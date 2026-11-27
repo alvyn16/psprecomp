@@ -29,6 +29,15 @@
 #ifndef ORACLE_RUNTIME
 #  define ORACLE_RUNTIME "libpsprecomp.a"
 #endif
+#ifndef ORACLE_SDL_LIBS
+#  define ORACLE_SDL_LIBS ""
+#endif
+#ifndef ORACLE_CFLAGS
+#  define ORACLE_CFLAGS ""
+#endif
+#ifndef ORACLE_LDFLAGS
+#  define ORACLE_LDFLAGS ""
+#endif
 
 #define CODE  0x08804000u
 #define STUB  0x08804100u
@@ -200,8 +209,8 @@ static void run_case(const char *name, const uint32_t *words, int n, int with_hl
 
     char cmd[1024];
     snprintf(cmd, sizeof cmd,
-             "\"%s\" -std=c11 -I\"%s\" -I. ./oracle_funcs_000.c ./oracle_imports.c ./oracle_main.c \"%s\" -lm -o ./oracle_body",
-             ORACLE_CC, ORACLE_INCLUDE, ORACLE_RUNTIME);
+             "\"%s\" -std=c11 %s -I\"%s\" -I. ./oracle_funcs_000.c ./oracle_imports.c ./oracle_main.c \"%s\" -lm %s %s -o ./oracle_body",
+             ORACLE_CC, ORACLE_CFLAGS, ORACLE_INCLUDE, ORACLE_RUNTIME, ORACLE_SDL_LIBS, ORACLE_LDFLAGS);
     int rc = system(cmd);
     CHECK(rc == 0, "%s: emitted C compiles and links", name);
     if (rc == 0) {
