@@ -149,6 +149,14 @@ int a_scan_data_pointers(const a_analysis *an,
                          const uint8_t *region, uint32_t region_len,
                          uint32_t *out, int max);
 
+/* Keep only seeds inside the known executable extent (.text). Static modules
+ * have no relocations, so the data scan above is the only way to find code
+ * pointers handed to the firmware; but a data region is full of words that
+ * point into other data and still decode as valid instructions. Filtering them
+ * keeps that heuristic from manufacturing thousands of bogus functions. With
+ * no .text extent known, nothing is filtered. Returns the kept count. */
+int a_keep_text_seeds(const a_analysis *an, uint32_t *seeds, int n);
+
 void a_analysis_free(a_analysis *an);
 
 /* Is `addr` inside the discovered code extent? */
