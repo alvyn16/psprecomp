@@ -537,8 +537,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         if (isnan(v))      fprintf(f, "%spsp_vimm(%u, NAN);\n", ind, in->vd);
         else if (isinf(v)) fprintf(f, "%spsp_vimm(%u, %sINFINITY);\n",
                                    ind, in->vd, v < 0 ? "-" : "");
-        else               fprintf(f, "%spsp_vimm(%u, %.9gf);\n",
-                                   ind, in->vd, (double)v);
+        else {
+            /* `%.9g` drops `.0` on whole numbers like `10`, so gluing `f`
+             * produces an invalid integer suffix `10f`. */
+            char buf[32];
+            snprintf(buf, sizeof buf, "%.9g", (double)v);
+            fprintf(f, "%spsp_vimm(%u, %s%sf);\n", ind, in->vd, buf,
+                    buf[strcspn(buf, ".eE")] ? "" : ".0");
+        }
         return;
     }
 
