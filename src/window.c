@@ -21,6 +21,8 @@ enum {
 #include <xinput.h>
 
 static volatile LONG g_closed;
+static HANDLE g_thread;
+static HWND g_hwnd;
 static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
@@ -142,6 +144,7 @@ static DWORD WINAPI window_main(LPVOID arg) {
                            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                            NULL, NULL, wc.hInstance, NULL);
     if (!h) { InterlockedExchange(&g_closed, 1); SetEvent(ready); return 1; }
+    g_hwnd = h;
     SetTimer(h, 1, 16, NULL);
     SetEvent(ready);
 
@@ -160,10 +163,20 @@ int psp_window_start(const char *title, int scale) {
     HANDLE ready = CreateEventA(NULL, TRUE, FALSE, NULL);
     HANDLE t = CreateThread(NULL, 0, window_main, ready, 0, NULL);
     if (!t) { CloseHandle(ready); return -1; }
+    g_thread = t;
     WaitForSingleObject(ready, INFINITE);       /* the window exists, or failed */
     CloseHandle(ready);
-    CloseHandle(t);
     return g_closed ? -1 : 0;
+}
+
+void psp_window_stop(void) {
+    if (!g_thread) return;
+    InterlockedExchange(&g_closed, 1);
+    if (g_hwnd) PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
+    WaitForSingleObject(g_thread, INFINITE);
+    CloseHandle(g_thread);
+    g_thread = NULL;
+    g_hwnd = NULL;
 }
 
 int psp_window_closed(void) { return g_closed != 0; }
@@ -178,6 +191,7 @@ static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 static SDL_GameController *g_pad;
+static SDL_Thread *g_thread;
 
 static uint32_t keyboard(void) {
     static const struct { SDL_Scancode sc; uint32_t bit; } K[] = {
@@ -284,7 +298,9 @@ static int SDLCALL window_main(void *arg) {
 }
 
 int psp_window_start(const char *title, int scale) {
+    if (g_thread) return -1;                   /* call psp_window_stop() first */
     if (title) g_title = title;
+    g_closed = 0;
     g_scale = scale;
     if (g_scale <= 0) {
         SDL_DisplayMode m;
@@ -297,10 +313,18 @@ int psp_window_start(const char *title, int scale) {
     if (!ready) { SDL_Quit(); return -1; }
     SDL_Thread *t = SDL_CreateThread(window_main, "psprecomp-window", ready);
     if (!t) { SDL_DestroySemaphore(ready); SDL_Quit(); return -1; }
+    g_thread = t;
     SDL_SemWait(ready);                       /* window created, or failed */
     SDL_DestroySemaphore(ready);
-    SDL_DetachThread(t);
     return g_closed ? -1 : 0;
+}
+
+void psp_window_stop(void) {
+    if (!g_thread) return;
+    g_closed = 1;                              /* the loop notices within a frame */
+    SDL_WaitThread(g_thread, NULL);
+    g_thread = NULL;
+    SDL_Quit();                                /* only now: the thread is gone */
 }
 
 int psp_window_closed(void) { return g_closed != 0; }
@@ -309,5 +333,6 @@ int psp_window_closed(void) { return g_closed != 0; }
 
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
+void psp_window_stop(void) { }
 
 #endif

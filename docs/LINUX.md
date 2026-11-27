@@ -43,7 +43,10 @@ at 60 Hz.
 | Enter | Start | Start |
 | Backspace | Back | Select |
 
-`psp_window_closed()` reports that the user closed the window.
+`psp_window_closed()` reports that the user closed the window. A game host should
+call `psp_window_stop()` before tearing down its runtime: it signals the window
+thread, joins it, and only then calls `SDL_Quit()`. Calling it twice is safe, and
+`psp_window_start()` may be called again afterwards.
 
 ## What is not here
 
