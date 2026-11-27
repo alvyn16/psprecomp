@@ -138,10 +138,13 @@ static void run_case(const char *name, const uint32_t *words, int n, int with_hl
     CHECK(ip.traps == 0 && ip.stopped, "%s: interpreter finished: traps=%llu",
           name, (unsigned long long)ip.traps);
     psp_cpu.pc = ip.pc;
-    FILE *f = fopen("./oracle-interp.txt", "wb");
+    char ipath[128], epath[128];
+    snprintf(ipath, sizeof ipath, "./oracle-%s-interp.txt", name);
+    snprintf(epath, sizeof epath, "./oracle-%s-emitted.txt", name);
+    FILE *f = fopen(ipath, "wb");
     CHECK(f != NULL, "%s: interpreter snapshot opens", name);
     if (f) { write_state(f); fclose(f); }
-    char *want = slurp("./oracle-interp.txt");
+    char *want = slurp(ipath);
     int vl[4];
     psp_vfpu_regs(0, 4, vl);
     printf("  v0=%08X f2=%08X V0lane=%08X pfx=%08X cc=%08X\n",
@@ -202,9 +205,11 @@ static void run_case(const char *name, const uint32_t *words, int n, int with_hl
     int rc = system(cmd);
     CHECK(rc == 0, "%s: emitted C compiles and links", name);
     if (rc == 0) {
-        rc = system("./oracle_body ./oracle-emitted.txt");
+        char cmd2[256];
+        snprintf(cmd2, sizeof cmd2, "./oracle_body %s", epath);
+        rc = system(cmd2);
         CHECK(rc == 0, "%s: emitted C runs", name);
-        char *got = slurp("./oracle-emitted.txt");
+        char *got = slurp(epath);
         CHECK(got && want && strcmp(got, want) == 0,
               "%s: interpreter and emitted C agree on the full guest state", name);
         if (got && want && strcmp(got, want) != 0) {
