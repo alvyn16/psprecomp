@@ -84,6 +84,28 @@ if(PSPRECOMP_SDL2_WINDOW AND NOT WIN32)
         target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2_WINDOW=1)
         target_link_libraries(psprecomp PUBLIC PkgConfig::SDL2)
         target_sources(psprecomp PRIVATE src/render_gpu.c)
+
+        # Optional Dear ImGui backend for the save-state UI. The sources are
+        # vendored (MIT) so a Linux host needs only SDL2, not a system ImGui.
+        option(PSPRECOMP_IMGUI_UI "Build the save-state UI with Dear ImGui" OFF)
+        if(PSPRECOMP_IMGUI_UI)
+            enable_language(CXX)
+            add_library(imgui STATIC
+                third_party/imgui/imgui.cpp
+                third_party/imgui/imgui_draw.cpp
+                third_party/imgui/imgui_tables.cpp
+                third_party/imgui/imgui_widgets.cpp
+                third_party/imgui/backends/imgui_impl_sdl2.cpp
+                third_party/imgui/backends/imgui_impl_sdlrenderer2.cpp)
+            target_include_directories(imgui PUBLIC
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends)
+            target_link_libraries(imgui PUBLIC PkgConfig::SDL2)
+            target_compile_definitions(psprecomp PUBLIC PSPRECOMP_IMGUI_UI=1)
+            target_link_libraries(psprecomp PUBLIC imgui)
+            target_sources(psprecomp PRIVATE src/ui_imgui.cpp)
+            set(PSPRECOMP_PC_EXTRA "-limgui")
+        endif()
     else()
         # A fresh clone must still configure with nothing installed. The window
         # then reports that it cannot open, exactly as before this option.
@@ -124,6 +146,9 @@ add_subdirectory(tools/allegrexrecomp)
 # A Linux host consumes psprecomp through pkg-config: a static runtime, the
 # recompiler library/CLI and the headers, all under one prefix.
 set(PSPRECOMP_VERSION "0.6.0")
+if(NOT PSPRECOMP_PC_EXTRA)
+    set(PSPRECOMP_PC_EXTRA "")
+endif()
 if(TARGET PkgConfig::SDL2)
     set(PSPRECOMP_PC_REQUIRES "sdl2")
 else()
@@ -137,6 +162,9 @@ install(TARGETS psprecomp allegrex_core allegrexrecomp
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 if(TARGET psprecomp_interp)
     install(TARGETS psprecomp_interp ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+if(TARGET imgui)
+    install(TARGETS imgui ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/psprecomp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

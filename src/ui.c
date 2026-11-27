@@ -8,10 +8,10 @@
 #include "psprecomp/ui.h"
 #include "psprecomp/state.h"
 
-#ifndef PSPRECOMP_SDL2_WINDOW
+#if !defined(PSPRECOMP_SDL2_WINDOW)
 int psp_ui_start(void) { return -1; }
 void psp_ui_stop(void) { }
-#else
+#elif !defined(PSPRECOMP_IMGUI_UI)
 
 #include <SDL.h>
 
@@ -151,4 +151,8 @@ void psp_ui_stop(void) {
     if (g_owns_sdl) { SDL_Quit(); g_owns_sdl = 0; }
 }
 
-#endif /* PSPRECOMP_SDL2_WINDOW */
+#endif /* SDL2 and not ImGui */
+
+#if defined(PSPRECOMP_SDL2_WINDOW) && defined(PSPRECOMP_IMGUI_UI)
+/* The ImGui implementation lives in ui_imgui.cpp; no symbols here. */
+#endif

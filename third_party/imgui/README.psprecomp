@@ -1,0 +1,8 @@
+Dear ImGui v1.90.9, vendored for the optional save-state UI.
+
+License: MIT, see LICENSE.txt (Copyright (c) 2014-2024 Omar Cornut).
+Source: https://github.com/ocornut/imgui
+
+Only the core sources and the SDL2/SDLRenderer2 backend files are included.
+They are compiled into a separate static library only when
+-DPSPRECOMP_IMGUI_UI=ON; the default build has no C++ or ImGui dependency.

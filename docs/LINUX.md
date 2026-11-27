@@ -68,9 +68,15 @@ and read back into the guest framebuffer, while triangles and textured
 geometry keep using the software backend so the GE's depth/lighting rules stay
 correct. Without SDL2 the name is rejected and software remains active.
 
-`psp_ui_start()` / `psp_ui_stop()` in `<psprecomp/ui.h>` open a small SDL2
+`psp_ui_start()` / `psp_ui_stop()` in `<psprecomp/ui.h>` open a save-state
 window with Save/Load buttons, a slot selector and F5/F8 shortcuts. It calls the
 same `psp_state_*` API and is independent of the game window.
+
+By default the UI is a small minimal SDL2 overlay. Configure with
+`-DPSPRECOMP_IMGUI_UI=ON` to build it with Dear ImGui instead: the MIT sources
+are vendored in `third_party/imgui`, the option adds a C++ compiler requirement
+and an `imgui` static library, and the pkg-config file then lists `-limgui`.
+Both implementations expose the same two functions and pass the same tests.
 
 ## Audio
 
@@ -88,8 +94,8 @@ thread, joins it, and only then calls `SDL_Quit()`. Calling it twice is safe, an
 ## What is not here
 
 The window presents pixels, input and audio. Firmware is still implemented by
-the runtime's HLE layer; there is no Dear ImGui frontend — the state UI is a
-small SDL2 overlay. The
+the runtime's HLE layer. Dear ImGui is optional for the state UI; there is no
+full editor/game frontend. The
 Windows backend remains in
 `src/window.c` behind `#ifdef _WIN32` and is checked on a best-effort basis in
 CI; it is no longer the primary target.
