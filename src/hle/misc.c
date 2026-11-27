@@ -125,6 +125,28 @@ static void hle_GetModuleId(void)          { psp_ret(PSP_MAIN_MODULE_ID); }
 static void hle_GetModuleIdByAddress(void) { psp_ret(PSP_MAIN_MODULE_ID); }
 static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 
+/* sceKernelStopUnloadSelfModuleWithStatus -- the NID was observed in Dante's
+ * Inferno's libstub table, and PPSSPP's table names it; the name is not
+ * SHA-1-derivable, so it is registered unnamed rather than under a name this
+ * toolkit cannot verify.
+ *
+ * The firmware does not return from this call: it stops and unloads the calling
+ * module, which is the end of the program. Returning 0 is not a harmless stub
+ * because the caller is compiled to continue -- _exit's wrapper leaves the exit
+ * status in $a0 and falls straight into code that treats $a0 as a pointer, and
+ * Dante's Inferno faults at 0x0D there. Record the exit and unwind the calling
+ * thread exactly as sceKernelExitThread does. */
+static void hle_StopUnloadSelfModuleWithStatus(void) {
+    uint32_t status = psp_arg(0);
+    g_exit_requested = 1;
+    fprintf(stderr,
+            "psprecomp: the game called sceKernelStopUnloadSelfModuleWithStatus(%u)\n",
+            status);
+    psp_cpu.r[PSP_REG_A0] = status;
+    psp_hle_call(0xAA73C935u);                 /* sceKernelExitThread */
+    psp_ret(status);                           /* only with nothing to unwind to */
+}
+
 /* ---- sceCtrl ------------------------------------------------------------- */
 
 static uint32_t g_buttons;
@@ -367,6 +389,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x50F0C1EC, "ModuleMgrForUser", "sceKernelStartModule",          hle_ModuleOk);
     psp_hle_register(0xD1FF982A, "ModuleMgrForUser", "sceKernelStopModule",           hle_ModuleOk);
     psp_hle_register(0x2E0911AA, "ModuleMgrForUser", "sceKernelUnloadModule",         hle_ModuleOk);
+    psp_hle_register_unnamed(0x8F2DF740, "ModuleMgrForUser", hle_StopUnloadSelfModuleWithStatus);
 
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);

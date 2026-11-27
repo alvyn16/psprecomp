@@ -29,6 +29,8 @@ static int failures;
 static char order[8];
 static int norder;
 static uint32_t start_gp, start_k0;
+static uint32_t start_arglen, start_argp;
+static char     start_arg[16];
 
 static void ctor_a(void) { order[norder++] = 'a'; }
 static void ctor_b(void) { order[norder++] = 'b'; }
@@ -36,6 +38,12 @@ static void start(void) {
     order[norder++] = 's';
     start_gp = psp_cpu.r[PSP_REG_GP];
     start_k0 = psp_cpu.r[26];
+    start_arglen = psp_cpu.r[PSP_REG_A0];
+    start_argp = psp_cpu.r[PSP_REG_A1];
+    memset(start_arg, 0, sizeof start_arg);
+    if (start_argp && start_arglen)
+        psp_mem_read_block(start_arg, start_argp,
+                           start_arglen < sizeof start_arg ? start_arglen : sizeof start_arg);
     psp_cpu.r[PSP_REG_V0] = 0;
 }
 
@@ -85,6 +93,28 @@ int main(void) {
     CHECK(strcmp(order, "abs") == 0, "constructors in order, then module_start: \"%s\"", order);
     CHECK(start_gp == GP, "module_start runs with the module's gp: 0x%08X", start_gp);
     CHECK(start_k0 && psp_read32(start_k0 + 4), "k0 points at a thread block with a reent pointer");
+    CHECK(start_arglen == 0 && start_argp == 0,
+          "no command line by default (arglen=%u argp=0x%08X)", start_arglen, start_argp);
+
+    /* The kernel calls module_start with (arglen, argp) for a command line, not
+     * with nothing: crt0 turns that string into main's argc/argv. Dante's
+     * Inferno reads argc, so an empty argument block is a different program. */
+    norder = 0;
+    psp_module_set_cmdline("EBOOT.BIN");
+    psp_module_start(&m);
+    CHECK(start_arglen == (uint32_t)strlen("EBOOT.BIN") + 1,
+          "arglen counts the NUL, got %u", start_arglen);
+    CHECK(strcmp(start_arg, "EBOOT.BIN") == 0,
+          "the command line is in guest memory, got \"%s\"", start_arg);
+    norder = 0;
+    psp_module_set_cmdline("");
+    psp_module_start(&m);
+    CHECK(start_arglen == 1 && start_arg[0] == '\0',
+          "an empty command line is still one argument (arglen=%u)", start_arglen);
+    norder = 0;
+    psp_module_set_cmdline(NULL);
+    psp_module_start(&m);
+    CHECK(start_arglen == 0 && start_argp == 0, "clearing the command line restores the default");
 
     remove(path);
 

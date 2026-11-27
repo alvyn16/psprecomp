@@ -85,12 +85,35 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
 #define START_STACK 0x08F00000u
 #define TCB_ADDR    0x08800000u
 #define REENT_ADDR  0x08800100u
+#define CMDLINE_ADDR 0x08800200u
+#define CMDLINE_MAX  1024u
+
+static char     g_cmdline[CMDLINE_MAX];
+static int      g_cmdline_set;
+
+void psp_module_set_cmdline(const char *line) {
+    if (!line) { g_cmdline_set = 0; g_cmdline[0] = '\0'; return; }
+    size_t n = strlen(line);
+    if (n >= CMDLINE_MAX) n = CMDLINE_MAX - 1;
+    memcpy(g_cmdline, line, n);
+    g_cmdline[n] = '\0';
+    g_cmdline_set = 1;
+}
 
 uint32_t psp_module_start(const psp_module *m) {
     psp_cpu.r[PSP_REG_GP] = m->gp;
     psp_cpu.r[PSP_REG_SP] = START_STACK;
     psp_cpu.r[PSP_REG_A0] = 0;
     psp_cpu.r[PSP_REG_A1] = 0;
+    /* The kernel's argument block: a NUL-terminated string and its byte length.
+     * crt0 walks it to build argc/argv, so the length includes the NUL. */
+    if (g_cmdline_set) {
+        uint32_t len = (uint32_t)strlen(g_cmdline) + 1u;
+        if (psp_mem_write_block(CMDLINE_ADDR, g_cmdline, len) == 0) {
+            psp_cpu.r[PSP_REG_A0] = len;
+            psp_cpu.r[PSP_REG_A1] = CMDLINE_ADDR;
+        }
+    }
     psp_cpu.r[26] = TCB_ADDR;                   /* $k0 */
     psp_write32(TCB_ADDR + 4, REENT_ADDR);
     if (m->ctors) psp_ctors_run(m->ctors);
