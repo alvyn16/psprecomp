@@ -52,6 +52,37 @@ int main(void) {
     fd = open_guest(PATH);
     CHECK((int32_t)fd >= 3, "valid paths still open after failures");
     close_guest(fd);
+    /* UMD raw-sector pseudo-files: the guest names a logical block and a
+     * byte count, and the firmware reads that window out of the disc image.
+     * Dante's Inferno uses these for resources listed in SECTORS.DIC. */
+    char iso_path[512];
+    snprintf(iso_path, sizeof iso_path, "%s/test.iso", PSP_TEST_IO_ROOT);
+    FILE *iso = fopen(iso_path, "wb");
+    CHECK(iso != NULL, "create a synthetic disc image");
+    if (iso) {
+        fseek(iso, 2048, SEEK_SET);            /* LBN 1 */
+        fwrite("LBN-OK", 1, 6, iso);
+        fclose(iso);
+        psp_io_set_iso(iso_path);
+        const char lbn[] = "disc0:/sce_lbn0x1_size0x10";
+        CHECK(psp_mem_write_block(PATH, lbn, sizeof lbn) == 0, "prepare the LBN path");
+        fd = open_guest(PATH);
+        CHECK((int32_t)fd >= 3, "an LBN pseudo-file opens from the image");
+        if ((int32_t)fd >= 3) {
+            const uint32_t dst = 0x08860000u;
+            psp_cpu.r[PSP_REG_A0] = (uint32_t)fd;
+            psp_cpu.r[PSP_REG_A1] = dst;
+            psp_cpu.r[PSP_REG_A2] = 6;
+            psp_hle_call(0x6A638D83u);         /* sceIoRead */
+            CHECK(psp_cpu.r[PSP_REG_V0] == 6, "the LBN window reads its bytes");
+            CHECK(psp_read8(dst) == 'L' && psp_read32(dst) == 0x2D4E424Cu,
+                  "the bytes come from the right sector");
+            close_guest(fd);
+        }
+        psp_io_set_iso(NULL);
+        remove(iso_path);
+    }
+
     psp_io_reset();
     psp_mem_free();
     printf("io_open: %d failures\n", failures);

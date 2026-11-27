@@ -35,7 +35,14 @@
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
 
-typedef struct { FILE *f; int used; } io_file;
+typedef struct {
+    FILE    *f;
+    int      used;
+    int      pseudo;          /* a window into the disc image */
+    uint64_t base;            /* byte offset of that window in the image */
+    uint64_t window;          /* and its length, as the guest named it */
+    uint64_t limit;           /* bytes left before the window ends */
+} io_file;
 
 typedef struct {
     int used;
@@ -53,6 +60,31 @@ static io_file g_file[MAX_FILES];
 static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
 static uint64_t g_bytes_read;
+static char     g_iso[512];
+
+void psp_io_set_iso(const char *path) {
+    snprintf(g_iso, sizeof g_iso, "%s", path ? path : "");
+}
+
+/* The UMD's raw-sector API: opening disc0:/sce_lbn0x6b9fe_size0x41a gives a
+ * file of `size` bytes starting at logical block `lbn`. Dante's Inferno uses
+ * it for data whose location is in SECTORS.DIC, not in the filesystem tree. */
+static int lbn_window(const char *guest, uint64_t *base, uint64_t *size) {
+    const char *p = guest;
+    if      (!strncmp(p, "disc0:", 6)) p += 6;
+    else if (!strncmp(p, "umd0:",  5)) p += 5;
+    else return 0;
+    while (*p == '/' || *p == '\\') p++;
+    if (strncmp(p, "sce_lbn0x", 9)) return 0;
+    char *end;
+    uint64_t lbn = strtoull(p + 9, &end, 16);
+    if (!end || strncmp(end, "_size0x", 7)) return 0;
+    uint64_t n = strtoull(end + 7, &end, 16);
+    if (!end || *end) return 0;
+    *base = lbn * 2048u;
+    *size = n;
+    return 1;
+}
 
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
@@ -95,7 +127,16 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "host0:", 6)) { p += 6; sub = "host"; }
 
     while (*p == '/' || *p == '\\') p++;
-    snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    /* The firmware accepts both separators; Dante's Inferno builds most of
+     * its resource paths with backslashes. On a POSIX host leaving them as-is
+     * makes fopen look for a single filename containing backslashes and every
+     * resource lookup fails. */
+    int n = snprintf(out, cap, "%s/%s/", g_root, sub);
+    if (n < 0 || (size_t)n >= cap) { out[cap - 1] = '\0'; return; }
+    char *q = out + n;
+    size_t room = cap - (size_t)n;
+    for (; *p && room > 1; p++, room--) *q++ = (*p == '\\') ? '/' : *p;
+    *q = '\0';
 }
 
 static void hle_Open(void) {
@@ -117,6 +158,34 @@ static void hle_Open(void) {
         psp_ret(0x80010002u);  /* ENOENT */
         return;
     }
+    uint64_t lbn_base = 0, lbn_size = 0;
+    int pseudo = g_iso[0] && lbn_window(guest, &lbn_base, &lbn_size);
+    if (pseudo) {
+        FILE *iso = fopen(g_iso, "rb");
+        if (iso && fseeko(iso, (off_t)lbn_base, SEEK_SET) == 0) {
+            for (int i = 0; i < MAX_FILES; i++) {
+                if (g_file[i].used) continue;
+                g_file[i].f = iso;
+                g_file[i].used = 1;
+                g_file[i].pseudo = 1;
+                g_file[i].base = lbn_base;
+                g_file[i].window = lbn_size;
+                g_file[i].limit = lbn_size;
+                if (getenv("PSPRECOMP_TRACE_IO"))
+                    fprintf(stderr, "io: open \"%s\" -> image+0x%llX (%llu bytes): ok\n",
+                            guest, (unsigned long long)lbn_base, (unsigned long long)lbn_size);
+                psp_ret((uint32_t)(i + 3));
+                return;
+            }
+            fclose(iso);
+            psp_ret(0x80010018);
+            return;
+        }
+        if (iso) fclose(iso);
+        psp_ret(0x80010002u);
+        return;
+    }
+
     map_path(guest, host, sizeof host);
 
     const char *mode = "rb";
@@ -144,6 +213,8 @@ static void hle_Open(void) {
         if (g_file[i].used) continue;
         g_file[i].f = f;
         g_file[i].used = 1;
+        g_file[i].pseudo = 0;
+        g_file[i].base = g_file[i].window = g_file[i].limit = 0;
         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
         return;
     }
@@ -186,6 +257,16 @@ static void hle_Getstat(void) {
         if (!guest[n]) break;
     }
     if (!n || n == sizeof guest) { psp_ret(0x80010016u); return; }
+    uint64_t lbn_base, lbn_size;
+    if (g_iso[0] && lbn_window(guest, &lbn_base, &lbn_size)) {
+        for (unsigned i = 0; i < 88; i++) psp_write8(out + i, 0);
+        psp_write32(out, 0x2000u | 0444u);
+        psp_write32(out + 4, 0x20u);
+        psp_write32(out + 8, (uint32_t)lbn_size);
+        psp_write32(out + 12, (uint32_t)(lbn_size >> 32));
+        psp_ret(0);
+        return;
+    }
     map_path(guest, host, sizeof host);
 #ifdef _WIN32
     struct _stat64 st;
@@ -252,7 +333,10 @@ static void hle_Read(void) {
     uint8_t *tmp = (uint8_t *)malloc(size);
     if (!tmp) { psp_ret(0x80020190); return; }
 
-    size_t got = fread(tmp, 1, size, h->f);
+    size_t want = size;
+    if (h->pseudo && want > h->limit) want = (size_t)h->limit;
+    size_t got = want ? fread(tmp, 1, want, h->f) : 0;
+    if (h->pseudo) h->limit -= got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -295,9 +379,21 @@ static void hle_Lseek(void) {
     if (!h) { psp_ret(0x80020323); return; }
 
     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
-    if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
+    int64_t base = h->pseudo ? (int64_t)h->base : 0;
+    int64_t end = h->pseudo ? (int64_t)(h->base + h->window) : 0;
+    int64_t at;
+    if (h->pseudo) {
+        int64_t here = (int64_t)ftello(h->f);
+        at = (w == SEEK_SET) ? base + (int64_t)off
+           : (w == SEEK_CUR) ? here + (int64_t)off
+                             : end + (int64_t)off;
+        if (fseeko(h->f, (off_t)at, SEEK_SET) != 0) { psp_ret(0xFFFFFFFFu); return; }
+    } else if (fseek(h->f, (long)(int64_t)off, w) != 0) {
+        psp_ret(0xFFFFFFFFu);
+        return;
+    }
 
-    long pos = ftell(h->f);
+    int64_t pos = h->pseudo ? (int64_t)ftello(h->f) - base : (int64_t)ftell(h->f);
     if (pos < 0) {
         psp_cpu.r[PSP_REG_V0] = 0xFFFFFFFFu;
         psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;

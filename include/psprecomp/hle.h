@@ -165,6 +165,11 @@ void psp_io_reset(void);
 void psp_io_set_root(const char *root);
 uint64_t psp_io_bytes_read(void);
 
+/* A disc image to back the UMD's raw-sector pseudo-files
+ * ("disc0:/sce_lbn0x<lbn>_size0x<n>"). Dante's Inferno locates its intro and
+ * movie data this way; without an image those opens fail and it waits. */
+void psp_io_set_iso(const char *path);
+
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
