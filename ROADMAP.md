@@ -209,9 +209,10 @@ library, which means it is implemented, not emulated.
       concrete decoder or container bug, and the aggregate VFPU percentage
       tells us which titles are cheap targets.
 - [ ] VFPU completion, driven by what the corpus says is actually used.
-- [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping —
-      built on the runtime, kept behind an opt-in CMake option so the core
-      stays dependency-free.
+- [ ] Save states, a Dear ImGui frontend and controller remapping. The SDL2
+      window itself is in place and is the default on Linux hosts; the core
+      stays dependency-free when the option is disabled. See
+      [`docs/LINUX.md`](docs/LINUX.md).
 
 ## Cross-cutting — the build loop ✅
 

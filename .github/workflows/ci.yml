@@ -4,17 +4,25 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Linux is the primary target of this fork: it is the required matrix entry and
+# the one that builds a playable window. The Win32/GDI backend is still in the
+# tree, so Windows stays as a best-effort compile check but cannot block a merge.
 jobs:
   build-test:
     name: ${{ matrix.os }} / real-threads=${{ matrix.real_threads }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
         real_threads: ['OFF', 'ON']
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux window dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev pkg-config
       # Separate steps are intentional: a failed build must never run stale tests.
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPSPRECOMP_REAL_THREADS=${{ matrix.real_threads }}
