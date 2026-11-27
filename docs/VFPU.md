@@ -47,13 +47,11 @@ Named and decoded:
 - `vnop`, `vsync`, `vflush` (`0xFFFF0000`, `0xFFFF0320`, `0xFFFF040D`)
 - **Vector width**, for all four widths, unit-tested
 
-Prefixes are applied by every vector op (src/vfpu.c). The matrix ops do not
-support prefixes: the hardware documentation marks rd, rs and rt as "Not
-supported" for vmmul, and the emulator oracle consumes a pending prefix without
-applying the general swizzle rules to the matrix. A pending prefix therefore
-makes the matrix op trap and leave its destination alone, rather than silently
-compute a number that ignored the prefix. Both the trap and the consumption are
-covered by `tests/test_vfpu.c`.
+Prefixes are applied by every vector op (src/vfpu.c). The matrix ops take only
+the narrow prefix effects the hardware and the emulator oracle agree on: source
+swizzle/abs/negate/constants and the destination mask/saturate on the matrix's
+last column, and on the final element of a multiply or transform. They do not
+take the general vector prefix path. `tests/test_vfpu.c` pins both effects.
 
 Everything else in the VFPU encoding space decodes to `A_VFPU_UNKNOWN`.
 

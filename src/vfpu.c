@@ -40,15 +40,6 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
     g_traps++;
 }
 
-/* The matrix ops do not apply prefixes. A pending one makes them trap rather
- * than compute a number that ignores it; WTF never prefixes a matrix op. */
-static int take_prefixes(uint32_t addr, const char *what) {
-    if (!psp_vfpu_prefix_pending()) return 1;
-    memset(g_prefix_set, 0, sizeof g_prefix_set);
-    psp_vfpu_unimplemented(addr, what);
-    return 0;
-}
-
 /* Every vector op consumes the prefixes, whether or not they were set. */
 static void end_op(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
 
@@ -143,6 +134,44 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
         }
         psp_cpu.v[l[i]] = x;
     }
+}
+
+/* Matrix ops do not take the general vector prefix path, but the hardware
+ * (and the emulator used as an oracle) applies the source swizzle/abs/negate/
+ * constants and the destination mask/saturate to the last column or element.
+ * Factor those two effects out so the matrix ops can use them on values that
+ * are already in float arrays. */
+static void apply_st(float *v, int size, int which) {
+    if (!g_prefix_set[which]) return;
+    const uint32_t p = g_prefix[which];
+    for (int i = 0; i < size; i++) {
+        const int sw = (int)(p >> (2 * i)) & 3;
+        const int ab = (int)(p >> (8 + i)) & 1;
+        const int k  = (int)(p >> (12 + i)) & 1;
+        float x = k ? PFX_CONST[sw | (ab << 2)] : v[sw];
+        if (!k && ab) x = fabsf(x);
+        if ((p >> (16 + i)) & 1) x = -x;
+        v[i] = x;
+    }
+}
+
+/* Destination prefix on a single lane, used for the last element of a
+ * transform or multiply. Returns 0 when the lane is masked out. */
+static int apply_d_lane(float *x, int lane) {
+    if (!g_prefix_set[2]) return 1;
+    const uint32_t p = g_prefix[2];
+    if ((p >> (8 + lane)) & 1) return 0;
+    switch ((p >> (2 * lane)) & 3) {
+    case 1: *x = sat0(*x); break;
+    case 3: *x = sat1(*x); break;
+    default: break;
+    }
+    return 1;
+}
+
+/* The register naming the matrix's last column, for write_dst's D prefix. */
+static uint32_t matrix_last_col(uint32_t vd, int size) {
+    return (((vd >> 2) & 7u) << 2) | (uint32_t)(size - 1) | (((vd >> 5) & 1u) << 5);
 }
 
 /* ---- moves between the integer and vector files --------------------------
@@ -520,12 +549,16 @@ static void matrix_write(uint32_t v, int size, const float m[4][4]) {
 }
 
 void psp_vmidt(uint32_t vd, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmidt")) return;
     int cols[4][4];
     matrix_cols(vd, size, cols);
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++)
             psp_cpu.v[cols[c][r]] = (c == r) ? 1.0f : 0.0f;
+    float last[4];
+    for (int r = 0; r < size; r++) last[r] = psp_cpu.v[cols[size - 1][r]];
+    apply_st(last, size, 0);
+    write_dst(matrix_last_col(vd, size), size, last);
+    end_op();
 }
 
 /* vidt -- an identity *vector*: all zeroes but for a single 1.0.
@@ -583,31 +616,39 @@ void psp_vcst(uint32_t vd, uint32_t which, int size) {
 }
 
 void psp_vmzero(uint32_t vd, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmzero")) return;
     int cols[4][4];
     matrix_cols(vd, size, cols);
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) psp_cpu.v[cols[c][r]] = 0.0f;
+    float last[4] = { 0, 0, 0, 0 };
+    apply_st(last, size, 0);
+    write_dst(matrix_last_col(vd, size), size, last);
+    end_op();
 }
 
 void psp_vmone(uint32_t vd, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmone")) return;
     int cols[4][4];
     matrix_cols(vd, size, cols);
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) psp_cpu.v[cols[c][r]] = 1.0f;
+    float last[4] = { 1, 1, 1, 1 };
+    apply_st(last, size, 0);
+    write_dst(matrix_last_col(vd, size), size, last);
+    end_op();
 }
 
 void psp_vmmov(uint32_t vd, uint32_t vs, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmmov")) return;
     int dc[4][4], sc[4][4];
     matrix_cols(vd, size, dc);
     matrix_cols(vs, size, sc);
     float tmp[4][4];
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) tmp[c][r] = psp_cpu.v[sc[c][r]];
+    apply_st(tmp[size - 1], size, 0);
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) psp_cpu.v[dc[c][r]] = tmp[c][r];
+    write_dst(matrix_last_col(vd, size), size, tmp[size - 1]);
+    end_op();
 }
 
 /* ---- matrix multiply and transform --------------------------------------- */
@@ -615,15 +656,19 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size) {
 /* Scale every element of a matrix by a scalar. Orientation-independent, so
  * this one is unambiguous. */
 void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmscl")) return;
     float m[4][4];
     int t[4];
     matrix_read(vs, size, m);
     psp_vfpu_regs(vt, 1, t);
-    const float k = psp_cpu.v[t[0]];
+    /* The T prefix on vmscl uses the scalar in every lane it touches. */
+    float k[4] = { psp_cpu.v[t[0]], psp_cpu.v[t[0]], psp_cpu.v[t[0]], psp_cpu.v[t[0]] };
+    apply_st(k, size, 1);
+    apply_st(m[size - 1], size, 0);  /* S applies to the last column */
     for (int c = 0; c < size; c++)
-        for (int r = 0; r < size; r++) m[c][r] *= k;
+        for (int r = 0; r < size; r++) m[c][r] *= (c == size - 1) ? k[r] : k[0];
     matrix_write(vd, size, m);
+    write_dst(matrix_last_col(vd, size), size, m[size - 1]);
+    end_op();
 }
 
 /* Transform a vector by a matrix: vd[r] = sum over c of M[c][r] * v[c].
@@ -633,7 +678,6 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  * column 0. That property is what the test pins, and it is the one that
  * distinguishes this from its transpose. */
 void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
     float m[4][4];
     int d[4], t[4];
     matrix_read(vs, size, m);
@@ -642,14 +686,20 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
     float in[4], out[4];
     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
+    /* The hardware applies S to the last matrix column and T to the vector,
+     * both only for the final output element. */
+    apply_st(m[size - 1], size, 0);
+    apply_st(in, size, 1);
     for (int r = 0; r < size; r++) {
         float sum = 0.0f;
         for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
         out[r] = sum;
     }
     /* vd may be one of the sources, so write only after the whole result is
-     * computed. */
-    for (int r = 0; r < size; r++) psp_cpu.v[d[r]] = out[r];
+     * computed. The D prefix masks/saturates the last element only. */
+    for (int r = 0; r < size - 1; r++) psp_cpu.v[d[r]] = out[r];
+    if (apply_d_lane(&out[size - 1], size - 1)) psp_cpu.v[d[size - 1]] = out[size - 1];
+    end_op();
 }
 
 /* Matrix product: Md = Ms^T * Mt. The first operand is used transposed, which
@@ -662,10 +712,13 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  * expects. Without the transpose it arrived transposed, and the first
  * transformed vertex landed at (-83408, -47266). */
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vmmul")) return;
     float a[4][4], b[4][4], out[4][4];
     matrix_read(vs, size, a);
     matrix_read(vt, size, b);
+    /* S and T swizzle the final dot product; the D prefix touches only the
+     * final destination element. */
+    apply_st(a[size - 1], size, 0);
+    apply_st(b[size - 1], size, 1);
 
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) {
@@ -673,7 +726,15 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
             for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
             out[c][r] = sum;
         }
-    matrix_write(vd, size, out);
+    int dc[4][4];
+    matrix_cols(vd, size, dc);
+    for (int c = 0; c < size; c++)
+        for (int r = 0; r < size; r++) {
+            if (c == size - 1 && r == size - 1 &&
+                !apply_d_lane(&out[c][r], size - 1)) continue;
+            psp_cpu.v[dc[c][r]] = out[c][r];
+        }
+    end_op();
 }
 
 /* Compare, writing one condition bit per lane plus the any/all summary bits

@@ -206,10 +206,11 @@ static void test_prefixes(void) {
     CHECK_F(out[3], 99.0f, "masked lane is not written");
     CHECK(psp_vfpu_trap_count() == traps, "vector ops with prefixes do not trap");
 
-    /* Matrix ops do not apply prefixes, so a pending one still traps. */
+    /* Matrix ops consume prefixes and apply their narrow last-column effects;
+     * they do not trap on a pending prefix. */
     psp_vfpu_set_prefix(0, 0x55);
     psp_vmmul(0x10, 0x00, 0x04, 4);
-    CHECK(psp_vfpu_trap_count() == traps + 1, "a prefixed matrix op traps");
+    CHECK(psp_vfpu_trap_count() == traps, "a prefixed matrix op does not trap");
     CHECK(!psp_vfpu_prefix_pending(), "and consumes the prefix");
 }
 
@@ -555,32 +556,33 @@ static void test_conversions(void) {
  * without applying the general swizzle rules to the matrix. Refusing to write
  * a value that ignored the prefix is intentional -- a plausible wrong matrix
  * is worse than a loud trap during bring-up. Lock that decision in. */
-static void test_matrix_prefix_trap(void) {
+/* Matrix ops apply the narrow prefix effects the hardware documents through
+ * the emulator oracle: source swizzle on the last column, destination mask on
+ * the last column. They are not the general vector prefix path. */
+static void test_matrix_prefixes(void) {
     psp_vfpu_reset();
-    float a[4][4] = {{0}}, b[4][4] = {{0}}, out[4][4];
+    float a[4][4] = {{0}}, out[4][4];
     a[0][0] = 1; a[1][0] = 2; a[0][1] = 3; a[1][1] = 4;
-    b[0][0] = 5; b[1][0] = 6; b[0][1] = 7; b[1][1] = 8;
+
     set_matrix(0x08, 2, a);
-    set_matrix(0x10, 2, b);
-    memset(out, 0, sizeof out);
-    set_matrix(0x00, 2, out);
-
-    /* A prefix pending on a source operand makes the matrix op refuse to run
-     * and traps once; the prefix is still consumed, so the op after it is
-     * unaffected. */
+    /* vpfxs [x,x,x,x]: every lane of the last source column reads lane 0. */
     psp_vfpu_set_prefix(0, 0x000000);
-    const uint64_t traps = psp_vfpu_trap_count();
-    psp_vmmul(0x00, 0x08, 0x10, 2);
-    CHECK(psp_vfpu_trap_count() == traps + 1, "prefixed vmmul traps once");
-    CHECK(!psp_vfpu_prefix_pending(), "the pending prefix is consumed");
+    psp_vmmov(0x00, 0x08, 2);
+    CHECK(!psp_vfpu_prefix_pending(), "the matrix op consumes its prefix");
     get_matrix(0x00, 2, out);
-    CHECK_F(out[0][0], 0.0f, "the prefixed matrix op does not write a wrong value");
+    CHECK_F(out[0][0], 1.0f, "first column is unchanged");
+    CHECK_F(out[0][1], 3.0f, "first column row 1 unchanged");
+    CHECK_F(out[1][0], 2.0f, "last column broadcasts lane 0");
+    CHECK_F(out[1][1], 2.0f, "last column broadcasts lane 0 again");
 
-    /* Without a prefix the same operands compute normally. */
-    psp_vmmul(0x00, 0x08, 0x10, 2);
-    CHECK(psp_vfpu_trap_count() == traps + 1, "unprefixed vmmul does not trap");
+    /* vpfxd mask on lane 0: the last column's first row keeps its old value. */
+    set_matrix(0x08, 2, a);
+    set_matrix(0x00, 2, a);
+    psp_vfpu_set_prefix(2, 1u << 8);
+    psp_vmmov(0x00, 0x08, 2);
     get_matrix(0x00, 2, out);
-    CHECK_F(out[0][0], 26.0f, "unprefixed vmmul still computes");
+    CHECK_F(out[1][0], 2.0f, "masked destination lane keeps its value");
+    CHECK_F(out[1][1], 4.0f, "unmasked destination lane is written");
 }
 
 int main(void) {
@@ -597,7 +599,7 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vmmul_orientation();
-    test_matrix_prefix_trap();
+    test_matrix_prefixes();
     test_conversions();
 
     psp_mem_free();
