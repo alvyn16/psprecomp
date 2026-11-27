@@ -201,6 +201,11 @@ library, which means it is implemented, not emulated.
       decoder and runtime, so the recompiled path can be diffed against it
       instruction-for-instruction. When they disagree, the bug is in exactly
       one of them. This is the bring-up tool that everything else leans on.
+      `src/interp.c` (`psprecomp_interp`) steps the integer core, branches,
+      delay slots and memory, models COP1 and VFPU by calling the same runtime
+      helpers the emitter calls, and routes import stubs through `psp_hle_call`.
+      `test_oracle_diff` compiles emitted C for synthetic streams and diffs the
+      full guest state against the interpreter.
 - [ ] **PPSSPP cross-check** — trace comparison against the external oracle at
       the syscall and frame level. See [`docs/ORACLE.md`](docs/ORACLE.md).
 - [ ] **First pixels** — a recompiled module reaching a rendered frame.
