@@ -176,6 +176,14 @@ int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
 
+/* Host audio sink. The SAS mixer writes its stereo grain into guest memory;
+ * a host (the SDL2 window on Linux) can register this callback to receive the
+ * same frames and play them. `rate` is the guest's sceSasCore sample rate.
+ * Pass NULL to detach. The callback may run on the guest thread. */
+typedef void (*psp_audio_sink_fn)(const int16_t *stereo, uint32_t frames,
+                                  uint32_t rate, void *user);
+void psp_audio_sink_set(psp_audio_sink_fn fn, void *user);
+
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 /* ThreadMan reset is a quiescent-host operation: all guest threads must have
