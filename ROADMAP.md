@@ -1,5 +1,9 @@
 # Roadmap
 
+> **Fork note.** This is the Linux-focused `alvyn16/psprecomp` fork. Defaults
+> and CI here differ from upstream (see [docs/FORK.md](docs/FORK.md)); the
+> checkboxes record original intent, not necessarily this fork's current state.
+
 Phased plan. Phases 1 and 2a are done; 2b is useful but not a gate. For what
 is implemented *now*, see the Status table in README.md and the CHANGELOG —
 the checkboxes below record original intent, not necessarily current state.

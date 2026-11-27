@@ -1,6 +1,11 @@
 # Linux host
 
-Linux is the primary target of this fork. The recompiler and runtime are plain
+This page describes `alvyn16/psprecomp`, the Linux-focused fork of
+[sp00nznet/psprecomp](https://github.com/sp00nznet/psprecomp). See
+[FORK.md](FORK.md) for why the defaults differ from upstream and how to track
+upstream changes.
+
+Linux is the primary target here. The recompiler and runtime are plain
 C11 and build with gcc or clang; the only optional dependency is SDL2, used for
 the window that displays the front buffer and feeds `sceCtrl`.
 
