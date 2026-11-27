@@ -585,6 +585,53 @@ static void test_matrix_prefixes(void) {
     CHECK_F(out[1][1], 4.0f, "unmasked destination lane is written");
 }
 
+static void test_vfpu9_and_unaligned_store(void) {
+    psp_vfpu_reset();
+    float out[4];
+    int r[4];
+
+    const float v[4] = { 4.0f, 1.0f, 7.0f, 2.0f };
+    set_quad(0x00, v);
+    psp_vsrt(2, 0x04, 0x00, 4);               /* vsrt2: min(w,x), min(z,y), max(z,y), max(w,x) */
+    get_quad(0x04, out);
+    CHECK_F(out[0], 2.0f, "vsrt2 lane 0 = min(w,x)");
+    CHECK_F(out[1], 1.0f, "vsrt2 lane 1 = min(z,y)");
+    CHECK_F(out[2], 7.0f, "vsrt2 lane 2 = max(z,y)");
+    CHECK_F(out[3], 4.0f, "vsrt2 lane 3 = max(w,x)");
+
+    psp_vsrt(4, 0x08, 0x00, 4);               /* vsrt4: max(x,w), max(y,z), min(z,y), min(w,x) */
+    get_quad(0x08, out);
+    CHECK_F(out[0], 4.0f, "vsrt4 lane 0 = max(x,w)");
+    CHECK_F(out[1], 7.0f, "vsrt4 lane 1 = max(y,z)");
+    CHECK_F(out[2], 1.0f, "vsrt4 lane 2 = min(z,y)");
+    CHECK_F(out[3], 2.0f, "vsrt4 lane 3 = min(w,x)");
+
+    const float h[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    set_quad(0x00, h);
+    psp_vfad(0x04, 0x00, 4);
+    psp_vfpu_regs(0x04, 1, r);
+    CHECK_F(psp_cpu.v[r[0]], 10.0f, "vfad sums quad");
+    psp_vavg(0x04, 0x00, 4);
+    CHECK_F(psp_cpu.v[r[0]], 2.5f, "vavg averages quad");
+
+    const uint32_t c8[4] = { 0xFF804020u, 0x00FFFFFFu, 0x00000000u, 0xF0E0D0C0u };
+    set_bits(0x00, 4, c8);
+    psp_vcolor(1, 0x04, 0x00, 4);             /* vt4444 */
+    psp_vfpu_regs(0x04, 2, r);
+    CHECK(psp_f32_to_bits(psp_cpu.v[r[0]]) == 0x0FFFF842u &&
+          psp_f32_to_bits(psp_cpu.v[r[1]]) == 0xFEDC0000u,
+          "vt4444 packs two pairs: 0x%08X 0x%08X",
+          psp_f32_to_bits(psp_cpu.v[r[0]]), psp_f32_to_bits(psp_cpu.v[r[1]]));
+
+    /* Unaligned 4-byte store via svr.q ptr+0 + svl.q ptr+12. */
+    set_quad(0x00, v);
+    uint32_t base = 0x08800004u;
+    psp_svr_q(0x00, base + 0);
+    psp_svl_q(0x00, base + 12);
+    for (int i = 0; i < 4; i++)
+        CHECK_F(psp_read_f32(base + (uint32_t)i * 4u), v[i], "svr.q+svl.q lane");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -601,6 +648,7 @@ int main(void) {
     test_vmmul_orientation();
     test_matrix_prefixes();
     test_conversions();
+    test_vfpu9_and_unaligned_store();
 
     psp_mem_free();
 

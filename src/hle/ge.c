@@ -126,8 +126,11 @@ typedef struct {
     uint32_t id;
     uint32_t list;      /* current read pointer */
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
-    uint32_t base;      /* GE_BASE: high bits for addresses */
-    uint32_t origin;
+    uint32_t base;      /* GE_BASE: bits 27:24 for addresses */
+    uint32_t offset;    /* GE_OFFSET_ADDR / GE_ORIGIN_ADDR */
+    uint32_t stack_pc[GE_STACK];
+    uint32_t stack_off[GE_STACK];
+    int      sp;
     int      used;
     int      done;
 } ge_queue;
@@ -681,20 +684,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * Taken literally, 0x88000 is main RAM: for a vaddr-0 module, its own code. */
 static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZE - 1)); }
 
+static uint32_t ge_rel_addr(const ge_queue *q, uint32_t data24) {
+    uint32_t base_ext = (q->base & 0x0F000000u) | (data24 & 0x00FFFFFFu);
+    return (q->offset + base_ext) & 0x0FFFFFFFu;
+}
+
 /* Walk a list until END/FINISH, the stall address, or a step budget.
  *
  * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
  * intermediate state while the CPU is still writing, and without a bound a
  * malformed or partially-written list hangs the host with no diagnostic. */
 static void run_list(ge_queue *q) {
-    uint32_t stack[GE_STACK];
-    int sp = 0;
     uint64_t budget = 1u << 22;
 
     g_ge.lists++;
 
     while (budget--) {
-        if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+        if (q->stall && (q->list & PSP_ADDR_MASK) == (q->stall & PSP_ADDR_MASK)) break;   /* caught up to the CPU */
 
         uint32_t word = psp_read32(q->list);
         uint32_t cmd  = word >> 24;
@@ -723,14 +729,22 @@ static void run_list(ge_queue *q) {
             break;
 
         case GE_JUMP:
-            q->list = (q->base | (arg & 0xFFFFFC));
+            q->list = ge_rel_addr(q, arg & 0xFFFFFCu);
             break;
         case GE_CALL:
-            if (sp < GE_STACK) stack[sp++] = q->list;
-            q->list = (q->base | (arg & 0xFFFFFC));
+            if (q->sp < GE_STACK) {
+                q->stack_pc[q->sp] = q->list;
+                q->stack_off[q->sp] = q->offset;
+                q->sp++;
+            }
+            q->list = ge_rel_addr(q, arg & 0xFFFFFCu);
             break;
         case GE_RET:
-            if (sp > 0) q->list = stack[--sp];
+            if (q->sp > 0) {
+                q->sp--;
+                q->list = q->stack_pc[q->sp] & 0x0FFFFFFFu;
+                q->offset = q->stack_off[q->sp];
+            }
             break;
         case GE_BJUMP:
             /* Conditional on the bounding-box test, which needs geometry we do
@@ -754,9 +768,9 @@ static void run_list(ge_queue *q) {
              * (no scheduler), so this is recorded and ignored. */
             break;
 
-        case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
-        case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
-        case GE_OFFSET_ADDR: q->base = arg << 8; break;
+        case GE_BASE:        q->base = (arg & 0x0F0000u) << 8; break;
+        case GE_ORIGIN_ADDR: q->offset = (q->list - 4) & 0x0FFFFFFFu; break;
+        case GE_OFFSET_ADDR: q->offset = arg << 8; break;
 
         case GE_VTYPE: g_ge.vtype = arg; break;
         case GE_FBP:
@@ -884,8 +898,8 @@ static void run_list(ge_queue *q) {
         case GE_SFIX:  g_ds.blend_sfix = arg; break;
         case GE_DFIX:  g_ds.blend_dfix = arg; break;
 
-        case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
-        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
+        case GE_VADDR: g_ge.vaddr = ge_rel_addr(q, arg); break;
+        case GE_IADDR: g_ge.iaddr = ge_rel_addr(q, arg); break;
 
         default:
             if (light_cmd(cmd, arg)) break;

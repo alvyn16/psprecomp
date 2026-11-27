@@ -236,6 +236,24 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
         psp_write_f32(addr + (uint32_t)i * 4, psp_cpu.v[r[i]]);
 }
 
+void psp_svl_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    addr &= ~3u;
+    const int offset = (int)((addr >> 2) & 3u);
+    for (int i = 0; i < offset + 1; i++)
+        psp_write_f32(addr - (uint32_t)i * 4u, psp_cpu.v[r[3 - i]]);
+}
+
+void psp_svr_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    addr &= ~3u;
+    const int offset = (int)((addr >> 2) & 3u);
+    for (int i = 0; i < (3 - offset) + 1; i++)
+        psp_write_f32(addr + (uint32_t)i * 4u, psp_cpu.v[r[i]]);
+}
+
 /* ---- arithmetic ---------------------------------------------------------- */
 
 #define BINOP(name, expr)                                                    \
@@ -488,6 +506,83 @@ void psp_vpack(int op, uint32_t vd, uint32_t vs, int size) {
         break;
     }
     if (nout < 1) nout = 1;
+    lanes4(vd, nout, dl);
+    const uint32_t mask = g_prefix_set[2] ? g_prefix[2] : 0;
+    for (int i = 0; i < nout; i++)
+        if (!((mask >> (8 + i)) & 1)) psp_cpu.v[dl[i]] = psp_bits_to_f32(out[i]);
+    end_op();
+}
+
+void psp_vsrt(int kind, uint32_t vd, uint32_t vs, int size) {
+    float s[4] = { 0 }, t[4] = { 0 }, out[4] = { 0 };
+    static const int SW13[4] = { 1, 0, 3, 2 };
+    static const int SW24[4] = { 3, 2, 1, 0 };
+    const int *sw = (kind == 1 || kind == 3) ? SW13 : SW24;
+    int l[4];
+    lanes4(vs, size, l);
+    read_src(0, vs, size, s);
+    for (int i = 0; i < size; i++) t[i] = psp_cpu.v[l[sw[i]]];
+    if (g_prefix_set[1]) {
+        const uint32_t p = g_prefix[1];
+        for (int i = 0; i < size; i++) {
+            const int absf = (int)(p >> (8 + i)) & 1;
+            const int k    = (int)(p >> (12 + i)) & 1;
+            float x = k ? PFX_CONST[sw[i] | (absf << 2)] : t[i];
+            if (!k && absf) x = fabsf(x);
+            if ((p >> (16 + i)) & 1) x = -x;
+            t[i] = x;
+        }
+    }
+    for (int i = 0; i < size; i++) {
+        const int want_max = (kind == 1) ? (i == 1 || i == 3)
+                           : (kind == 2) ? (i >= 2)
+                           : (kind == 3) ? (i == 0 || i == 2)
+                           :               (i < 2);
+        out[i] = want_max ? (s[i] > t[i] ? s[i] : t[i])
+                          : (t[i] < s[i] ? t[i] : s[i]);
+    }
+    write_dst(vd, size, out);
+    end_op();
+}
+
+static void horiz_reduce(uint32_t vd, uint32_t vs, int size, float scale) {
+    float s[4], out[4] = { 0 };
+    read_src(0, vs, size, s);
+    for (int i = 0; i < size; i++) out[0] += s[i] * scale;
+    write_dst(vd, 1, out);
+    end_op();
+}
+
+void psp_vfad(uint32_t vd, uint32_t vs, int size) { horiz_reduce(vd, vs, size, 1.0f); }
+void psp_vavg(uint32_t vd, uint32_t vs, int size) {
+    horiz_reduce(vd, vs, size, size > 1 ? 1.0f / (float)size : 0.0f);
+}
+
+void psp_vcolor(int mode, uint32_t vd, uint32_t vs, int size) {
+    int sl[4], dl[4];
+    lanes4(vs, 4, sl);
+    uint32_t src[4];
+    for (int i = 0; i < 4; i++) src[i] = psp_f32_to_bits(psp_cpu.v[sl[i]]);
+    if (g_prefix_set[0]) {
+        const uint32_t p = g_prefix[0];
+        uint32_t perm[4];
+        for (int i = 0; i < 4; i++) perm[i] = src[(p >> (2 * i)) & 3u];
+        memcpy(src, perm, sizeof src);
+    }
+    uint16_t cols[4];
+    for (int i = 0; i < 4; i++) {
+        const uint32_t in = src[i];
+        const uint32_t r = in & 0xFFu, g = (in >> 8) & 0xFFu;
+        const uint32_t b = (in >> 16) & 0xFFu, a = (in >> 24) & 0xFFu;
+        cols[i] = (uint16_t)(mode == 1 ? (((a >> 4) << 12) | ((b >> 4) << 8) | ((g >> 4) << 4) | (r >> 4))
+                           : mode == 2 ? (((a >> 7) << 15) | ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3))
+                                       : (((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3)));
+    }
+    const uint32_t out[2] = {
+        (uint32_t)cols[0] | ((uint32_t)cols[1] << 16),
+        (uint32_t)cols[2] | ((uint32_t)cols[3] << 16)
+    };
+    const int nout = size == 1 ? 1 : 2;
     lanes4(vd, nout, dl);
     const uint32_t mask = g_prefix_set[2] ? g_prefix[2] : 0;
     for (int i = 0; i < nout; i++)

@@ -212,6 +212,7 @@ int psp_window_closed(void) { return g_closed != 0; }
 
 static volatile int g_closed;
 static int g_scale;
+static int g_win_w = W * 2, g_win_h = H * 2;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 static SDL_GameController *g_pad;
@@ -317,14 +318,11 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
 static void render(SDL_Renderer *r, SDL_Texture *tex) {
     int cw, ch;
     SDL_GetRendererOutputSize(r, &cw, &ch);
-    int scale = g_scale;
-    if (scale > 0 && (W * scale > cw || H * scale > ch)) scale = 0;
-    if (scale <= 0) {
-        scale = cw / W;
-        if (ch / H < scale) scale = ch / H;
-        if (scale < 1) scale = 1;
-    }
-    const SDL_Rect dst = { (cw - W * scale) / 2, (ch - H * scale) / 2, W * scale, H * scale };
+    int dw = cw, dh = cw * H / W;
+    if (dh > ch) { dh = ch; dw = ch * W / H; }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    const SDL_Rect dst = { (cw - dw) / 2, (ch - dh) / 2, dw, dh };
     SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
     SDL_RenderClear(r);
     if (psp_display_read(g_px) == 0) {
@@ -339,8 +337,8 @@ static void render(SDL_Renderer *r, SDL_Texture *tex) {
 static int SDLCALL window_main(void *arg) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED,
-                                       SDL_WINDOWPOS_CENTERED, W * g_scale, H * g_scale,
-                                       SDL_WINDOW_SHOWN);
+                                       SDL_WINDOWPOS_CENTERED, g_win_w, g_win_h,
+                                       SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!win) { g_closed = 1; SDL_SemPost((SDL_sem *)arg); return 1; }
     g_focused = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
     /* VSync gives natural 60 Hz pacing; the software fallback keeps the old
@@ -425,14 +423,25 @@ int psp_window_start(const char *title, int scale) {
     if (title) g_title = title;
     g_closed = 0;
     g_scale = scale;
-    if (g_scale <= 0) {
-        SDL_DisplayMode m;
-        g_scale = (SDL_GetCurrentDisplayMode(0, &m) == 0 && m.h > H)
-                      ? m.h * 7 / 10 / H : 1;
-        if (g_scale < 1) g_scale = 1;
-    }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS |
                  SDL_INIT_AUDIO) != 0) return -1;
+    if (g_scale > 0) {
+        g_win_w = W * g_scale;
+        g_win_h = H * g_scale;
+    } else {
+        g_win_w = W * 3;
+        g_win_h = H * 3;
+        SDL_DisplayMode m;
+        if (SDL_GetCurrentDisplayMode(0, &m) == 0 && m.w > W && m.h > H) {
+            int dw = m.w * 85 / 100;
+            int dh = dw * H / W;
+            if (dh > m.h * 85 / 100) {
+                dh = m.h * 85 / 100;
+                dw = dh * W / H;
+            }
+            if (dw >= W && dh >= H) { g_win_w = dw; g_win_h = dh; }
+        }
+    }
 
     /* SAS keeps mixing into guest memory regardless; a host audio device just
      * makes the same frames audible. No device is not a fatal error. */

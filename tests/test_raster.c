@@ -846,6 +846,44 @@ static void test_near_clip_modes(void) {
     CHECK(pixel(250, 200) == 0xFFFF00FFu, "clipped triangle fan anchors v0 for second wedge: 0x%08X", pixel(250, 200));
 }
 
+/* CALL/RET with ORIGIN_ADDR and OFFSET_ADDR across uncached stall addresses. */
+static void test_list_offset_origin_and_uncached_stall(void) {
+    psp_ge_reset();
+    clear_fb();
+    psp_mem_bad_access = 0;
+
+    /* Subroutine at 0x08810100: ORIGIN, draws green sprite using relative VADDR, then RET. */
+    uint32_t sub = 0x08810100u;
+    uint32_t verts_rel = 0x08810140u;
+    psp_write32(sub + 0,  (0x14u << 24));                           /* ORIGIN -> offset = sub */
+    psp_write32(sub + 4,  (0x10u << 24));                           /* BASE 0 */
+    psp_write32(sub + 8,  (0x12u << 24) | VTYPE_2D);                /* VTYPE */
+    psp_write32(sub + 12, (0x01u << 24) | (verts_rel - sub));       /* VADDR = offset + 0x40 */
+    psp_write32(sub + 16, (0x04u << 24) | (6u << 16) | 2u);         /* PRIM SPRITES */
+    psp_write32(sub + 20, (0x0Bu << 24));                           /* RET (restores caller offset) */
+
+    psp_write32(verts_rel + 0,  0xFF00FF00u);
+    psp_write16(verts_rel + 4,  10); psp_write16(verts_rel + 6,  10); psp_write16(verts_rel + 8, 0);
+    psp_write32(verts_rel + 12, 0xFF00FF00u);
+    psp_write16(verts_rel + 16, 20); psp_write16(verts_rel + 18, 20); psp_write16(verts_rel + 20, 0);
+
+    g_pc = 0;
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x13, ((sub & 0xFF000000u) >> 8) | ((sub >> 8) & 0xFFFFu)); /* OFFSET_ADDR = sub & ~0xFF */
+    cmd(0x10, 0);                                                   /* BASE must not clobber OFFSET */
+    cmd(0x0A, sub & 0xFFu);                                         /* CALL sub via offset + base */
+    uint32_t stall1 = (LIST + g_pc) | 0x40000000u;                  /* uncached stall right at RET point */
+    uint32_t qid = call(0xAB49E76A, LIST | 0x40000000u, stall1, 0, 0);
+    CHECK(pixel(15, 15) == 0xFF00FF00u, "ORIGIN+OFFSET+CALL draws before uncached stall: 0x%08X", pixel(15, 15));
+    CHECK(psp_mem_bad_access == 0, "no bad access across uncached stall stop");
+
+    cmd(0x0F, 0); /* FINISH */
+    cmd(0x0C, 0); /* END */
+    call(0xE0D68148, qid, (LIST + g_pc) | 0x40000000u, 0, 0);       /* sceGeListUpdateStallAddr */
+    CHECK(psp_mem_bad_access == 0, "no bad access finishing after stall update");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -872,6 +910,7 @@ int main(void) {
     test_vertex_flow();
     test_lighting();
     test_backend_selection();
+    test_list_offset_origin_and_uncached_stall();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

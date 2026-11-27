@@ -48,6 +48,8 @@ void psp_lv_s(uint32_t vt, uint32_t addr);
 void psp_lv_q(uint32_t vt, uint32_t addr);
 void psp_sv_s(uint32_t vt, uint32_t addr);
 void psp_sv_q(uint32_t vt, uint32_t addr);
+void psp_svl_q(uint32_t vt, uint32_t addr);
+void psp_svr_q(uint32_t vt, uint32_t addr);
 
 /* Element-wise arithmetic across `size` lanes. */
 void psp_vadd(uint32_t vd, uint32_t vs, uint32_t vt, int size);
@@ -86,6 +88,13 @@ enum {
     PSP_VP_UC2I, PSP_VP_C2I, PSP_VP_US2I, PSP_VP_S2I
 };
 void psp_vpack(int op, uint32_t vd, uint32_t vs, int size);
+
+/* Vector horizontal reductions, sort permutations, and 16-bit colour packing
+ * (VFPU9). mode for psp_vcolor: 1=4444, 2=5551, 3=5650. */
+void psp_vsrt(int kind, uint32_t vd, uint32_t vs, int size);
+void psp_vfad(uint32_t vd, uint32_t vs, int size);
+void psp_vavg(uint32_t vd, uint32_t vs, int size);
+void psp_vcolor(int mode, uint32_t vd, uint32_t vs, int size);
 
 /* mfv / mtv, and mfvc / mtvc when bit 7 of `reg` is set (control registers:
  * 0-2 the prefixes, 3 the condition codes). */
