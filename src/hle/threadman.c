@@ -719,7 +719,9 @@ static int others_alive(void) {
 }
 #endif
 
+#if PSPRECOMP_REAL_THREADS
 static uint64_t g_wait_long;          /* long waits reported, real threads */
+#endif
 
 static void warn_wait(const char *what, const char *name) {
 #if !PSPRECOMP_REAL_THREADS

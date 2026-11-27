@@ -459,10 +459,14 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
 static void read3(uint32_t a, int fmt, int raw, float v[3]) {
     for (int i = 0; i < 3; i++) {
         switch (fmt) {
-        case 1:  v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
-                 if (!raw) v[i] /= 128.0f; break;
-        case 2:  v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
-                 if (!raw) v[i] /= 32768.0f; break;
+        case 1:
+            v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
+            if (!raw) v[i] /= 128.0f;
+            break;
+        case 2:
+            v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
+            if (!raw) v[i] /= 32768.0f;
+            break;
         default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
         }
     }
