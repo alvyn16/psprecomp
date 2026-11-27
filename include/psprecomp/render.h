@@ -23,7 +23,10 @@ typedef struct {
     float    z;              /* depth, 0..65535 */
     uint32_t rgba;
     float    u, v;
-    int      behind;         /* behind the eye: triangles using it are dropped */
+    int      behind;         /* behind the eye; transformed vertices are clipped */
+    /* Homogeneous clip-space position, kept so a triangle that straddles the
+     * near plane can be clipped and reprojected instead of dropped whole. */
+    float    clip[4];
 } psp_vertex;
 
 /* GE primitive types, from the PRIM argument's type field. */

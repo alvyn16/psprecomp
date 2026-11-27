@@ -228,6 +228,52 @@ static void test_transformed_quad(void) {
     CHECK(pixel(300, 64) == 0, "top edge is at y=68: 0x%08X", pixel(300, 64));
 }
 
+/* A transformed triangle with a vertex behind the eye used to be dropped
+ * whole. With clipping it keeps the part in front of the near plane. The
+ * projection here makes clip w = -z_eye, so z = +1 is behind and z = -1 is in
+ * front; the two front vertices put the top edge at y = 68. */
+static void fvertex_z(int idx, float x, float y, float z, uint32_t rgba) {
+    uint32_t a = VERTS + (uint32_t)idx * 24;
+    psp_write32(a + 0, fbits(0));
+    psp_write32(a + 4, fbits(0));
+    psp_write32(a + 8, rgba);
+    psp_write32(a + 12, fbits(x));
+    psp_write32(a + 16, fbits(y));
+    psp_write32(a + 20, fbits(z));
+}
+
+static void test_near_plane_clipping(void) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, VTYPE_3D);
+    cmd(0x01, VERTS & 0xFFFFFF);
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+
+    const float ident[12] = { 1,0,0, 0,1,0, 0,0,1, 0,0,0 };
+    cmd(0x3A, 0); for (int k = 0; k < 12; k++) fcmd(0x3B, ident[k]);
+    cmd(0x3C, 0); for (int k = 0; k < 12; k++) fcmd(0x3D, ident[k]);
+    /* Projection is 4x4: the last row makes clip w = -z_eye. */
+    const float proj[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,-1, 0,0,0,0 };
+    cmd(0x3E, 0); for (int k = 0; k < 16; k++) fcmd(0x3F, proj[k]);
+
+    fvertex_z(0, -0.5f,  0.5f, -1.0f, 0xFFFFFFFFu);
+    fvertex_z(1,  0.5f,  0.5f, -1.0f, 0xFFFFFFFFu);
+    fvertex_z(2,  0.0f,  0.5f,  1.0f, 0xFFFFFFFFu);   /* behind the eye */
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+
+    CHECK(psp_ge_pixels() > 0, "a straddling triangle draws pixels, got %llu",
+          (unsigned long long)psp_ge_pixels());
+    CHECK(pixel(240, 60) == 0xFFFFFFFFu, "the front part survives: 0x%08X", pixel(240, 60));
+}
+
 static void test_triangle_strip(void) {
     psp_ge_reset();
     clear_fb();
@@ -682,6 +728,7 @@ int main(void) {
     test_winding();
     test_clipping();
     test_transformed_quad();
+    test_near_plane_clipping();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
     test_textured_sprite();
