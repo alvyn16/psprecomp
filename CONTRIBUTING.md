@@ -2,32 +2,38 @@
 
 Thanks for your interest in the PSP static-recompilation toolkit. This page
 covers building, testing, what a PR needs, and where your code may come from.
+**This is the Linux-focused fork** — see [docs/FORK.md](docs/FORK.md) for how it
+differs from upstream.
 
 ## Development environment
 
-- **Windows 10/11 with Visual Studio 2022** (C workload). MSVC is the reference
-  compiler, and every change has to build with it.
-- **CMake 3.16+**
-- **Git**
+The reference host is **Ubuntu with gcc or clang** and **CMake 3.16+**. The
+runtime core still has no dependencies; the Linux defaults add SDL2 for the
+window, audio and input, and the optional ImGui UI also needs a C++ compiler:
 
-No other dependencies. The crypto, decoder and runtime are self-contained.
-
-```
-git clone https://github.com/sp00nznet/psprecomp.git
+```sh
+sudo apt-get install -y build-essential cmake libsdl2-dev pkg-config
+git clone https://github.com/alvyn16/psprecomp.git
 cd psprecomp
-cmake -S . -B build
-cmake --build build --config Release
-ctest --test-dir build -C Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-The expected result is `100% tests passed, 0 tests failed out of 10`. Every
-suite uses synthetic code and needs no game data.
+By default this enables the SDL2 window and cooperative guest threads. A
+dependency-free toolchain build is `-DPSPRECOMP_SDL2_WINDOW=OFF`; the ImGui
+state UI is `-DPSPRECOMP_IMGUI_UI=ON`. Every suite uses synthetic code and needs
+no game data.
+
+The Win32/GDI/XInput backend is still in the tree and is compiled by a
+best-effort Windows CI job. Changes should keep it building, but Linux is the
+target the defaults are chosen for.
 
 ## What a PR needs
 
-- **It builds and passes `ctest` with MSVC.** A runtime change that needs
-  POSIX-only APIs (`pthread.h`, `clock_gettime`) needs a Windows path too. Use
-  C11 `<threads.h>`, Win32, or a small shim.
+- **It builds and passes `ctest` on Linux** with the default options and with
+  `-DPSPRECOMP_SDL2_WINDOW=OFF`. Keep the Windows backend compiling too; a
+  POSIX-only API should be guarded or given a Win32 path.
 - **A test that fails on the old behaviour.** For the emitter, hand-build the
   analysis (see `hand_built()` in `tests/test_emit.c`) rather than relying on
   discovery order. Read generated output from the split units

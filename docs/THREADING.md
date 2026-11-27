@@ -1,22 +1,27 @@
 # Threading modes
 
-`PSPRECOMP_REAL_THREADS` is **OFF by default**. Without it,
-`sceKernelStartThread` runs the guest entry inline, saves/restores the caller's
-registers, and returns after that entry has ended. Sleep/delay calls do not
-wait in host time; an unsatisfied semaphore/event/pool wait returns a timeout
-without scheduling another guest. The callback, sub-interrupt and pool HLE
-added alongside the scheduler is available in both modes.
+In this Linux-focused fork, `PSPRECOMP_REAL_THREADS` is **ON by default on
+non-Windows hosts** and **OFF on Windows**. Cooperative scheduling is what lets
+a guest that waits on another thread make progress; the inline model below is
+the opt-out and the Windows default.
 
-To opt into experimental cooperative scheduling:
+With the inline model, `sceKernelStartThread` runs the guest entry inline,
+saves/restores the caller's registers, and returns after that entry has ended.
+Sleep/delay calls do not wait in host time; an unsatisfied semaphore/event/pool
+wait returns a timeout without scheduling another guest. The callback,
+sub-interrupt and pool HLE added alongside the scheduler is available in both
+modes.
+
+To opt out of cooperative scheduling on Linux:
 
 ```sh
-cmake -S . -B build-threads -DPSPRECOMP_REAL_THREADS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-threads --config Release
-ctest --test-dir build-threads -C Release --output-on-failure
+cmake -S . -B build-inline -DPSPRECOMP_REAL_THREADS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-inline -j"$(nproc)"
+ctest --test-dir build-inline -C Release --output-on-failure
 ```
 
-For the default mode use a separate build directory and omit the option (or
-set it explicitly to `OFF`). CMake exports the selected `0`/`1` definition to
+The default Linux build needs no flag. CMake exports the selected `0`/`1`
+definition to
 consumers of the `psprecomp` target. Do not mix runtime libraries and test
 binaries from different configurations. A failed build must stop before tests.
 

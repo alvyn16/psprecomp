@@ -7,6 +7,17 @@
 
 ---
 
+> **This is `alvyn16/psprecomp`, a Linux-focused fork** of
+> [sp00nznet/psprecomp](https://github.com/sp00nznet/psprecomp).
+> Linux is the primary host here: SDL2 window, cooperative guest threads and a
+> dependency-free core build are the defaults, with an optional GPU sprite
+> backend, SDL audio, save states and an ImGui state UI. The Windows backend is
+> retained but is no longer the reference target; CI treats it as best-effort.
+> See [docs/FORK.md](docs/FORK.md) for the full rationale and all the escape
+> hatches.
+
+---
+
 ## What Is This?
 
 **psprecomp** is an open-source toolkit providing the analysis tools, code
@@ -208,6 +219,8 @@ program, and both producing plausible values rather than visible failures:
 
 | Document | What It Covers |
 |----------|---------------|
+| **[This fork](docs/FORK.md)** | Why Linux is the default, what changed, how to track upstream |
+| **[Linux host](docs/LINUX.md)** | Packages, build options, controls, audio, rendering and states |
 | **[Architecture](docs/ARCHITECTURE.md)** | Allegrex overview, pipeline stages, memory model |
 | **[Containers](docs/CONTAINERS.md)** | ISO9660 → PBP → `~PSP` → PRX, and how to identify each |
 | **[Decryption](docs/DECRYPT.md)** | KIRK, key tags, and supplying your own key material |
