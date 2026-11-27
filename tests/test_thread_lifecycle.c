@@ -37,7 +37,15 @@ static uint32_t create(void) {
     return id;
 }
 
-static void normal_entry(void) { stage++; psp_cpu.r[PSP_REG_V0] = 0x55; }
+static void normal_entry(void) {
+    uint32_t k0 = psp_cpu.r[PSP_REG_K0];
+    REQUIRE(k0 != 0);
+    REQUIRE(psp_read32(k0 + 4) == 0);
+    psp_write32(k0 + 4, 0xCAFEBABEu);
+    REQUIRE(psp_read32(k0 + 4) == 0xCAFEBABEu);
+    stage++;
+    psp_cpu.r[PSP_REG_V0] = 0x55;
+}
 static void delete_entry(void) {
     stage++;
     call("sceKernelExitDeleteThread", 0x1234, 0, 0, 0);

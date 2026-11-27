@@ -116,7 +116,10 @@ static void check_parses_the_documented_shape(void) {
         "]\r\n"
         "\r\n"
         "[[label]]\r\n"
-        "at = [0x0031D974]\r\n";
+        "at = [0x0031D974]\r\n"
+        "\r\n"
+        "[[func]]\r\n"
+        "at = [0x08BB9700, 0x08BB9778, 0x08BB9700]\r\n";
 
     CHECK(write_file(path, text) == 0, "the hints file is written");
 
@@ -124,6 +127,11 @@ static void check_parses_the_documented_shape(void) {
     char err[512];
     CHECK(a_hints_load(path, &h, err, sizeof err) == 0, "the documented shape loads: %s", err);
     CHECK(h.nlabels == 5, "five distinct addresses, got %d", h.nlabels);
+    CHECK(h.nfuncs == 2, "two distinct func seeds, got %d", h.nfuncs);
+    if (h.nfuncs == 2) {
+        CHECK(h.funcs[0] == 0x08BB9700u, "first func seed");
+        CHECK(h.funcs[1] == 0x08BB9778u, "second func seed");
+    }
     if (h.nlabels == 5) {
         CHECK(h.labels[0] == 0x0031D93Cu, "first address is hex");
         CHECK(h.labels[1] == 0x0031D944u, "`_` is a digit separator");

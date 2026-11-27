@@ -140,21 +140,23 @@ static int parse_address(lex *L, uint32_t *out) {
     return 0;
 }
 
-static int push_label(lex *L, a_hints *h, uint32_t addr) {
-    for (int i = 0; i < h->nlabels; i++)
-        if (h->labels[i] == addr) return 0;         /* listing it twice is not an error */
+static int push_addr(lex *L, uint32_t **arr, int *n, uint32_t addr) {
+    for (int i = 0; i < *n; i++)
+        if ((*arr)[i] == addr) return 0;            /* listing it twice is not an error */
 
-    /* realloc-per-entry keeps this simple; a hints file has tens of addresses,
-     * not thousands, and the read happens once per emit. */
-    uint32_t *p = (uint32_t *)realloc(h->labels, (size_t)(h->nlabels + 1) * sizeof *p);
+    /* realloc-per-entry keeps this simple; a hints file has tens to hundreds of
+     * addresses and the read happens once per emit. */
+    uint32_t *p = (uint32_t *)realloc(*arr, (size_t)(*n + 1) * sizeof *p);
     if (!p) return err_at(L, L->line, "out of memory");
-    h->labels = p;
-    h->labels[h->nlabels++] = addr;
+    *arr = p;
+    (*arr)[(*n)++] = addr;
     return 0;
 }
 
+typedef enum { HINT_NONE = 0, HINT_LABEL, HINT_FUNC } hint_table;
+
 /* `at = [ ... ]`, with the `[` already consumed. */
-static int parse_at_array(lex *L, a_hints *h) {
+static int parse_at_array(lex *L, a_hints *h, hint_table kind) {
     /* Reported against the line the array was opened on: by the time the file
      * runs out, the reader has been moved past it, and "line 41: not closed"
      * for an array that starts on line 3 sends them to the wrong place. */
@@ -167,7 +169,11 @@ static int parse_at_array(lex *L, a_hints *h) {
 
         uint32_t addr;
         if (parse_address(L, &addr) != 0) return -1;
-        if (push_label(L, h, addr) != 0) return -1;
+        if (kind == HINT_FUNC) {
+            if (push_addr(L, &h->funcs, &h->nfuncs, addr) != 0) return -1;
+        } else {
+            if (push_addr(L, &h->labels, &h->nlabels, addr) != 0) return -1;
+        }
 
         skip_ws(L);
         if (cur(L) == ',') { advance(L); continue; }
@@ -178,7 +184,10 @@ static int parse_at_array(lex *L, a_hints *h) {
 }
 
 int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
-    if (out) { out->labels = NULL; out->nlabels = 0; }
+    if (out) {
+        out->labels = NULL; out->nlabels = 0;
+        out->funcs  = NULL; out->nfuncs  = 0;
+    }
     if (err && errlen) err[0] = '\0';
     if (!path) return 0;                 /* no hints file is not a failure */
 
@@ -187,7 +196,7 @@ int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
     blank_comments(text);
 
     lex L = { text, 0, 1, path, err, errlen };
-    int in_label = 0;
+    hint_table table = HINT_NONE;
     int rc = 0;
 
     for (;;) {
@@ -209,19 +218,22 @@ int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
             advance(&L);
             advance(&L);
 
-            if (strcmp(name, "label") != 0) {
+            if (strcmp(name, "label") == 0) {
+                table = HINT_LABEL;
+            } else if (strcmp(name, "func") == 0) {
+                table = HINT_FUNC;
+            } else {
                 char msg[160];
                 snprintf(msg, sizeof msg,
-                         "unknown hints table `%s`; this build understands `label`",
+                         "unknown hints table `%s`; this build understands `label` and `func`",
                          name);
                 rc = err_at(&L, L.line, msg);
                 break;
             }
-            in_label = 1;
             continue;
         }
 
-        if (!in_label) {
+        if (table == HINT_NONE) {
             rc = err_at(&L, L.line,
                         "a key outside a table; every hint sits in one, e.g. [[label]]");
             break;
@@ -243,7 +255,8 @@ int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
         if (strcmp(key, "at") != 0) {
             char msg[160];
             snprintf(msg, sizeof msg,
-                     "unknown key `%s` in [[label]]; this build understands `at`", key);
+                     "unknown key `%s` in [[%s]]; this build understands `at`",
+                     key, table == HINT_FUNC ? "func" : "label");
             rc = err_at(&L, keyline, msg);
             break;
         }
@@ -253,7 +266,7 @@ int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
             break;
         }
         advance(&L);
-        if (parse_at_array(&L, out) != 0) { rc = -1; break; }
+        if (parse_at_array(&L, out, table) != 0) { rc = -1; break; }
     }
 
     free(text);
@@ -264,6 +277,9 @@ int a_hints_load(const char *path, a_hints *out, char *err, size_t errlen) {
 void a_hints_free(a_hints *h) {
     if (!h) return;
     free(h->labels);
+    free(h->funcs);
     h->labels = NULL;
     h->nlabels = 0;
+    h->funcs = NULL;
+    h->nfuncs = 0;
 }

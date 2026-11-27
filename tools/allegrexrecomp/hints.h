@@ -46,6 +46,8 @@ extern "C" {
 typedef struct a_hints {
     uint32_t *labels;   /* addresses forced to be dispatch entries */
     int       nlabels;
+    uint32_t *funcs;    /* extra function entry seeds (e.g. .data ctors) */
+    int       nfuncs;
 } a_hints;
 
 /* Load `path` into `*out` (zeroed first, so a failed load leaves it empty).

@@ -781,6 +781,20 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
     }
 }
 
+/* Initialize a newly started guest thread's register file, placing a zeroed
+ * 64-byte kernel TCB/TLS block at the top of its stack for $k0 (newlib stores
+ * its per-thread _reent pointer at *(k0 + 4)). */
+static void init_thread_regs(const psp_thread *t, uint32_t arglen, uint32_t argp) {
+    uint32_t tcb = (t->stack_base + t->stack_size - 64u) & ~15u;
+    for (uint32_t off = 0; off < 64u; off += 4u) psp_write32(tcb + off, 0);
+    psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
+    psp_cpu.r[PSP_REG_A0] = arglen;
+    psp_cpu.r[PSP_REG_A1] = argp;
+    psp_cpu.r[PSP_REG_K0] = tcb;
+    psp_cpu.r[PSP_REG_SP] = tcb - 64u;
+    psp_cpu.r[PSP_REG_RA] = 0;
+}
+
 #if PSPRECOMP_REAL_THREADS
 static void *guest_thread_main(void *arg) {
     psp_thread *t = (psp_thread *)arg;
@@ -790,16 +804,10 @@ static void *guest_thread_main(void *arg) {
     g_current = t;
 
     /* A fresh register file: a thread must not see the leftovers of whatever
-     * ran before it. $sp and the o32 argument registers are the firmware's to
-     * set, everything else starts at zero. */
+     * ran before it. $sp, $k0 and the o32 argument registers are the
+     * firmware's to set, everything else starts at zero. */
     psp_cpu_reset();
-    psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
-    psp_cpu.r[PSP_REG_A0] = t->arglen;
-    psp_cpu.r[PSP_REG_A1] = t->argp;
-    /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
-     * a little headroom so a callee storing below $sp cannot run off the end. */
-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
-    psp_cpu.r[PSP_REG_RA] = 0;
+    init_thread_regs(t, t->arglen, t->argp);
 
     t->state = TH_RUNNING;
     /* We have the CPU: the flag that says "started, never run" is cleared by the
@@ -924,10 +932,10 @@ static void hle_StartThread(void) {
     int prev_intr = g_tls_intr_depth;
     g_tls_intr_depth = 0;
     g_current = g_tls_me = t;
-    psp_cpu.r[PSP_REG_A0] = psp_arg(1);
-    psp_cpu.r[PSP_REG_A1] = psp_arg(2);
-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
-    psp_cpu.r[PSP_REG_RA] = 0;
+    uint32_t arglen = psp_arg(1);
+    uint32_t argp   = psp_arg(2);
+    psp_cpu_reset();
+    init_thread_regs(t, arglen, argp);
     t->state = TH_RUNNING;
     t->exited = t->terminated = t->delete_after = 0;
     g_started++;

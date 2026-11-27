@@ -33,7 +33,7 @@ static int usage(void) {
         "  allegrexrecomp extract <file.iso> <substring> <outdir>\n"
         "  allegrexrecomp dis     <file> [start-addr] [count]\n"
         "  allegrexrecomp cover   <file>\n"
-        "  allegrexrecomp funcs   <file> [--list] [--base <addr>]\n"
+        "  allegrexrecomp funcs   <file> [--list] [--base <addr>] [--hints <path>]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix] [--base <addr>] [--hints <path>]\n"
         "  allegrexrecomp dump    <file> <addr>\n"
         "  allegrexrecomp relocate <file> <base> <out>\n"
@@ -464,7 +464,9 @@ static int cmd_cover(const char *path) {
 /* Load a decrypted module and run discovery over it. On success the caller
  * owns both `b` (psp_blob_free) and `an` (a_analysis_free). Shared by `funcs`
  * and `emit`, which differ only in what they do with the result. */
-static int load_and_discover(const char *path, uint32_t base, uint8_t **out_reloc_buf, size_t *out_reloc_sz,
+static int load_and_discover(const char *path, uint32_t base,
+                             const uint32_t *extra_seeds, int n_extra_seeds,
+                             uint8_t **out_reloc_buf, size_t *out_reloc_sz,
                              psp_blob *b, elf_info *e,
                              a_analysis *an, int *out_nseeds, int *out_nexports,
                              int *out_nptr, int *out_scanned) {
@@ -553,7 +555,7 @@ static int load_and_discover(const char *path, uint32_t base, uint8_t **out_relo
     int nptr_avail = psp_collect_pointer_seeds_at(b->data, b->size,
                                                   reloc_buf, reloc_sz, base,
                                                   e, bias, NULL, 0);
-    int cap = 1 + 512 + nptr_avail;
+    int cap = 1 + 512 + nptr_avail + (n_extra_seeds > 0 ? n_extra_seeds : 0);
     uint32_t *seeds = (uint32_t *)malloc((size_t)cap * sizeof *seeds);
     if (!seeds) { free(reloc_buf); psp_blob_free(b); return -1; }
 
@@ -605,6 +607,14 @@ static int load_and_discover(const char *path, uint32_t base, uint8_t **out_relo
         }
     }
 
+    if (extra_seeds && n_extra_seeds > 0) {
+        uint32_t *bigger = (uint32_t *)realloc(seeds, (size_t)(nseeds + n_extra_seeds) * sizeof *seeds);
+        if (bigger) {
+            seeds = bigger;
+            for (int i = 0; i < n_extra_seeds; i++) seeds[nseeds++] = extra_seeds[i];
+        }
+    }
+
     int rc = a_discover(an, seeds, nseeds);
     free(seeds);
     if (rc != 0) {
@@ -621,7 +631,7 @@ static int load_and_discover(const char *path, uint32_t base, uint8_t **out_relo
     return 0;
 }
 
-static int cmd_funcs(const char *path, int list, uint32_t base) {
+static int cmd_funcs(const char *path, int list, uint32_t base, const char *hintspath) {
     psp_blob b;
     elf_info e;
     a_analysis an;
@@ -629,7 +639,20 @@ static int cmd_funcs(const char *path, int list, uint32_t base) {
     uint8_t *reloc_buf = NULL;
     size_t reloc_sz = 0;
 
-    if (load_and_discover(path, base, &reloc_buf, &reloc_sz, &b, &e, &an, &nseeds, &nexports, &nptr, &scanned) != 0) return 1;
+    a_hints hints;
+    char err[512];
+    if (a_hints_load(hintspath, &hints, err, sizeof err) != 0) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+
+    if (load_and_discover(path, base, hints.funcs, hints.nfuncs,
+                          &reloc_buf, &reloc_sz, &b, &e, &an,
+                          &nseeds, &nexports, &nptr, &scanned) != 0) {
+        a_hints_free(&hints);
+        return 1;
+    }
+    a_hints_free(&hints);
 
     printf("module:     %s\n", path);
     printf("code:       0x%08X + %u bytes  (%u instructions)\n",
@@ -766,7 +789,22 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix, ui
     uint8_t *reloc_buf = NULL;
     size_t reloc_sz = 0;
 
-    if (load_and_discover(path, base, &reloc_buf, &reloc_sz, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
+    /* Hints are loaded before discovery and validated on the way in: [[func]]
+     * seeds extra function entries (such as .data constructors), and [[label]]
+     * emits interior dispatch entries for targets discovery could not see. */
+    a_hints hints;
+    char err[512];
+    if (a_hints_load(hintspath, &hints, err, sizeof err) != 0) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+
+    if (load_and_discover(path, base, hints.funcs, hints.nfuncs,
+                          &reloc_buf, &reloc_sz, &b, &e, &an,
+                          NULL, NULL, NULL, NULL) != 0) {
+        a_hints_free(&hints);
+        return 1;
+    }
 
     psp_module_info mi;
     const char *module = "(unknown)";
@@ -790,20 +828,6 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix, ui
         }
     }
 
-    /* Hints are loaded before emission and validated on the way in: a
-     * misaligned or unknown address is a typo in a file the author can fix, and
-     * saying so here beats a warning buried in the emission report. */
-    a_hints hints;
-    char err[512];
-    if (a_hints_load(hintspath, &hints, err, sizeof err) != 0) {
-        fprintf(stderr, "%s\n", err);
-        free(imp);
-        free(reloc_buf);
-        a_analysis_free(&an);
-        psp_blob_free(&b);
-        return 1;
-    }
-
     emit_opts o;
     o.outdir = outdir;
     o.prefix = prefix ? prefix : "recomp";
@@ -815,7 +839,9 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix, ui
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
     printf("imports:    %d\n", an.nimports);
-    if (hintspath) printf("hints:      %s (%d address(es))\n", hintspath, hints.nlabels);
+    if (hintspath)
+        printf("hints:      %s (%d label(s), %d func(s))\n",
+               hintspath, hints.nlabels, hints.nfuncs);
     printf("\n");
 
     int rc = a_emit(&an, &o);
@@ -849,7 +875,7 @@ static int cmd_dump(const char *path, const char *addrs) {
     uint32_t addr = (uint32_t)strtoul(addrs, NULL, 0);
     int rc;
 
-    if (load_and_discover(path, 0, NULL, NULL, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
+    if (load_and_discover(path, 0, NULL, 0, NULL, NULL, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
 
     rc = a_emit_one(&an, addr, stdout);
     if (rc != 0)
@@ -1116,11 +1142,13 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "funcs")) {
         int list = 0;
         uint32_t base = 0;
+        const char *hintspath = NULL;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--list")) list = 1;
             else if (!strcmp(argv[i], "--base") && i + 1 < argc) base = (uint32_t)strtoul(argv[++i], NULL, 0);
+            else if (!strcmp(argv[i], "--hints") && i + 1 < argc) hintspath = argv[++i];
         }
-        return cmd_funcs(argv[2], list, base);
+        return cmd_funcs(argv[2], list, base, hintspath);
     }
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
