@@ -550,6 +550,39 @@ static void test_conversions(void) {
     }
 }
 
+/* Matrix ops have no prefix support: the hardware documentation marks rd, rs
+ * and rt as "Not supported", and the emulator oracle consumes a pending prefix
+ * without applying the general swizzle rules to the matrix. Refusing to write
+ * a value that ignored the prefix is intentional -- a plausible wrong matrix
+ * is worse than a loud trap during bring-up. Lock that decision in. */
+static void test_matrix_prefix_trap(void) {
+    psp_vfpu_reset();
+    float a[4][4] = {{0}}, b[4][4] = {{0}}, out[4][4];
+    a[0][0] = 1; a[1][0] = 2; a[0][1] = 3; a[1][1] = 4;
+    b[0][0] = 5; b[1][0] = 6; b[0][1] = 7; b[1][1] = 8;
+    set_matrix(0x08, 2, a);
+    set_matrix(0x10, 2, b);
+    memset(out, 0, sizeof out);
+    set_matrix(0x00, 2, out);
+
+    /* A prefix pending on a source operand makes the matrix op refuse to run
+     * and traps once; the prefix is still consumed, so the op after it is
+     * unaffected. */
+    psp_vfpu_set_prefix(0, 0x000000);
+    const uint64_t traps = psp_vfpu_trap_count();
+    psp_vmmul(0x00, 0x08, 0x10, 2);
+    CHECK(psp_vfpu_trap_count() == traps + 1, "prefixed vmmul traps once");
+    CHECK(!psp_vfpu_prefix_pending(), "the pending prefix is consumed");
+    get_matrix(0x00, 2, out);
+    CHECK_F(out[0][0], 0.0f, "the prefixed matrix op does not write a wrong value");
+
+    /* Without a prefix the same operands compute normally. */
+    psp_vmmul(0x00, 0x08, 0x10, 2);
+    CHECK(psp_vfpu_trap_count() == traps + 1, "unprefixed vmmul does not trap");
+    get_matrix(0x00, 2, out);
+    CHECK_F(out[0][0], 26.0f, "unprefixed vmmul still computes");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -564,6 +597,7 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vmmul_orientation();
+    test_matrix_prefix_trap();
     test_conversions();
 
     psp_mem_free();
