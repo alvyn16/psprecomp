@@ -460,6 +460,73 @@ static int cmp_func(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+static int insn_writes_gpr(const a_insn *in, uint8_t reg) {
+    if (!reg) return 0;
+    switch (in->fmt) {
+    case F_RD_RS_RT:
+    case F_RD_RT_SA:
+    case F_RD_RT_RS:
+    case F_RD_RS:
+    case F_RD_RT:
+    case F_RD:
+        return in->rd == reg;
+    case F_RT_IMM:
+    case F_RT_RS_IMM:
+    case F_RT_RS_UIMM:
+    case F_RT_RS_POS_SZ:
+    case F_RT_FS:
+    case F_RT_VD:
+        return in->rt == reg;
+    case F_RT_OFF_BASE:
+        /* Only load instructions write rt; stores read rt. */
+        switch (in->op) {
+        case A_LB: case A_LH: case A_LWL: case A_LW:
+        case A_LBU: case A_LHU: case A_LWR: case A_LL:
+            return in->rt == reg;
+        default:
+            return 0;
+        }
+    default:
+        return in->is_call && reg == 31;
+    }
+}
+
+static void scan_lui_at(const a_analysis *an, const uint8_t *seen, int require_seen,
+                        uint32_t a, uint32_t sbase, uint32_t ssize,
+                        u32list *out_targets) {
+    a_insn in;
+    a_decode(fetch(an, a), a, &in);
+    if (in.op != A_LUI || in.rt == 0) return;
+
+    int k_limit = 16;
+    for (int k = 1; k <= k_limit; k++) {
+        uint32_t b = a + (uint32_t)k * 4;
+        if (!a_in_range(an, b)) break;
+        if (require_seen && !(seen[word_index(an, b)] & SEEN_CODE)) break;
+        a_insn in2;
+        a_decode(fetch(an, b), b, &in2);
+        if ((in2.op == A_ADDIU || in2.op == A_ORI) && in2.rs == in.rt) {
+            uint32_t addr = (in2.op == A_ORI)
+                ? (((uint32_t)in.imm << 16) | (uint32_t)in2.imm)
+                : (((uint32_t)in.imm << 16) + (uint32_t)in2.imm);
+            /* The target must be in the scanned range too, not just the image:
+             * lui+addiu builds far more data pointers than code pointers, and
+             * nearly any data word decodes. */
+            if (a_in_range(an, addr) && !is_import_stub(an, addr) &&
+                addr >= sbase && addr - sbase < ssize) {
+                a_insn probe;
+                if (a_decode(fetch(an, addr), addr, &probe) && probe.op != A_INVALID)
+                    u32_push(out_targets, addr);
+            }
+            if (in2.rt == in.rt) break;
+        } else if (insn_writes_gpr(&in2, in.rt)) {
+            break;
+        }
+        if (in2.has_delay_slot && k_limit > k + 1) k_limit = k + 1;
+        else if (in2.is_return || in2.is_indirect) break;
+    }
+}
+
 int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     an->funcs = NULL; an->nfuncs = 0;
     an->imports = NULL; an->nimports = 0;
@@ -539,63 +606,37 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
      * pairs in .text recover code pointers passed via registers -- including
      * thread entries passed to sceKernelCreateThread on ET_EXEC modules that
      * have no relocation tables. */
+    const uint32_t sbase = an->scan_size ? an->scan_base : an->base;
+    const uint32_t ssize = an->scan_size ? an->scan_size : an->size;
+
     if (an->scan_calls && an->base != 0) {
-        uint32_t sbase = an->scan_size ? an->scan_base : an->base;
-        uint32_t ssize = an->scan_size ? an->scan_size : an->size;
+        u32list lui_targets = { 0 };
         for (uint32_t off = 0; off + 4 <= ssize; off += 4) {
             uint32_t a = sbase + off;
             if (!a_in_range(an, a)) continue;
-            a_insn in;
-            a_decode(fetch(an, a), a, &in);
-            if (in.op != A_LUI) continue;
-
-            for (int k = 1; k <= 4; k++) {
-                uint32_t b = a + (uint32_t)k * 4;
-                if (!a_in_range(an, b)) break;
-                a_insn in2;
-                a_decode(fetch(an, b), b, &in2);
-                if (in2.op == A_LUI && in2.rt == in.rt) break; /* overwritten first */
-                if ((in2.op == A_ADDIU || in2.op == A_ORI) && in2.rs == in.rt) {
-                    uint32_t addr = (in2.op == A_ORI)
-                        ? (((uint32_t)in.imm << 16) | (uint32_t)in2.imm)
-                        : (((uint32_t)in.imm << 16) + (uint32_t)in2.imm);
-                    /* The target must be in the scanned range too, not just
-                     * the image: lui+addiu builds far more data pointers than
-                     * code pointers, and nearly any data word decodes. */
-                    if (a_in_range(an, addr) && !is_import_stub(an, addr) &&
-                        addr - sbase < ssize) {
-                        a_insn probe;
-                        if (a_decode(fetch(an, addr), addr, &probe) && probe.op != A_INVALID) {
-                            uint32_t ti = word_index(an, addr);
-                            if (!entry_map[ti]) {
-                                entry_map[ti] = 1;
-                                u32_push(&queue, addr);
-                            }
-                        }
-                    }
-                    break;
-                }
+            scan_lui_at(an, seen, 0, a, sbase, ssize, &lui_targets);
+        }
+        for (int i = 0; i < lui_targets.n; i++) {
+            uint32_t addr = lui_targets.v[i];
+            uint32_t ti = word_index(an, addr);
+            if (!entry_map[ti]) {
+                entry_map[ti] = 1;
+                u32_push(&queue, addr);
             }
         }
+        free(lui_targets.v);
     }
 
     a_func *funcs = NULL;
     int nfuncs = 0, cap = 0;
 
-    /* Two rounds. The first walks everything reachable by control flow; the
-     * second walks whatever the jump tables reveal, which can only be resolved
-     * once the `jr` sites have been found. Tables discovered in round two are
-     * not chased further -- one level covers the switch statements a compiler
-     * actually emits, and unbounded rounds would need a fixpoint check for
-     * very little gain. */
     /* Iterate to a fixpoint. Each re-walk can expose cross-function branches that
- * the previous walk order hid, so a fixed two rounds leaves some unpromoted --
- * which shows up as a dispatch miss at run time. The cap is a termination
- * guarantee, not an expected limit: entries only ever accumulate, so this
- * converges in a handful of rounds. */
+     * the previous walk order hid, and functions discovered outside .text
+     * (such as .data-resident static constructors from [[func]] hints) can
+     * construct .text function pointers via lui+addiu as well. */
     for (int round = 0; round < 8; round++) {
     if (round > 0) {
-        if (!an->image && !cross.n && !indirects.n) break;
+        if (!an->image && !cross.n && !indirects.n && !(an->scan_calls && an->base != 0)) break;
         u32list targets = { 0 };
         an->ntables = 0;
         an->ntable_targets = 0;
@@ -604,6 +645,14 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
             if (n > 0) { an->ntables++; an->ntable_targets += n; }
         }
         for (int i = 0; i < cross.n; i++) u32_push(&targets, cross.v[i]);
+        if (an->scan_calls && an->base != 0) {
+            for (uint32_t i = 0; i < nwords; i++) {
+                if (!(seen[i] & SEEN_CODE)) continue;
+                uint32_t a = an->base + i * 4;
+                if (a >= sbase && a - sbase < ssize) continue;
+                scan_lui_at(an, seen, 1, a, sbase, ssize, &targets);
+            }
+        }
         int added = 0;
         for (int i = 0; i < targets.n; i++) {
             uint32_t t = targets.v[i];

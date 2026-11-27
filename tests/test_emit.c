@@ -1411,14 +1411,29 @@ int main(void) {
             const uint32_t IMG_BASE = 0x08900000u;
             uint32_t words[32];
             memset(words, 0, sizeof words);
-            /* entry at +0: lui $s1, 0x0890; addiu $a1, $s1, 0x40; jr $ra; nop */
+            /* entry at +0: lui $s1, 0x0890 with 6 intervening insns before addiu $a1, $s1, 0x40;
+             * also test a .data-like region outside scan_size forming a pointer back into .text */
             words[0] = 0x3C110890u; /* lui $s1, 0x0890 */
-            words[1] = 0x26250040u; /* addiu $a1, $s1, 0x40 -> IMG_BASE + 0x40 */
-            words[2] = 0x03E00008u; /* jr $ra */
-            words[3] = 0x00000000u;
+            words[1] = 0x00000000u; /* nop */
+            words[2] = 0x00000000u; /* nop */
+            words[3] = 0x00000000u; /* nop */
+            words[4] = 0x00000000u; /* nop */
+            words[5] = 0x00000000u; /* nop */
+            words[6] = 0x00000000u; /* nop */
+            words[7] = 0x26250040u; /* addiu $a1, $s1, 0x40 -> IMG_BASE + 0x40 */
+            words[8] = 0x03E00008u; /* jr $ra */
+            words[9] = 0x00000000u;
             /* target at +0x40 (word 16): jr $ra; nop */
             words[16] = 0x03E00008u;
             words[17] = 0x00000000u;
+            /* function outside scan_size at +0x60 (word 24): lui $a1, 0x0890; addiu $a1, $a1, 0x50; jr $ra; nop */
+            words[24] = 0x3C050890u; /* lui $a1, 0x0890 */
+            words[25] = 0x24A50050u; /* addiu $a1, $a1, 0x50 -> IMG_BASE + 0x50 */
+            words[26] = 0x03E00008u; /* jr $ra */
+            words[27] = 0x00000000u;
+            /* target at +0x50 (word 20): jr $ra; nop */
+            words[20] = 0x03E00008u;
+            words[21] = 0x00000000u;
 
             uint8_t bytes[128];
             for (int k = 0; k < 32; k++) {
@@ -1436,15 +1451,17 @@ int main(void) {
             an.base = IMG_BASE;
             an.size = sizeof bytes;
             an.scan_base = IMG_BASE;
-            an.scan_size = sizeof bytes;
+            an.scan_size = 0x60u;
             an.scan_calls = 1;
-            uint32_t seed = IMG_BASE;
-            CHECK(a_discover(&an, &seed, 1) == 0, "lui+addiu discovery runs with image set");
-            int found_target = 0;
+            uint32_t seed_list[2] = { IMG_BASE, IMG_BASE + 0x60u };
+            CHECK(a_discover(&an, seed_list, 2) == 0, "lui+addiu discovery runs with image set");
+            int found_target = 0, found_data_target = 0;
             for (int k = 0; k < an.nfuncs; k++) {
                 if (an.funcs[k].addr == IMG_BASE + 0x40u) found_target = 1;
+                if (an.funcs[k].addr == IMG_BASE + 0x50u) found_data_target = 1;
             }
-            CHECK(found_target, "lui+addiu target discovered when an.image is set");
+            CHECK(found_target, "lui+addiu target discovered across >4 insns");
+            CHECK(found_data_target, "lui+addiu target discovered from seeded code outside scan_size");
             a_analysis_free(&an);
         }
     }
