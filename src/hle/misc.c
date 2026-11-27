@@ -320,6 +320,37 @@ static void hle_OutputBlocking(void) {
     psp_ret(samples);
 }
 
+/* sceAudio's second output API has no channel argument: one output is reserved
+ * with its sample count and every later Output2 call drains it. Dante's
+ * Inferno's FMOD mixer uses this rather than the channel API above, and with
+ * the NID unimplemented its thread looped at nearly a million calls a second,
+ * starving the game's other threads. The same pacing applies here. */
+static uint32_t g_output2_samples;
+#if PSPRECOMP_REAL_THREADS
+static uint64_t g_output2_due_us;
+#endif
+
+static void hle_Output2Reserve(void) {
+    g_output2_samples = psp_arg(0);
+    psp_ret(0);                       /* the single output's id on success */
+}
+
+static void hle_Output2OutputBlocking(void) {
+    /* (volume, samples) -- the return value is the sample count played. */
+    uint32_t samples = g_output2_samples ? g_output2_samples : 256u;
+    g_audio_blocks++;
+    const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
+#if PSPRECOMP_REAL_THREADS
+    uint64_t now = host_now_us();
+    if (g_output2_due_us < now) g_output2_due_us = now;
+    g_output2_due_us += play_us;
+    while (host_now_us() + play_us < g_output2_due_us) psp_threadman_yield();
+#else
+    psp_threadman_delay(play_us);
+#endif
+    psp_ret(samples);
+}
+
 /* The sample count a channel outputs per call. It is set at reserve time and
  * changed here; ignoring the change left WTF's channel at its reserved length,
  * so each blocking output waited for 4,096 samples while the game mixed 256,
@@ -406,4 +437,6 @@ void psp_misc_register(void) {
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
+    psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve",        hle_Output2Reserve);
+    psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking", hle_Output2OutputBlocking);
 }

@@ -38,6 +38,11 @@ typedef struct {
 static mem_block g_block[MAX_BLOCKS];
 static uint32_t  g_next_uid;
 static uint32_t  g_heap_lo, g_heap_hi;
+/* A loader whose module sits high in RAM leaves a second free region below
+ * it. That region is real RAM the game may use, but it cannot satisfy the
+ * large contiguous blocks a PSP would get from a module at the bottom. VPLs
+ * fall back to it; partitions and MaxFreeMemSize do not count it. */
+static uint32_t  g_aux_lo, g_aux_hi;
 
 /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
  * starting above them keeps the allocator from handing out memory the module
@@ -50,6 +55,7 @@ void psp_sysmem_reset(void) {
     g_next_uid = UID_BASE;
     g_heap_lo = DEFAULT_HEAP_LO;
     g_heap_hi = DEFAULT_HEAP_HI;
+    g_aux_lo = g_aux_hi = 0;
 }
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
@@ -88,9 +94,14 @@ int psp_sysmem_reserve(uint32_t addr, uint32_t size) {
     return 0;                  /* uid stays 0: the guest cannot free it */
 }
 
-/* Does [addr, addr+size) overlap anything already handed out? */
-static int overlaps(uint32_t addr, uint32_t size) {
-    if (addr > g_heap_hi || size > g_heap_hi - addr) return 1;
+void psp_sysmem_set_aux(uint32_t lo, uint32_t hi) {
+    g_aux_lo = lo < hi ? lo : 0;
+    g_aux_hi = lo < hi ? hi : 0;
+}
+
+/* Does [addr, addr+size) overlap anything already handed out, within [0, hi)? */
+static int overlaps(uint32_t addr, uint32_t size, uint32_t hi) {
+    if (addr > hi || size > hi - addr) return 1;
     for (int i = 0; i < MAX_BLOCKS; i++) {
         if (!g_block[i].used) continue;
         uint32_t b = g_block[i].addr, e = b + g_block[i].size;
@@ -99,26 +110,25 @@ static int overlaps(uint32_t addr, uint32_t size) {
     return 0;
 }
 
-/* First fit walking up from the bottom of the heap. Blocks are few (a few
- * hundred at most) so a linear probe per candidate is fine and keeps the
- * bookkeeping to one array. */
-static uint32_t place_low(uint32_t size, uint32_t align) {
-    if (!align || (align & (align - 1)) || size > g_heap_hi - g_heap_lo) return 0;
-    uint64_t start = ((uint64_t)g_heap_lo + align - 1) & ~((uint64_t)align - 1);
-    if (start > g_heap_hi) return 0;
+/* First fit walking up from `lo`. Blocks are few (a few hundred at most) so a
+ * linear probe per candidate is fine and keeps the bookkeeping to one array. */
+static uint32_t place_in(uint32_t lo, uint32_t hi, uint32_t size, uint32_t align) {
+    if (!align || (align & (align - 1)) || hi <= lo || size > hi - lo) return 0;
+    uint64_t start = ((uint64_t)lo + align - 1) & ~((uint64_t)align - 1);
+    if (start > hi) return 0;
     uint32_t a = (uint32_t)start;
-    while (a >= g_heap_lo && a <= g_heap_hi && size <= g_heap_hi - a) {
-        if (!overlaps(a, size)) return a;
+    while (a >= lo && a <= hi && size <= hi - a) {
+        if (!overlaps(a, size, hi)) return a;
         /* Skip past whatever is in the way rather than stepping by `align`,
          * which on a full heap would be O(heap/align) probes per allocation. */
-        uint32_t next = g_heap_hi;
+        uint32_t next = hi;
         for (int i = 0; i < MAX_BLOCKS; i++) {
             if (!g_block[i].used) continue;
             uint32_t b = g_block[i].addr, e = b + g_block[i].size;
             if (a < e && b < a + size && e < next) next = e;
         }
         uint64_t next_a = ((uint64_t)next + align - 1) & ~((uint64_t)align - 1);
-        if (next_a > g_heap_hi || (uint32_t)next_a <= a) return 0;
+        if (next_a > hi || (uint32_t)next_a <= a) return 0;
         a = (uint32_t)next_a;
     }
     return 0;
@@ -129,7 +139,7 @@ static uint32_t place_high(uint32_t size, uint32_t align) {
     if (!align || (align & (align - 1)) || size > g_heap_hi - g_heap_lo) return 0;
     uint32_t a = (g_heap_hi - size) & ~(align - 1);
     while (a >= g_heap_lo) {
-        if (!overlaps(a, size)) return a;
+        if (!overlaps(a, size, g_heap_hi)) return a;
         uint32_t prev = g_heap_lo;
         for (int i = 0; i < MAX_BLOCKS; i++) {
             if (!g_block[i].used) continue;
@@ -155,24 +165,37 @@ uint32_t psp_sysmem_free(void) {
     return used < total ? (uint32_t)(total - used) : 0;
 }
 
+static uint32_t claim(uint32_t addr, uint32_t size, const char *name) {
+    mem_block *b = alloc_slot();
+    if (!b) return 0;
+    b->uid = g_next_uid++;
+    b->addr = addr;
+    b->size = size;
+    b->used = 1;
+    snprintf(b->name, sizeof b->name, "%s", name);
+    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
+            b->uid, b->addr, b->size, b->addr + b->size);
+    return addr;
+}
+
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
     if (size > g_heap_hi - g_heap_lo) return 0;
     uint32_t rounded = (size + 0xFF) & ~0xFFu;
     if (!rounded) rounded = 0x100;
 
-    uint32_t addr = from_high ? place_high(rounded, 0x100) : place_low(rounded, 0x100);
-    if (!addr) return 0;
+    uint32_t addr = from_high ? place_high(rounded, 0x100)
+                              : place_in(g_heap_lo, g_heap_hi, rounded, 0x100);
+    return addr ? claim(addr, rounded, "internal") : 0;
+}
 
-    mem_block *b = alloc_slot();
-    if (!b) return 0;
-    b->uid = g_next_uid++;
-    b->addr = addr;
-    b->size = rounded;
-    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
-            b->uid, b->addr, b->size, b->addr + b->size);
-    b->used = 1;
-    snprintf(b->name, sizeof b->name, "internal");
-    return addr;
+uint32_t psp_sysmem_alloc_vpl(uint32_t size) {
+    uint32_t addr = psp_sysmem_alloc(size, 0);
+    if (addr) return addr;
+    if (!g_aux_hi) return 0;
+    uint32_t rounded = (size + 0xFF) & ~0xFFu;
+    if (!rounded) rounded = 0x100;
+    addr = place_in(g_aux_lo, g_aux_hi, rounded, 0x100);
+    return addr ? claim(addr, rounded, "vpl") : 0;
 }
 
 void psp_sysmem_release(uint32_t addr) {
@@ -220,12 +243,12 @@ static void hle_AllocPartitionMemory(void) {
     uint32_t addr = 0;
     switch (type) {
     case PSP_SMEM_Low:
-    case PSP_SMEM_LowAligned:  addr = place_low(rounded, align);  break;
+    case PSP_SMEM_LowAligned:  addr = place_in(g_heap_lo, g_heap_hi, rounded, align); break;
     case PSP_SMEM_High:
     case PSP_SMEM_HighAligned: addr = place_high(rounded, align); break;
     case PSP_SMEM_Addr:
         if (want >= g_heap_lo && want <= g_heap_hi &&
-            rounded <= g_heap_hi - want && !overlaps(want, rounded))
+            rounded <= g_heap_hi - want && !overlaps(want, rounded, g_heap_hi))
             addr = want;
         break;
     default:

@@ -122,17 +122,15 @@ uint32_t psp_module_start(const psp_module *m) {
             psp_cpu.r[PSP_REG_A1] = CMDLINE_ADDR;
         }
     }
-    /* On a PSP the user heap is all of user RAM the module does not occupy.
-     * This port maps the module a megabyte higher than the loader does, so the
-     * default heap floor would throw that megabyte away; Dante's Inferno sizes
-     * its engine and macro heaps to nearly all the remaining memory and then
-     * asks for an 850 KB VPL that no longer fits. Claim the page holding the
-     * loader's own TCB, reent and command line, then let the heap reach down
-     * to the bottom of user RAM. */
-    psp_sysmem_reserve(TCB_ADDR, 0x1000);
-    if (m->base > TCB_ADDR + 0x1000 &&
-        m->base < PSP_RAM_BASE + PSP_RAM_SIZE)
-        psp_sysmem_set_floor(TCB_ADDR);
+    /* This port maps the module a megabyte higher than the PSP loader does.
+     * Lowering the heap floor into that gap would only make things worse: the
+     * game sizes its heaps from sceKernelMaxFreeMemSize, so it would ask for a
+     * block that no longer fits in the contiguous RAM above the module. Keep
+     * the reported heap as it is and offer the gap as a fallback for memory
+     * pools instead (Dante's Inferno's 850 KB "MicroMem" pool is what this is
+     * for). The page holding the TCB, reent and command line is excluded. */
+    if (m->base > TCB_ADDR + 0x1000)
+        psp_sysmem_set_aux(TCB_ADDR + 0x1000, m->base);
 
     psp_cpu.r[26] = TCB_ADDR;                   /* $k0 */
     psp_write32(TCB_ADDR + 4, REENT_ADDR);

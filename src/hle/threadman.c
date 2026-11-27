@@ -1454,7 +1454,7 @@ static uint32_t take_vpl_block(int blocking) {
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
     }
 
-    uint32_t addr = psp_sysmem_alloc(size, 0);
+    uint32_t addr = psp_sysmem_alloc_vpl(size);
     if (!addr) return SCE_KERNEL_ERROR_NO_MEMORY;
 
     for (int i = 0; i < MAX_VPL_BLOCKS; i++) {

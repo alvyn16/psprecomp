@@ -298,6 +298,14 @@ void psp_sysmem_set_floor(uint32_t lo);
  * it. Returns 0, or -1 if the bookkeeping is full. */
 int psp_sysmem_reserve(uint32_t addr, uint32_t size);
 
+/* A second, smaller arena used only as a fallback by VPL allocations. A
+ * loader that maps its module above the bottom of user RAM leaves RAM below
+ * it that is too fragmented for the game's large contiguous partitions but
+ * large enough for a memory pool. Set once at start-up; it is not reported by
+ * sceKernelMaxFreeMemSize and is not used for ordinary partitions. */
+void psp_sysmem_set_aux(uint32_t lo, uint32_t hi);
+uint32_t psp_sysmem_alloc_vpl(uint32_t size);
+
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */

@@ -514,6 +514,40 @@ static void test_vpl(void) {
           "a deleted pool is gone");
 }
 
+/* A module mapped above the bottom of user RAM leaves RAM below it that is
+ * too fragmented for the game's large partitions but can back a pool. The
+ * fallback is what lets Dante's Inferno's 850 KB MicroMem pool coexist with
+ * its 19 MB macro heap. */
+static void test_vpl_aux_fallback(void) {
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sysmem_set_aux(0x08801000u, 0x08900000u);
+
+    /* Take almost the whole normal heap, so the pool's block has to come
+     * from the auxiliary region. */
+    uint32_t big = psp_sysmem_alloc(psp_sysmem_free() - 0x200u, 0);
+    CHECK(big != 0, "the normal heap can be filled");
+
+    const uint32_t CREATE = psp_nid("sceKernelCreateVpl");
+    const uint32_t ALLOC  = psp_nid("sceKernelAllocateVplCB");
+    const uint32_t FREE   = psp_nid("sceKernelFreeVpl");
+    const uint32_t NAME = 0x08804000u;
+    psp_write8(NAME, 0);
+    uint32_t vpl = call5(CREATE, NAME, 2, 0, 0x10000, 0);
+    uint32_t out = 0x08804100u, to = 0x08804110u;
+    psp_write32(to, 1000);
+    CHECK(call(ALLOC, vpl, 0x8000, out, to) == 0, "a pool block is allocated with the heap full");
+    uint32_t blk = psp_read32(out);
+    CHECK(blk >= 0x08801000u && blk + 0x8000 <= 0x08900000u,
+          "the block comes from the gap below the module, got 0x%08X", blk);
+    psp_write32(blk, 0x13572468u);
+    CHECK(psp_read32(blk) == 0x13572468u, "the fallback block is addressable guest RAM");
+
+    CHECK(call(FREE, vpl, blk, 0, 0) == 0, "the fallback block can be freed");
+    psp_sysmem_release(big);
+    psp_sysmem_reset();
+}
+
 static void test_guest_strings(void) {
     /* Names come out of guest memory, so the reader has to terminate and must
      * not run past the buffer. */
@@ -958,6 +992,7 @@ int main(void) {
     test_event_flags();
     test_threads();
     test_vpl();
+    test_vpl_aux_fallback();
     test_guest_strings();
     test_ge_display_list();
     test_ge_infinite_list();

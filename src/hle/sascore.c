@@ -398,6 +398,15 @@ static void hle_CoreWithMix(void) {
  * The dry mix is what carries the music and effects; reverb is a refinement. */
 static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
+static void hle_GetOutputMode(void) { psp_ret(g_output_mode); }
+
+static void hle_SetOutputMode(void) {
+    /* (sasCore, mode) -- a game may set mono/stereo mixing; record it so a
+     * later GetOutputmode returns what was requested. */
+    g_output_mode = psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
     psp_hle_register(0x99944089, "sceSasCore", "__sceSasSetVoice",          hle_SetVoice);
@@ -416,6 +425,8 @@ void psp_sas_register(void) {
     psp_hle_register(0x2C8E6AB3, "sceSasCore", "__sceSasGetPauseFlag",      hle_GetPauseFlag);
     psp_hle_register(0x74AE582A, "sceSasCore", "__sceSasGetEnvelopeHeight", hle_GetEnvelopeHeight);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_accept);
+    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputMode);
+    psp_hle_register(0xE855BF76, "sceSasCore", "__sceSasSetOutputmode",     hle_SetOutputMode);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
     psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
