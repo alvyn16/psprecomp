@@ -89,9 +89,32 @@ static const uint32_t VFPU_STREAM[] = {
 /* HLE: a call to the synthetic import stub, which runs the registered
  * handler (writing 42 to $v0), then returns. */
 static const uint32_t HLE_STREAM[] = {
-    0x0E201040u,                       /* jal STUB                     */
-    0x00000000u,                       /* slot                         */
+    0x0E201040u,                       /* jal STUB (0x08804100)        */
+    0x00000000u,
     0x03E00008u, 0x00000000u,
+};
+
+/* Extended Allegrex semantics: signed MAX/MIN, EXT, DIV INT_MIN/-1,
+ * CVT.S.W / CVT.W.S / ROUND.W.S / CEIL.W.S / FLOOR.W.S, and not-taken BEQL. */
+static const uint32_t SEMANTICS_STREAM[] = {
+    0x2404FFFFu,                       /* addiu $a0, $zero, -1         */
+    0x24050001u,                       /* addiu $a1, $zero, 1          */
+    0x0085102Cu,                       /* max   $v0, $a0, $a1          */
+    0x0085182Du,                       /* min   $v1, $a0, $a1          */
+    0x3C068000u,                       /* lui   $a2, 0x8000            */
+    0x00C4001Au,                       /* div   $a2, $a0 (INT_MIN/-1)  */
+    0x3C081234u, 0x35085678u,          /* li    $t0, 0x12345678        */
+    (0x1Fu<<26)|(8u<<21)|(9u<<16)|(7u<<11)|(8u<<6), /* ext $t1, $t0, 8, 8 */
+    0x44840800u,                       /* mtc1  $a0, $f1 (-1 bits)     */
+    (0x11u<<26)|(0x14u<<21)|(1u<<11)|(0u<<6)|0x20u, /* cvt.s.w $f0,$f1 (-1.0f) */
+    (0x11u<<26)|(0x10u<<21)|(0u<<11)|(2u<<6)|0x24u, /* cvt.w.s $f2,$f0 */
+    0x3C0A422Au, 0x448A1800u,          /* lui $t2, 0x422A (42.5); mtc1 $t2,$f3 */
+    (0x11u<<26)|(0x10u<<21)|(3u<<11)|(4u<<6)|0x0Cu, /* round.w.s $f4,$f3 */
+    (0x11u<<26)|(0x10u<<21)|(3u<<11)|(5u<<6)|0x0Eu, /* ceil.w.s  $f5,$f3 */
+    (0x11u<<26)|(0x10u<<21)|(3u<<11)|(6u<<6)|0x0Fu, /* floor.w.s $f6,$f3 */
+    0x50850001u,                       /* beql  $a0, $a1, +1 (skipped) */
+    0x240B0063u,                       /* addiu $t3, $zero, 99 (slot)  */
+    0x03E00008u, 0x00000000u,          /* jr $ra; nop                  */
 };
 
 static char *slurp(const char *path) {
@@ -245,6 +268,7 @@ int main(void) {
     run_case("fpu", FPU_STREAM, 8, 0);
     run_case("vfpu", VFPU_STREAM, 6, 0);
     run_case("hle", HLE_STREAM, 4, 1);
+    run_case("semantics", SEMANTICS_STREAM, (int)(sizeof SEMANTICS_STREAM / sizeof SEMANTICS_STREAM[0]), 0);
 
     psp_mem_free();
     if (failures) {

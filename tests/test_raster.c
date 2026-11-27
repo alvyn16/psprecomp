@@ -740,11 +740,110 @@ static void test_gpu_sprite(void) {
     CHECK(pixel(20, 20) == 0xFF0000FFu, "gpu sprite lands at 20,20: 0x%08X", pixel(20, 20));
     CHECK(psp_render_pixels() > 0, "gpu backend counts the pixels it drew");
 
+    /* Non-palindromic solid colour catches RGBA8888 vs ABGR8888 channel swaps. */
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 10, 10, 0xFF339911u);
+    vertex(1, 30, 30, 0xFF339911u);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    psp_render_current()->finish();
+    CHECK(pixel(20, 20) == 0xFF339911u, "gpu solid sprite keeps ABGR byte order: 0x%08X", pixel(20, 20));
+
+    /* Textured sprite > 16x16 (32x32) with sub-UVs over an existing software background. */
+    for (int y = 0; y < 32; y++)
+        for (int x = 0; x < 32; x++)
+            psp_write32(TEX + (uint32_t)(y * 32 + x) * 4,
+                        (x >= 4 && x < 28 && y >= 4 && y < 28) ? 0xFFCC4411u : 0xFF00FF00u);
+    psp_ge_reset();
+    clear_fb();
+    /* Draw a software-path background triangle first, then a >16x16 GPU textured sprite. */
+    begin_list();
+    vertex(0, 0, 0, 0xFFFF0000u);
+    vertex(1, 200, 0, 0xFFFF0000u);
+    vertex(2, 0, 200, 0xFFFF0000u);
+    cmd(0x04, (3u << 16) | 3);          /* triangles -> software path */
+    end_list();
+    begin_tex_list(3, 5, 5, 0);         /* 32x32 8888 texture */
+    tvertex(0, 20, 20, 4, 4, 0xFFFFFFFFu);
+    tvertex(1, 44, 44, 28, 28, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    psp_render_current()->finish();
+    CHECK(pixel(30, 30) == 0xFFCC4411u, "32x32 textured GPU sprite + sub-UV: 0x%08X", pixel(30, 30));
+    CHECK(pixel(5, 5) == 0xFFFF0000u, "GPU sprite flush preserves prior software pixels: 0x%08X", pixel(5, 5));
+
     psp_render_current()->shutdown();
     CHECK(psp_render_select("software") == 0, "software restored after gpu test");
 #else
     CHECK(psp_render_select("gpu") != 0, "no gpu backend without SDL2");
 #endif
+}
+
+/* Multi-triangle near-plane clipping must advance TRIANGLES by 3, keep
+ * TRIANGLE_FAN anchored at v[0], and never divide by zero when w_a + w_b == 0. */
+static void test_near_clip_modes(void) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, VTYPE_3D);
+    cmd(0x01, VERTS & 0xFFFFFF);
+    cmd(0x16, 1); /* SHADE = gouraud */
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+
+    const float ident[12] = { 1,0,0, 0,1,0, 0,0,1, 0,0,0 };
+    cmd(0x3A, 0); for (int k = 0; k < 12; k++) fcmd(0x3B, ident[k]);
+    cmd(0x3C, 0); for (int k = 0; k < 12; k++) fcmd(0x3D, ident[k]);
+    const float proj[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,-1, 0,0,0,0 };
+    cmd(0x3E, 0); for (int k = 0; k < 16; k++) fcmd(0x3F, proj[k]);
+
+    /* Triangle 0 (verts 0..2): straddles w=+1 and w=-1 (wa + wb == 0!). */
+    fvertex_z(0, -0.5f,  0.5f, -1.0f, 0xFF00FF00u);
+    fvertex_z(1,  0.5f,  0.5f, -1.0f, 0xFF00FF00u);
+    fvertex_z(2,  0.0f,  0.5f,  1.0f, 0xFF00FF00u);
+    /* Triangle 1 (verts 3..5): placed cleanly on the right (x in 0.4..0.8, y in -0.5..0.5). */
+    fvertex_z(3,  0.4f, -0.5f, -1.0f, 0xFF0000FFu);
+    fvertex_z(4,  0.8f, -0.5f, -1.0f, 0xFF0000FFu);
+    fvertex_z(5,  0.6f,  0.5f, -1.0f, 0xFF0000FFu);
+    cmd(0x04, (3u << 16) | 6); /* PSP_PRIM_TRIANGLES, 6 verts */
+    end_list();
+
+    CHECK(pixel(240, 60) == 0xFF00FF00u, "straddling triangle preserves green colour (no zero denom): 0x%08X", pixel(240, 60));
+    CHECK(pixel(384, 150) == 0xFF0000FFu, "second clipped-list triangle renders cleanly: 0x%08X", pixel(384, 150));
+    /* Between triangles: (280, 180) must NOT receive a fake strip triangle (v1,v2,v3). */
+    CHECK(pixel(280, 180) == 0u, "no spurious intermediate strip triangle between tri 0 and tri 1: 0x%08X", pixel(280, 180));
+
+    /* TRIANGLE_FAN (4 verts): v0 anchored, v3 behind the near plane. */
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, VTYPE_3D);
+    cmd(0x01, VERTS & 0xFFFFFF);
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+    cmd(0x3A, 0); for (int k = 0; k < 12; k++) fcmd(0x3B, ident[k]);
+    cmd(0x3C, 0); for (int k = 0; k < 12; k++) fcmd(0x3D, ident[k]);
+    cmd(0x3E, 0); for (int k = 0; k < 16; k++) fcmd(0x3F, proj[k]);
+    fvertex_z(0,  0.0f,  0.0f, -1.0f, 0xFFFF00FFu);
+    fvertex_z(1,  0.6f,  0.0f, -1.0f, 0xFFFF00FFu);
+    fvertex_z(2,  0.6f, -0.6f, -1.0f, 0xFFFF00FFu);
+    fvertex_z(3,  0.0f, -0.6f,  1.0f, 0xFFFF00FFu); /* behind the eye */
+    cmd(0x04, (5u << 16) | 4); /* PSP_PRIM_TRIANGLE_FAN */
+    end_list();
+    CHECK(pixel(300, 170) == 0xFFFF00FFu, "clipped triangle fan draws first wedge: 0x%08X", pixel(300, 170));
+    CHECK(pixel(250, 200) == 0xFFFF00FFu, "clipped triangle fan anchors v0 for second wedge: 0x%08X", pixel(250, 200));
 }
 
 int main(void) {
@@ -760,6 +859,7 @@ int main(void) {
     test_gpu_sprite();
     test_transformed_quad();
     test_near_plane_clipping();
+    test_near_clip_modes();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
     test_textured_sprite();

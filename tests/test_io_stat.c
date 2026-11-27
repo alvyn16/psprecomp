@@ -131,6 +131,49 @@ int main(int argc, char **argv) {
     CHECK(getstat(PATH, OUT) == 0, "nested directory succeeds");
     CHECK((psp_read32(OUT) & 0xF000u) == 0x1000u, "directory mode");
     CHECK((psp_read32(OUT + 4) & 0x38u) == 0x10u, "directory attribute");
+
+    /* sceIoDopen / sceIoDread / sceIoDclose and handle cleanup on reset. */
+    put_path("disc0:/");
+    psp_cpu.r[PSP_REG_A0] = PATH;
+    psp_hle_call(0xB29DDF9Cu);
+    uint32_t dh = psp_cpu.r[PSP_REG_V0];
+    CHECK((int32_t)dh > 0, "directory opens cleanly");
+    if ((int32_t)dh > 0) {
+        const uint32_t DIR_EDGE = PSP_RAM_BASE + PSP_RAM_SIZE - (88u + 255u);
+        for (unsigned i = 0; i < 88u + 255u; i++) psp_write8(DIR_EDGE + i, 0xA5);
+        psp_cpu.r[PSP_REG_A0] = dh;
+        psp_cpu.r[PSP_REG_A1] = DIR_EDGE;
+        psp_hle_call(0xE3EB004Cu);
+        CHECK((int32_t)psp_cpu.r[PSP_REG_V0] < 0, "truncated dirent rejected atomically");
+        CHECK(untouched(DIR_EDGE, 88u + 255u), "truncated dirent untouched");
+
+        int saw_probe = 0;
+        for (int tries = 0; tries < 32; tries++) {
+            for (unsigned i = 0; i < 88u + 256u; i++) psp_write8(OUT + i, 0x5A);
+            psp_cpu.r[PSP_REG_A0] = dh;
+            psp_cpu.r[PSP_REG_A1] = OUT;
+            psp_hle_call(0xE3EB004Cu);
+            if ((int32_t)psp_cpu.r[PSP_REG_V0] <= 0) break;
+            for (unsigned i = 0; i < 88u; i++) CHECK(psp_read8(OUT + i) == 0, "d_stat cleared");
+            char nm[256] = {0};
+            for (unsigned i = 0; i < 255u; i++) {
+                nm[i] = (char)psp_read8(OUT + 88u + i);
+                if (!nm[i]) break;
+            }
+            if (strcmp(nm, "probe.txt") == 0) saw_probe = 1;
+        }
+        CHECK(saw_probe, "sceIoDread populates d_name at offset 88 (past 88-byte SceIoStat)");
+        psp_cpu.r[PSP_REG_A0] = dh;
+        psp_hle_call(0xEB092469u);
+        CHECK(psp_cpu.r[PSP_REG_V0] == 0, "directory closes cleanly");
+    }
+    for (int r = 0; r < 32; r++) {
+        psp_cpu.r[PSP_REG_A0] = PATH;
+        psp_hle_call(0xB29DDF9Cu);
+        CHECK((int32_t)psp_cpu.r[PSP_REG_V0] > 0, "psp_io_reset reclaims open dir handles");
+        psp_io_reset();
+    }
+
     CHECK(psp_mem_bad_access == bad_before, "invalid arguments cause no guest memory faults");
     psp_mem_free();
     printf("io_stat: %d failures\n", failures);

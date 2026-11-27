@@ -59,8 +59,8 @@ static int exec(const a_insn *in) {
     case A_NOR:  v = ~(reg(in->rs) | reg(in->rt)); setr(in->rd, v); return 1;
     case A_SLT:  v = (int32_t)reg(in->rs) < (int32_t)reg(in->rt); setr(in->rd, v); return 1;
     case A_SLTU: v = reg(in->rs) < reg(in->rt); setr(in->rd, v); return 1;
-    case A_MAX:  v = reg(in->rs) > reg(in->rt) ? reg(in->rs) : reg(in->rt); setr(in->rd, v); return 1;
-    case A_MIN:  v = reg(in->rs) < reg(in->rt) ? reg(in->rs) : reg(in->rt); setr(in->rd, v); return 1;
+    case A_MAX:  v = (int32_t)reg(in->rs) > (int32_t)reg(in->rt) ? reg(in->rs) : reg(in->rt); setr(in->rd, v); return 1;
+    case A_MIN:  v = (int32_t)reg(in->rs) < (int32_t)reg(in->rt) ? reg(in->rs) : reg(in->rt); setr(in->rd, v); return 1;
 
     case A_ADDI: case A_ADDIU: v = reg(in->rs) + (uint32_t)in->imm; setr(in->rt, v); return 1;
     case A_SLTI:  v = (int32_t)reg(in->rs) < in->imm; setr(in->rt, v); return 1;
@@ -90,8 +90,13 @@ static int exec(const a_insn *in) {
                   psp_cpu.lo = (uint32_t)q; psp_cpu.hi = (uint32_t)(q >> 32); return 1;
     case A_DIV:
         if (!reg(in->rt)) return 0;
-        psp_cpu.lo = (uint32_t)((int32_t)reg(in->rs) / (int32_t)reg(in->rt));
-        psp_cpu.hi = (uint32_t)((int32_t)reg(in->rs) % (int32_t)reg(in->rt));
+        if ((int32_t)reg(in->rs) == INT32_MIN && (int32_t)reg(in->rt) == -1) {
+            psp_cpu.lo = 0x80000000u;
+            psp_cpu.hi = 0;
+        } else {
+            psp_cpu.lo = (uint32_t)((int32_t)reg(in->rs) / (int32_t)reg(in->rt));
+            psp_cpu.hi = (uint32_t)((int32_t)reg(in->rs) % (int32_t)reg(in->rt));
+        }
         return 1;
     case A_DIVU:
         if (!reg(in->rt)) return 0;
@@ -126,8 +131,8 @@ static int exec(const a_insn *in) {
                      ((x >> 8) & 0x0000FF00u) | ((x >> 24) & 0x000000FFu)); return 1;
     }
     case A_EXT: {
-        /* F_RT_RS_POS_SZ: sa is the position, rd holds the msb (size-1). */
-        const unsigned pos = in->sa, size = in->rd - in->sa + 1;
+        /* F_RT_RS_POS_SZ: sa is the position, rd holds size - 1. */
+        const unsigned pos = in->sa, size = in->rd + 1;
         const uint32_t mask = size >= 32 ? 0xFFFFFFFFu : ((1u << size) - 1u);
         setr(in->rt, (reg(in->rs) >> pos) & mask); return 1;
     }
@@ -147,10 +152,18 @@ static int exec(const a_insn *in) {
     case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs]; return 1;
     case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs(psp_cpu.f[in->fs]); return 1;
     case A_SQRT_S: psp_cpu.f[in->fd] = psp_fsqrt(psp_cpu.f[in->fs]); return 1;
-    case A_CVT_S_W: case A_ROUND_W_S: case A_TRUNC_W_S:
-    case A_CEIL_W_S: case A_FLOOR_W_S:
-        psp_cpu.f[in->fd] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[in->fs]); return 1;
-    case A_CVT_W_S: psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]); return 1;
+    case A_ROUND_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[in->fs], 0)); return 1;
+    case A_TRUNC_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[in->fs], 1)); return 1;
+    case A_CEIL_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[in->fs], 2)); return 1;
+    case A_FLOOR_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[in->fs], 3)); return 1;
+    case A_CVT_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[in->fs], (int)(psp_cpu.fcr31 & 3u))); return 1;
+    case A_CVT_S_W:
+        psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]); return 1;
     case A_C_COND_S:
         psp_fpu_set_cond(psp_fcmp(in->fcond, psp_cpu.f[in->fs], psp_cpu.f[in->ft]));
         return 1;
@@ -258,11 +271,11 @@ int psp_interp_step(psp_interp *ip) {
         return 1;
     }
 
-    /* A taken branch writes $ra before the slot runs; MIPS does it in the
-     * branch itself, not after the delay instruction. */
-    if (link) setr(PSP_RA_INDEX, link);
+    /* A branch/jump writes its link register before the slot runs; MIPS does it
+     * in the transfer itself, not after the delay instruction. JALR writes rd. */
+    if (link) setr(in.op == A_JALR ? in.rd : PSP_RA_INDEX, link);
 
-    if (in.has_delay_slot) {
+    if (in.has_delay_slot && (take || !in.is_likely)) {
         a_insn slot;
         if (!a_decode(psp_read32(ip->pc + 4), ip->pc + 4, &slot) ||
             transfer(&slot, &(uint32_t){0}, &(uint32_t){0}) >= 0 ||
@@ -275,7 +288,7 @@ int psp_interp_step(psp_interp *ip) {
     /* A call into a registered import stub runs the same HLE handler the
      * emitted thunk would, then resumes at the link address. */
     uint32_t nid;
-    if (in.is_call && hle_at(to, &nid)) {
+    if (take && in.is_call && hle_at(to, &nid)) {
         psp_hle_call(nid);
         ip->pc = link ? link : ip->pc + 8u;
         return 1;

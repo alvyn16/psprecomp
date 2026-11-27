@@ -385,8 +385,20 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_CVT_S_W:
         fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                 ind, in->fd, in->fs); return;
-    case A_CVT_W_S: case A_TRUNC_W_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
+    case A_ROUND_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[%u], 0));\n",
+                ind, in->fd, in->fs); return;
+    case A_TRUNC_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[%u], 1));\n",
+                ind, in->fd, in->fs); return;
+    case A_CEIL_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[%u], 2));\n",
+                ind, in->fd, in->fs); return;
+    case A_FLOOR_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[%u], 3));\n",
+                ind, in->fd, in->fs); return;
+    case A_CVT_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_round_w(psp_cpu.f[%u], (int)(psp_cpu.fcr31 & 3u)));\n",
                 ind, in->fd, in->fs); return;
     case A_C_COND_S:
         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
@@ -666,6 +678,10 @@ static void mark_labels(ectx *c, const a_func *fn) {
          * back to it has somewhere to land through dispatch; see jr $ra. */
         if (in.is_call && !in.is_get_pc && owned_by(an, a + 8, owner))
             c->is_label[widx(an, a + 8)] = 1;
+        /* A branch-likely with an unowned delay slot skips to a + 8 when not taken. */
+        if (in.is_branch && in.is_likely && !owned_by(an, a + 4, owner) &&
+            owned_by(an, a + 8, owner))
+            c->is_label[widx(an, a + 8)] = 1;
     }
 
     /* A delay slot can also be somebody's branch target. Arriving through the
@@ -885,7 +901,20 @@ static void emit_function(ectx *c, const a_func *fn) {
                 else
                     fprintf(f, "        psp_dispatch(0x%08Xu); return;\n", a + 8);
             }
-            fprintf(f, "      } }\n");
+            if (in.is_likely && !have_slot) {
+                fprintf(f, "      } else {\n");
+                if (owned_by(an, a + 8, owner) && c->is_label[widx(an, a + 8)])
+                    fprintf(f, "        goto L_%08X;\n", a + 8);
+                else {
+                    fprintf(f, "        PSP_SP_LEAVE(0x%08Xu);\n", a + 8);
+                    emit_static_call_tail(c, a + 8);
+                    fprintf(f, "        return;\n");
+                }
+                fprintf(f, "      } }\n");
+                last_terminal = 1;
+            } else {
+                fprintf(f, "      } }\n");
+            }
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
             if (have_slot) a += 4;
             continue;
@@ -909,6 +938,16 @@ static void emit_function(ectx *c, const a_func *fn) {
                 else
                     { emit_static_call_tail(c, in.target); fprintf(f, "        return;\n"); }
                 fprintf(f, "    }\n");
+                if (!have_slot) {
+                    if (owned_by(an, a + 8, owner) && c->is_label[widx(an, a + 8)])
+                        fprintf(f, "    goto L_%08X;\n", a + 8);
+                    else {
+                        fprintf(f, "    PSP_SP_LEAVE(0x%08Xu);\n", a + 8);
+                        emit_static_call_tail(c, a + 8);
+                        fprintf(f, "    return;\n");
+                    }
+                    last_terminal = 1;
+                }
             } else {
                 /* An ordinary branch always executes its delay slot, and reads
                  * its condition registers BEFORE the slot runs. The slot may

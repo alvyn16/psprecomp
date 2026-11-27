@@ -427,6 +427,7 @@ static int park_us(uint64_t timeout_us) {
         if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
         while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
         g_baton_owned = 1;
+        g_baton_takes++;
         g_switches++;
         host_mutex_unlock(&g_baton_m);
         g_tls_depth = depth;
@@ -658,8 +659,8 @@ int psp_threadman_intr_suspend(void) {
 }
 
 void psp_threadman_intr_resume(uint32_t cookie) {
-    if (g_tls_intr_depth > 0) g_tls_intr_depth--;
     if (cookie) g_tls_intr_depth = 0;
+    else if (g_tls_intr_depth > 1) g_tls_intr_depth--;
 }
 
 int psp_threadman_intr_disabled(void) { return g_tls_intr_depth > 0; }

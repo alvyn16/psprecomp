@@ -218,6 +218,29 @@ static inline uint32_t psp_f32_to_bits(float v) {
     return c.u;
 }
 
+/* Convert single-precision float to 32-bit signed integer word (stored as raw
+ * bit pattern via psp_bits_to_f32). Modes match FCSR RM bits 0..1:
+ *   0 = round to nearest-even, 1 = trunc, 2 = ceil (+inf), 3 = floor (-inf).
+ * Out-of-range / NaN inputs saturate safely without C float-cast UB. */
+static inline uint32_t psp_f32_round_w(float v, int mode) {
+    if (!(v >= -2147483648.0f && v < 2147483648.0f)) return 0x7FFFFFFFu;
+    int32_t t = (int32_t)v;
+    float tf = (float)t;
+    switch (mode & 3) {
+    case 1: return (uint32_t)t;
+    case 2: return (uint32_t)(tf < v ? t + 1 : t);
+    case 3: return (uint32_t)(tf > v ? t - 1 : t);
+    default: {
+        float d = v - tf;
+        if (d > 0.5f) return (uint32_t)(t + 1);
+        if (d < -0.5f) return (uint32_t)(t - 1);
+        if (d == 0.5f) return (uint32_t)((t & 1) ? t + 1 : t);
+        if (d == -0.5f) return (uint32_t)((t & 1) ? t - 1 : t);
+        return (uint32_t)t;
+    }
+    }
+}
+
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
 
 /* Newton-Raphson would be faster but the host FPU is exact and this is not the

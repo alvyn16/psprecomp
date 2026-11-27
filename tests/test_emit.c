@@ -1337,6 +1337,75 @@ int main(void) {
         }
     }
 
+    /* A likely branch whose delay slot is owned by another body must transfer
+     * to a+8 on the not-taken path instead of falling into the nullified slot. */
+    {
+        static const uint32_t CODE_BL[] = {
+            0x50400002u,   /* 0x00: beql $v0, $zero, BASE+0x0C */
+            0x03E00008u,   /* 0x04: jr $ra (separate seeded body) */
+            0x2402002Au,   /* 0x08: addiu $v0, $zero, 42 */
+            0x03E00008u,   /* 0x0C: jr $ra */
+            0x00000000u,   /* 0x10: nop */
+        };
+        const uint32_t seeds[] = { BASE, BASE + 4u, BASE + 8u };
+        char *bsrc = emit_synthetic("t_bl_foreign", CODE_BL, 5, seeds, 3, NULL);
+        if (bsrc) {
+            expect_contains(bsrc, "psp_func_08804008();",
+                            "not-taken beql with foreign slot transfers to a+8");
+            expect_absent(bsrc, "falls into 0x08804004",
+                          "not-taken beql never falls into nullified slot");
+            free(bsrc);
+        }
+    }
+
+    /* Multi-round discovery must preserve nindirects and avoid double-counting
+     * jump tables across re-walks. */
+    {
+        uint32_t *img = (uint32_t *)calloc(64, 4);
+        CHECK(img != NULL, "alloc synthetic PRX image");
+        if (img) {
+            /* func 0 (0x00): lui/addiu/addu/lw/jr/nop jump table at 0x80 with 2 targets */
+            img[0]  = 0x3C080880u; /* lui $t0, 0x0880 */
+            img[1]  = 0x25084080u; /* addiu $t0, $t0, 0x4080 (table) */
+            img[2]  = 0x01094021u; /* addu $t0, $t0, $t1 */
+            img[3]  = 0x8D0A0000u; /* lw $t2, 0($t0) */
+            img[4]  = 0x01400008u; /* jr $t2 */
+            img[5]  = 0x00000000u; /* nop */
+            /* target 0 (0x20): jr $ra; nop */
+            img[8]  = 0x03E00008u;
+            img[9]  = 0x00000000u;
+            /* target 1 (0x40): jr $ra; nop */
+            img[16] = 0x03E00008u;
+            img[17] = 0x00000000u;
+            /* jump table at 0x80 (words 32, 33) */
+            img[32] = BASE + 0x20u;
+            img[33] = BASE + 0x40u;
+
+            uint8_t bytes[256];
+            for (int k = 0; k < 64; k++) {
+                bytes[k * 4 + 0] = (uint8_t)img[k];
+                bytes[k * 4 + 1] = (uint8_t)(img[k] >> 8);
+                bytes[k * 4 + 2] = (uint8_t)(img[k] >> 16);
+                bytes[k * 4 + 3] = (uint8_t)(img[k] >> 24);
+            }
+            a_analysis an;
+            memset(&an, 0, sizeof an);
+            an.code = bytes;
+            an.image = bytes;
+            an.image_base = BASE;
+            an.image_size = sizeof bytes;
+            an.base = BASE;
+            an.size = sizeof bytes;
+            uint32_t seed = BASE;
+            CHECK(a_discover(&an, &seed, 1) == 0, "multi-round jump table discovery runs");
+            CHECK(an.nindirects == 1, "indirect jump site count survives convergence: got %d", an.nindirects);
+            CHECK(an.ntables == 1, "jump table not double-counted across rounds: got %d", an.ntables);
+            CHECK(an.ntable_targets == 2, "jump table target count not double-counted: got %d", an.ntable_targets);
+            a_analysis_free(&an);
+            free(img);
+        }
+    }
+
     check_fall_out();
     check_jalr_body_continuation();
     check_slot_of_another_body();

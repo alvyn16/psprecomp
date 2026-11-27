@@ -142,6 +142,10 @@ static void test_mask(void) {
     psp_threadman_intr_resume((uint32_t)inner);
     call("sceKernelSleepThread", 0, 0, 0, 0);
     REQUIRE(deliveries == 0);
+    /* Calling ResumeIntr(0) while already disabled must not re-enable interrupts. */
+    psp_threadman_intr_resume(0);
+    call("sceKernelSleepThread", 0, 0, 0, 0);
+    REQUIRE(psp_threadman_intr_disabled() != 0 && deliveries == 0);
     psp_threadman_intr_resume((uint32_t)outer);
     call("sceKernelDelayThread", 1, 0, 0, 0);
     REQUIRE(deliveries == 1);

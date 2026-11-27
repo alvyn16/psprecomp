@@ -125,6 +125,77 @@ static void test_trap(void) {
     CHECK(ip.stopped, "and stops the run");
 }
 
+static void test_allegrex_semantics(void) {
+    /* MAX/MIN signed, DIV INT_MIN/-1, EXT size=rd+1, CVT.S.W/W.S/ROUND/TRUNC/CEIL/FLOOR,
+     * BEQL not-taken slot nullification, and JALR writing rd instead of $ra. */
+    const uint32_t words[] = {
+        0x0085102Cu,                                                /* max $v0, $a0, $a1 */
+        0x0085182Du,                                                /* min $v1, $a0, $a1 */
+        0x00C7001Au,                                                /* div $a2, $a3 */
+        (0x1Fu << 26) | (9u << 21) | (8u << 16) | (7u << 11) | (8u << 6) | 0x00u, /* ext $t0,$t1,8,8 */
+        (0x11u << 26) | (0x14u << 21) | (2u << 11) | (0u << 6) | 0x20u, /* cvt.s.w $f0, $f2 */
+        (0x11u << 26) | (0x10u << 21) | (0u << 11) | (4u << 6) | 0x24u, /* cvt.w.s $f4, $f0 */
+        (0x11u << 26) | (0x10u << 21) | (1u << 11) | (6u << 6) | 0x0Cu, /* round.w.s $f6, $f1 */
+        (0x11u << 26) | (0x10u << 21) | (3u << 11) | (8u << 6) | 0x0Cu, /* round.w.s $f8, $f3 */
+        (0x11u << 26) | (0x10u << 21) | (5u << 11) | (10u << 6) | 0x0Eu, /* ceil.w.s $f10, $f5 */
+        (0x11u << 26) | (0x10u << 21) | (5u << 11) | (12u << 6) | 0x0Fu, /* floor.w.s $f12, $f5 */
+        (0x11u << 26) | (0x10u << 21) | (7u << 11) | (14u << 6) | 0x0Du, /* trunc.w.s $f14, $f7 */
+        (0x14u << 26) | (10u << 21) | (11u << 16) | 2u,             /* beql $t2, $t3, +2 (not taken) */
+        (0x09u << 26) | (0u << 21) | (12u << 16) | 99u,             /* addiu $t4, $zero, 99 (nullified) */
+        (0u << 26) | (14u << 21) | (13u << 11) | 0x09u,             /* jalr $t5, $t6 */
+        0x00000000u,                                                /* nop */
+        0x03E00008u,                                                /* jr $ra (landed via jalr) */
+        0x00000000u,                                                /* nop */
+    };
+    psp_cpu_reset();
+    psp_cpu.r[PSP_REG_A0] = 0xFFFFFFFFu; /* -1 */
+    psp_cpu.r[PSP_REG_A1] = 1u;
+    psp_cpu.r[PSP_REG_A2] = 0x80000000u; /* INT32_MIN */
+    psp_cpu.r[PSP_REG_A3] = 0xFFFFFFFFu; /* -1 */
+    psp_cpu.r[9]  = 0x12345678u;         /* $t1 */
+    psp_cpu.r[10] = 1u;                  /* $t2 */
+    psp_cpu.r[11] = 2u;                  /* $t3 */
+    psp_cpu.r[14] = CODE + 15u * 4u;     /* $t6 -> jr $ra at word 15 */
+    psp_cpu.r[PSP_REG_RA] = 0xCAFEBABEu;
+
+    uint32_t bneg5 = (uint32_t)(int32_t)-5;
+    memcpy(&psp_cpu.f[2], &bneg5, 4);
+    psp_cpu.f[1] = 42.5f;
+    psp_cpu.f[3] = 43.5f;
+    psp_cpu.f[5] = 42.25f;
+    psp_cpu.f[7] = -42.75f;
+
+    load(words, (int)(sizeof words / sizeof words[0]));
+    psp_interp ip;
+    psp_interp_init(&ip, CODE);
+    psp_interp_run(&ip, 50, 0);
+
+    CHECK(ip.traps == 0, "all instructions supported without trap, got %llu",
+          (unsigned long long)ip.traps);
+    CHECK(psp_cpu.r[PSP_REG_V0] == 1u, "max(-1, 1) signed == 1, got 0x%08X", psp_cpu.r[PSP_REG_V0]);
+    CHECK(psp_cpu.r[PSP_REG_V1] == 0xFFFFFFFFu, "min(-1, 1) signed == -1, got 0x%08X", psp_cpu.r[PSP_REG_V1]);
+    CHECK(psp_cpu.lo == 0x80000000u && psp_cpu.hi == 0u,
+          "div(INT_MIN, -1) saturates cleanly: lo=0x%08X hi=0x%08X", psp_cpu.lo, psp_cpu.hi);
+    CHECK(psp_cpu.r[8] == 0x56u, "ext(0x12345678, 8, 8) == 0x56, got 0x%08X", psp_cpu.r[8]);
+    CHECK(psp_cpu.f[0] == -5.0f, "cvt.s.w(-5) == -5.0f, got %f", psp_cpu.f[0]);
+
+    uint32_t w4 = 0, w6 = 0, w8 = 0, w10 = 0, w12 = 0, w14 = 0;
+    memcpy(&w4,  &psp_cpu.f[4],  4);
+    memcpy(&w6,  &psp_cpu.f[6],  4);
+    memcpy(&w8,  &psp_cpu.f[8],  4);
+    memcpy(&w10, &psp_cpu.f[10], 4);
+    memcpy(&w12, &psp_cpu.f[12], 4);
+    memcpy(&w14, &psp_cpu.f[14], 4);
+    CHECK((int32_t)w4 == -5, "cvt.w.s(-5.0) == -5, got %d", (int32_t)w4);
+    CHECK((int32_t)w6 == 42 && (int32_t)w8 == 44,
+          "round.w.s ties to even (42.5->42, 43.5->44), got %d/%d", (int32_t)w6, (int32_t)w8);
+    CHECK((int32_t)w10 == 43 && (int32_t)w12 == 42 && (int32_t)w14 == -42,
+          "ceil/floor/trunc got %d/%d/%d", (int32_t)w10, (int32_t)w12, (int32_t)w14);
+    CHECK(psp_cpu.r[12] == 0u, "not-taken beql nullifies delay slot ($t4=%u)", psp_cpu.r[12]);
+    CHECK(psp_cpu.r[13] == CODE + 15u * 4u, "jalr writes link into rd ($t5=0x%08X)", psp_cpu.r[13]);
+    CHECK(psp_cpu.r[PSP_REG_RA] == 0xCAFEBABEu, "jalr rd!=31 leaves $ra alone (0x%08X)", psp_cpu.r[PSP_REG_RA]);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     test_arithmetic();
@@ -132,6 +203,7 @@ int main(void) {
     test_delay_slot_taken();
     test_memory();
     test_trap();
+    test_allegrex_semantics();
     psp_mem_free();
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

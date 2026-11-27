@@ -68,6 +68,7 @@ static mem_block *alloc_slot(void) {
 
 /* Does [addr, addr+size) overlap anything already handed out? */
 static int overlaps(uint32_t addr, uint32_t size) {
+    if (addr > g_heap_hi || size > g_heap_hi - addr) return 1;
     for (int i = 0; i < MAX_BLOCKS; i++) {
         if (!g_block[i].used) continue;
         uint32_t b = g_block[i].addr, e = b + g_block[i].size;
@@ -80,8 +81,11 @@ static int overlaps(uint32_t addr, uint32_t size) {
  * hundred at most) so a linear probe per candidate is fine and keeps the
  * bookkeeping to one array. */
 static uint32_t place_low(uint32_t size, uint32_t align) {
-    uint32_t a = (g_heap_lo + align - 1) & ~(align - 1);
-    while (a + size <= g_heap_hi) {
+    if (!align || (align & (align - 1)) || size > g_heap_hi - g_heap_lo) return 0;
+    uint64_t start = ((uint64_t)g_heap_lo + align - 1) & ~((uint64_t)align - 1);
+    if (start > g_heap_hi) return 0;
+    uint32_t a = (uint32_t)start;
+    while (a >= g_heap_lo && a <= g_heap_hi && size <= g_heap_hi - a) {
         if (!overlaps(a, size)) return a;
         /* Skip past whatever is in the way rather than stepping by `align`,
          * which on a full heap would be O(heap/align) probes per allocation. */
@@ -91,14 +95,16 @@ static uint32_t place_low(uint32_t size, uint32_t align) {
             uint32_t b = g_block[i].addr, e = b + g_block[i].size;
             if (a < e && b < a + size && e < next) next = e;
         }
-        a = (next + align - 1) & ~(align - 1);
+        uint64_t next_a = ((uint64_t)next + align - 1) & ~((uint64_t)align - 1);
+        if (next_a > g_heap_hi || (uint32_t)next_a <= a) return 0;
+        a = (uint32_t)next_a;
     }
     return 0;
 }
 
 /* First fit walking down from the top. */
 static uint32_t place_high(uint32_t size, uint32_t align) {
-    if (size > g_heap_hi - g_heap_lo) return 0;
+    if (!align || (align & (align - 1)) || size > g_heap_hi - g_heap_lo) return 0;
     uint32_t a = (g_heap_hi - size) & ~(align - 1);
     while (a >= g_heap_lo) {
         if (!overlaps(a, size)) return a;
@@ -122,6 +128,7 @@ uint32_t psp_sysmem_free(void) {
 }
 
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
+    if (size > g_heap_hi - g_heap_lo) return 0;
     uint32_t rounded = (size + 0xFF) & ~0xFFu;
     if (!rounded) rounded = 0x100;
 
@@ -157,8 +164,20 @@ static void hle_AllocPartitionMemory(void) {
 
     /* The hardware allocator works in 256-byte granules. Rounding up matters:
      * a game that allocates 100 bytes and then writes 256 is relying on it. */
-    uint32_t rounded = (size + 0xFF) & ~0xFFu;
-    if (rounded == 0) rounded = 0x100;
+    uint64_t rounded64 = ((uint64_t)size + 0xFFu) & ~0xFFull;
+    if (rounded64 == 0) rounded64 = 0x100;
+    if (rounded64 > g_heap_hi - g_heap_lo) {
+        if (type == PSP_SMEM_LowAligned || type == PSP_SMEM_HighAligned) {
+            uint32_t check_align = want ? want : 0x100;
+            if (check_align & (check_align - 1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+        } else if (type > PSP_SMEM_HighAligned) {
+            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+            return;
+        }
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    uint32_t rounded = (uint32_t)rounded64;
 
     uint32_t align = 0x100;
     if (type == PSP_SMEM_LowAligned || type == PSP_SMEM_HighAligned) {
@@ -174,7 +193,8 @@ static void hle_AllocPartitionMemory(void) {
     case PSP_SMEM_High:
     case PSP_SMEM_HighAligned: addr = place_high(rounded, align); break;
     case PSP_SMEM_Addr:
-        if (want >= g_heap_lo && want + rounded <= g_heap_hi && !overlaps(want, rounded))
+        if (want >= g_heap_lo && want <= g_heap_hi &&
+            rounded <= g_heap_hi - want && !overlaps(want, rounded))
             addr = want;
         break;
     default:
@@ -235,6 +255,7 @@ static void hle_Printf(void) {
         if (!*p) break;
         /* Skip flags/width/precision; we do not reproduce padding. */
         while (*p && strchr("-+ #0123456789.lhz", *p)) p++;
+        if (!*p) { fputc('%', stderr); break; }
         switch (*p) {
         case 'd': case 'i': fprintf(stderr, "%d", (int32_t)psp_arg(argi++)); break;
         case 'u':           fprintf(stderr, "%u", psp_arg(argi++)); break;

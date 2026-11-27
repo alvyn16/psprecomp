@@ -17,12 +17,13 @@ enum {
 };
 /* Default button map, indexed by the slots in window.h. Both backends read it,
  * so a rebind applies to keyboard and controller alike. */
-static const uint32_t DEFAULT_MAP[PSP_WINDOW_BUTTON_COUNT] = {
-    B_UP, B_RIGHT, B_DOWN, B_LEFT,
-    B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE,
-    B_L, B_R, B_START, B_SELECT
-};
-static uint32_t g_button_map[PSP_WINDOW_BUTTON_COUNT];
+#define DEFAULT_BUTTON_MAP_INIT { \
+    B_UP, B_RIGHT, B_DOWN, B_LEFT, \
+    B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE, \
+    B_L, B_R, B_START, B_SELECT \
+}
+static const uint32_t DEFAULT_MAP[PSP_WINDOW_BUTTON_COUNT] = DEFAULT_BUTTON_MAP_INIT;
+static uint32_t g_button_map[PSP_WINDOW_BUTTON_COUNT] = DEFAULT_BUTTON_MAP_INIT;
 
 void psp_window_set_button_map(const uint32_t map[PSP_WINDOW_BUTTON_COUNT]) {
     if (map) memcpy(g_button_map, map, sizeof g_button_map);
@@ -172,16 +173,24 @@ static DWORD WINAPI window_main(LPVOID arg) {
 }
 
 int psp_window_start(const char *title, int scale) {
-    psp_window_set_button_map(NULL);           /* host overrides come before start */
+    if (g_thread) return -1;
+    InterlockedExchange(&g_closed, 0);
     if (title) g_title = title;
     g_scale = scale;
     HANDLE ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!ready) return -1;
     HANDLE t = CreateThread(NULL, 0, window_main, ready, 0, NULL);
     if (!t) { CloseHandle(ready); return -1; }
     g_thread = t;
     WaitForSingleObject(ready, INFINITE);       /* the window exists, or failed */
     CloseHandle(ready);
-    return g_closed ? -1 : 0;
+    if (g_closed) {
+        WaitForSingleObject(t, INFINITE);
+        CloseHandle(t);
+        g_thread = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 void psp_window_stop(void) {
@@ -319,8 +328,8 @@ static void render(SDL_Renderer *r, SDL_Texture *tex) {
     SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
     SDL_RenderClear(r);
     if (psp_display_read(g_px) == 0) {
-        /* The front buffer is 0xAABBGGRR; RGBA8888 names memory bytes, which
-         * on a little-endian host are exactly RR,GG,BB,AA. */
+        /* The front buffer is 0xAABBGGRR (little-endian bytes RR,GG,BB,AA),
+         * which is SDL_PIXELFORMAT_ABGR8888 (SDL_PIXELFORMAT_RGBA32). */
         SDL_UpdateTexture(tex, NULL, g_px, W * 4);
         SDL_RenderCopy(r, tex, NULL, &dst);
     }
@@ -332,7 +341,7 @@ static int SDLCALL window_main(void *arg) {
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, W * g_scale, H * g_scale,
                                        SDL_WINDOW_SHOWN);
-    if (!win) { g_closed = 1; return 1; }
+    if (!win) { g_closed = 1; SDL_SemPost((SDL_sem *)arg); return 1; }
     g_focused = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
     /* VSync gives natural 60 Hz pacing; the software fallback keeps the old
      * fixed-tick delay because SDL cannot vsync a software renderer. */
@@ -342,7 +351,7 @@ static int SDLCALL window_main(void *arg) {
     SDL_RendererInfo rinfo;
     const int vsync = r && SDL_GetRendererInfo(r, &rinfo) == 0 &&
                       (rinfo.flags & SDL_RENDERER_PRESENTVSYNC);
-    SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
+    SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
                                              SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
     if (tex) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
     if (!tex) g_closed = 1;
@@ -392,9 +401,10 @@ static int SDLCALL window_main(void *arg) {
             else next = now;
         }
     }
-    SDL_GameControllerClose(g_pad); g_pad = NULL;
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(r);
+    if (g_pad) { SDL_GameControllerClose(g_pad); g_pad = NULL; }
+    g_pad_instance = -1;
+    if (tex) SDL_DestroyTexture(tex);
+    if (r) SDL_DestroyRenderer(r);
     SDL_DestroyWindow(win);
     g_closed = 1;
     return 0;
@@ -412,7 +422,6 @@ static void audio_shutdown(void) {
 
 int psp_window_start(const char *title, int scale) {
     if (g_thread) return -1;                   /* call psp_window_stop() first */
-    psp_window_set_button_map(NULL);           /* host overrides come before start */
     if (title) g_title = title;
     g_closed = 0;
     g_scale = scale;
@@ -453,7 +462,14 @@ int psp_window_start(const char *title, int scale) {
     g_thread = t;
     SDL_SemWait(ready);                       /* window created, or failed */
     SDL_DestroySemaphore(ready);
-    return g_closed ? -1 : 0;
+    if (g_closed) {
+        SDL_WaitThread(t, NULL);
+        g_thread = NULL;
+        audio_shutdown();
+        SDL_Quit();
+        return -1;
+    }
+    return 0;
 }
 
 void psp_window_stop(void) {

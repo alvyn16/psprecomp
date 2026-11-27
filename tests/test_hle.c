@@ -150,6 +150,17 @@ static void test_sysmem(void) {
     uint32_t huge = call5(NID_ALLOC, 2, 0, 0, 0x7F000000u, 0);
     CHECK(huge == SCE_KERNEL_ERROR_NO_MEMORY, "an oversized request fails, got 0x%08X", huge);
 
+    /* Wrapping around (size + 0xFF) & ~0xFF must not succeed as 256 bytes. */
+    uint32_t wrap = call5(NID_ALLOC, 2, 0, 0, 0xFFFFFF80u, 0);
+    CHECK(wrap == SCE_KERNEL_ERROR_NO_MEMORY, "a wrapping size fails cleanly, got 0x%08X", wrap);
+
+    /* Trailing format specifiers in sceKernelPrintf must stop at NUL safely. */
+    psp_write8(0x08804000u, '%');
+    psp_write8(0x08804001u, '0');
+    psp_write8(0x08804002u, 0);
+    CHECK(call(psp_nid("sceKernelPrintf"), 0x08804000u, 0, 0, 0) == 0,
+          "sceKernelPrintf handles trailing format flags without over-reading");
+
     call(NID_FREE, uid2, 0, 0, 0);
     call(NID_FREE, uid3, 0, 0, 0);
     CHECK(psp_sysmem_free() == before, "everything freed restores the heap");

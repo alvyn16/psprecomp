@@ -64,6 +64,14 @@ void psp_io_reset(void) {
         g_file[i].used = 0;
         g_file[i].f = NULL;
     }
+    for (int i = 0; i < MAX_DIRS; i++) {
+        if (!g_dir[i].used) continue;
+#ifdef _WIN32
+        if (g_dir[i].handle != -1) _findclose(g_dir[i].handle);
+#else
+        if (g_dir[i].dir) closedir(g_dir[i].dir);
+#endif
+    }
     memset(g_dir, 0, sizeof g_dir);
     g_bytes_read = 0;
     if (!g_root[0]) psp_io_set_root(".");
@@ -290,8 +298,14 @@ static void hle_Lseek(void) {
     if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
 
     long pos = ftell(h->f);
-    psp_cpu.r[PSP_REG_V0] = (uint32_t)pos;
-    psp_cpu.r[PSP_REG_V1] = 0;
+    if (pos < 0) {
+        psp_cpu.r[PSP_REG_V0] = 0xFFFFFFFFu;
+        psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
+        return;
+    }
+    uint64_t upos = (uint64_t)pos;
+    psp_cpu.r[PSP_REG_V0] = (uint32_t)upos;
+    psp_cpu.r[PSP_REG_V1] = (uint32_t)(upos >> 32);
 }
 
 static void hle_Rename(void) {
@@ -337,6 +351,7 @@ static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    if (!dirent || !psp_mem_ptr(dirent, 88 + 256)) { psp_ret(0x80010016u); return; }
 
     const char *name = NULL;
 #ifdef _WIN32
@@ -357,11 +372,12 @@ static void hle_Dread(void) {
     name = de->d_name;
 #endif
 
-    /* SceIoDirent: a 52-byte SceIoStat, then char d_name[256]. */
-    for (int i = 0; i < 52; i++) psp_write8(dirent + (uint32_t)i, 0);
-    uint32_t at = dirent + 52;
-    for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
-    psp_write8(at + (uint32_t)strlen(name), 0);
+    /* SceIoDirent: 88-byte SceIoStat, then char d_name[256]. */
+    for (int i = 0; i < 88; i++) psp_write8(dirent + (uint32_t)i, 0);
+    uint32_t at = dirent + 88;
+    uint32_t len = 0;
+    for (; len < 255 && name[len]; len++) psp_write8(at + len, (uint8_t)name[len]);
+    psp_write8(at + len, 0);
 
     psp_ret(1);                       /* more entries may follow */
 }

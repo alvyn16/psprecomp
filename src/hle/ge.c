@@ -543,29 +543,25 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
  * them linearly would put the new vertex in the wrong place. Attributes are
  * perspective-correct -- interpolate attr/w and divide by the interpolated w.
  */
-static float clip_w(float w) {
-    return (w < 0 ? -1.0f : 1.0f) * (fabsf(w) < NEAR_EPS ? NEAR_EPS : fabsf(w));
-}
 
 static psp_vertex clip_lerp(const psp_vertex *a, const psp_vertex *b, float t) {
     psp_vertex o = *a;
     for (int i = 0; i < 4; i++) o.clip[i] = a->clip[i] + t * (b->clip[i] - a->clip[i]);
-    const float wa = clip_w(a->clip[3]), wb = clip_w(b->clip[3]);
-    const float ia = 1.0f / wa, ib = 1.0f / wb;
-    /* Perspective-correct: interpolate attr/w, then divide by interpolated 1/w. */
-    const float denom = (1.0f - t) * ia + t * ib;
-
+    /* Because `t` is linear in 4D homogeneous clip space (w(t) = (1-t)*wa + t*wb),
+     * rational perspective attributes attr(t) are also linear in `t` with w_t
+     * cancelling identically, avoiding division by near-zero when wa and wb have
+     * opposite signs across the near plane. */
     o.rgba = 0;
     for (int ch = 0; ch < 4; ch++) {
         const float va = (float)((a->rgba >> (8 * ch)) & 0xFFu);
         const float vb = (float)((b->rgba >> (8 * ch)) & 0xFFu);
-        float x = ((1.0f - t) * va * ia + t * vb * ib) / denom;
+        float x = va + t * (vb - va);
         if (x < 0) x = 0;
         if (x > 255) x = 255;
         o.rgba |= ((uint32_t)(x + 0.5f)) << (8 * ch);
     }
-    o.u = ((1.0f - t) * a->u * ia + t * b->u * ib) / denom;
-    o.v = ((1.0f - t) * a->v * ia + t * b->v * ib) / denom;
+    o.u = a->u + t * (b->u - a->u);
+    o.v = a->v + t * (b->v - a->v);
     o.behind = 0;
     return o;
 }
@@ -656,10 +652,24 @@ static void draw_prim(uint32_t type, uint32_t count) {
         for (uint32_t k = 0; k < n; k++) if (v[k].behind) { need_clip = 1; break; }
     if (need_clip) {
         static psp_vertex out[4];
-        for (uint32_t i = 0; i + 2 < n; i++) {
-            psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
-            const int m = clip_near(tri, out);
-            if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+        if (type == PSP_PRIM_TRIANGLES) {
+            for (uint32_t i = 0; i + 2 < n; i += 3) {
+                psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
+                const int m = clip_near(tri, out);
+                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+            }
+        } else if (type == PSP_PRIM_TRIANGLE_FAN) {
+            for (uint32_t i = 1; i + 1 < n; i++) {
+                psp_vertex tri[3] = { v[0], v[i], v[i + 1] };
+                const int m = clip_near(tri, out);
+                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+            }
+        } else {
+            for (uint32_t i = 0; i + 2 < n; i++) {
+                psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
+                const int m = clip_near(tri, out);
+                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+            }
         }
     } else {
         psp_render_current()->draw((int)type, v, (int)n, &g_ds);

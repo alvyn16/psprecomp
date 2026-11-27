@@ -596,13 +596,13 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     if (round > 0) {
         if (!an->image && !cross.n && !indirects.n) break;
         u32list targets = { 0 };
+        an->ntables = 0;
+        an->ntable_targets = 0;
         for (int i = 0; i < indirects.n; i++) {
             int n = resolve_jump_table(an, indirects.v[i], &targets);
             if (n > 0) { an->ntables++; an->ntable_targets += n; }
         }
         for (int i = 0; i < cross.n; i++) u32_push(&targets, cross.v[i]);
-        cross.n = 0;
-        indirects.n = 0;
         int added = 0;
         for (int i = 0; i < targets.n; i++) {
             uint32_t t = targets.v[i];
@@ -614,6 +614,9 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
         }
         free(targets.v);
         if (!added) break;
+
+        cross.n = 0;
+        indirects.n = 0;
 
         /* Re-walk everything from a clean slate rather than walking only the
          * new entries.

@@ -54,4 +54,20 @@ if(PKG_CONFIG)
     message(FATAL_ERROR "unexpected pkg-config flags: ${pc_out}")
   endif()
   message(STATUS "pkg-config: ${pc_out}")
+
+  file(WRITE "${PREFIX}/consumer_pc.c"
+  "#include <psprecomp/cpu.h>\n#include <psprecomp/recomp_rt.h>\n#include <psprecomp/window.h>\n#include <psprecomp/ui.h>\n#include <psprecomp/hle.h>\nint main(void) { psp_cpu_reset(); psp_window_stop(); psp_ui_stop(); return psp_fsqrt(4.0f) == 2.0f ? 0 : 1; }\n")
+  separate_arguments(PC_FLAGS NATIVE_COMMAND "${pc_out}")
+  execute_process(
+    COMMAND "${CMAKE_C_COMPILER}" -std=c11 ${CFLAGS_LIST}
+            "${PREFIX}/consumer_pc.c" ${PC_FLAGS} -o "${PREFIX}/consumer_pc"
+    RESULT_VARIABLE pc_cc_res OUTPUT_VARIABLE pc_cc_out ERROR_VARIABLE pc_cc_err)
+  if(NOT pc_cc_res EQUAL 0)
+    message(FATAL_ERROR "pkg-config consumer did not compile/link: ${pc_cc_out}\n${pc_cc_err}")
+  endif()
+  execute_process(COMMAND "${PREFIX}/consumer_pc"
+    RESULT_VARIABLE pc_run_res OUTPUT_VARIABLE pc_run_out ERROR_VARIABLE pc_run_err)
+  if(NOT pc_run_res EQUAL 0)
+    message(FATAL_ERROR "pkg-config consumer did not run: ${pc_run_out}\n${pc_run_err}")
+  endif()
 endif()
