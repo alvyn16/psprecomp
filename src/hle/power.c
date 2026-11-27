@@ -93,9 +93,16 @@ static void hle_PowerUnregisterCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* The clock-frequency call is advisory here: there is no hardware clock to
+ * change, and the game only sets it at start-up. PPSSPP lists 0xEBD177D6 as
+ * scePowerSetClockFrequency350; the name does not SHA-1 to the NID, so it is
+ * registered unnamed like the other observed firmware calls. */
+static void hle_SetClockFrequency(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_power_register(void) {
     psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback",   hle_PowerRegisterCallback);
     psp_hle_register(0xDFA8BAF8, "scePower", "scePowerUnregisterCallback", hle_PowerUnregisterCallback);
+    psp_hle_register_unnamed(0xEBD177D6, "scePower", hle_SetClockFrequency);
 }
 
 void psp_power_init(void) { psp_power_reset(); }
