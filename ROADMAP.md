@@ -217,7 +217,8 @@ library, which means it is implemented, not emulated.
       concrete decoder or container bug, and the aggregate VFPU percentage
       tells us which titles are cheap targets.
 - [ ] VFPU completion, driven by what the corpus says is actually used.
-- [ ] A Dear ImGui frontend and in-UI controller remapping. The SDL2 window is
+- [ ] A full Dear ImGui game frontend and in-UI controller remapping. The
+      save-state UI has an opt-in Dear ImGui backend, and the SDL2 window is
       the default on Linux, controller buttons can be rebound through
       `psp_window_set_button_map()`, core save states exist in
       `<psprecomp/state.h>` with a small SDL2 UI (`psp_ui_start`), and an

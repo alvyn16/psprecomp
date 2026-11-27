@@ -7,7 +7,7 @@ includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 Name: psprecomp
 Description: Static recompilation toolkit for PlayStation Portable games
 Version: @PSPRECOMP_VERSION@
-Libs: -L${libdir} -lpsprecomp -lallegrex_core
+Libs: -L${libdir} -lpsprecomp -lallegrex_core @PSPRECOMP_PC_EXTRA@
 Libs.private: -lm
 Requires.private: @PSPRECOMP_PC_REQUIRES@
 Cflags: -I${includedir}
