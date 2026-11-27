@@ -245,7 +245,7 @@ allegrexrecomp extract <file.iso> <match> <dir>  pull files out of a disc image
 allegrexrecomp dis     <file> [addr] [count]     disassemble Allegrex code
 allegrexrecomp cover   <file>                    decode-coverage report
 allegrexrecomp funcs   <file> [--list] [--base <addr>]   function discovery report
-allegrexrecomp emit    <file> <outdir> [prefix] [--base <addr>] [--hints <path>]
+allegrexrecomp emit    <file> <outdir> [prefix] [--base <addr>] [--hints <path>] [--trampoline]
                                                  generate C
 allegrexrecomp dump    <file> <addr>             print one function's C
 allegrexrecomp relocate <file> <base> <out>      write a PRX relocated to <base>
@@ -258,6 +258,13 @@ unit. A file whose contents did not change is left untouched, so a re-emit after
 an emitter tweak rebuilds only what actually moved. `dump` runs the same emitter
 over a single function and prints it; an address from a trace that lands inside
 a function resolves to the routine that owns it.
+
+`--trampoline` is an opt-in for games with long guest loops. It emits a
+body-ending transfer as a hand-off to the runtime instead of a C call, so a
+guest loop that crosses function boundaries no longer grows the host stack;
+guest calls still own their frames. Off by default, and with it off the output
+is unchanged. Re-emit the whole corpus when enabling it: a unit emitted without
+the option can leave a pending hand-off after its caller has continued.
 
 `info` accepts anything in the stack — a disc image, a PBP, a `~PSP` or `~SCE`
 module, a plain ELF/PRX — and recurses one level, so pointing it at a
