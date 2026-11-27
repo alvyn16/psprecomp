@@ -28,6 +28,12 @@ typedef struct {
 
 void psp_interp_init(psp_interp *ip, uint32_t entry);
 
+/* Register an import stub address with the NID it calls in the HLE layer.
+ * A call (jal/jalr) to that address runs psp_hle_call() and resumes after its
+ * delay slot, exactly as the emitted import thunk does. */
+void psp_interp_hle_add(uint32_t addr, uint32_t nid);
+void psp_interp_hle_clear(void);
+
 /* Execute exactly one instruction, including its delay slot when present.
  * Returns 1 if it executed, 0 if the interpreter was already stopped. */
 int psp_interp_step(psp_interp *ip);

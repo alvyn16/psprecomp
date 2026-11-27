@@ -1,14 +1,17 @@
 /* Interpreter vs emitted C: run both over the same synthetic stream and diff
- * the guest register file and the stopping PC. No game data.
+ * the complete guest state. No game data.
  *
- * The emitted side is produced by a_emit_one(), the same emitter used for a
- * real corpus, compiled with the host C compiler and linked against the same
- * runtime the interpreter uses. A mismatch is therefore a bug in exactly one
- * of the two paths, which is the point of the oracle. */
+ * The emitted side is produced by a_emit() -- the emitter a real game repo
+ * uses -- compiled with the host compiler and linked against the same runtime
+ * the interpreter uses. A mismatch is therefore a bug in exactly one of the
+ * two paths, which is the point of the oracle. */
 
 #include "psprecomp/interp.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/hle.h"
+#include "psprecomp/vfpu.h"
+#include "psprecomp/recomp_rt.h"
 
 #include "analyze.h"
 #include "emit.h"
@@ -27,7 +30,9 @@
 #  define ORACLE_RUNTIME "libpsprecomp.a"
 #endif
 
-#define CODE 0x08804000u
+#define CODE  0x08804000u
+#define STUB  0x08804100u
+#define NID   0x12345678u
 
 static int failures;
 #define CHECK(cond, ...)                                        \
@@ -40,33 +45,45 @@ static int failures;
         }                                                       \
     } while (0)
 
-/* The stream: arithmetic, a not-taken branch with its delay slot, a store,
- * a load, and a return. Every instruction here is in both modelled subsets. */
-static const uint32_t STREAM[] = {
-    0x24020005u,   /* addiu $v0, $zero, 5       */
-    0x24030003u,   /* addiu $v1, $zero, 3       */
-    0x00431021u,   /* addu  $v0, $v0, $v1       */
-    0x10400002u,   /* beq   $v0, $zero, +2      */
-    0x24420001u,   /* addiu $v0, $v0, 1 (slot)  */
-    0x3C040400u,   /* lui   $a0, 0x0400         */
-    0x34840200u,   /* ori   $a0, $a0, 0x0200    */
-    0xAC430000u,   /* sw    $v1, 0($a0)         */
-    0x8C820000u,   /* lw    $v0, 0($a0)         */
-    0x03E00008u,   /* jr    $ra                 */
-    0x00000000u,   /* nop                       */
+/* The HLE handler both processes register for the synthetic import. */
+static void oracle_hle(void) { psp_cpu.r[PSP_REG_V0] = 42; }
+
+/* Integer: arithmetic, a not-taken branch with its delay slot, a store, a
+ * load, and a return. */
+static const uint32_t INT_STREAM[] = {
+    0x24020005u, 0x24030003u, 0x00431021u, 0x10400002u,
+    0x24420001u, 0x3C040400u, 0x34840200u, 0xAC830000u,
+    0x8C820000u, 0x03E00008u, 0x00000000u,
 };
 
-static const char *SNAP = "./oracle-snapshot.txt";
+/* COP1: build 3.0 and 4.0 in GPRs, move them to $f0/$f1, add, move the
+ * result back to $v0, then return. */
+static const uint32_t FPU_STREAM[] = {
+    0x3C024040u, 0x44820000u,          /* lui $v0,0x4040; mtc1 $v0,$f0 */
+    0x3C034080u, 0x44830800u,          /* lui $v1,0x4080; mtc1 $v1,$f1 */
+    0x46010080u,                       /* add.s $f2,$f0,$f1            */
+    0x44021000u,                       /* mfc1 $v0,$f2                 */
+    0x03E00008u, 0x00000000u,          /* jr $ra; nop                  */
+};
 
-static void write_snapshot(const char *path) {
-    FILE *f = fopen(path, "wb");
-    CHECK(f != NULL, "snapshot %s is writable", path);
-    if (!f) return;
-    for (int i = 0; i < PSP_NUM_GPR; i++)
-        fprintf(f, "R%02d=%08X\n", i, psp_cpu.r[i]);
-    fprintf(f, "PC=%08X\n", psp_cpu.pc);
-    fclose(f);
-}
+/* VFPU: build a quad of ones, negate every source lane with vpfxs, add the
+ * quad to itself, then return. Prefix state and all 128 VFPU registers are in
+ * the snapshot, so a missed prefix or a wrong operand shows up. */
+static const uint32_t VFPU_STREAM[] = {
+    0xD0078080u,                       /* vone.q v0                    */
+    0xDC0F0000u,                       /* vpfxs negate every lane      */
+    0xDD0F0000u,                       /* vpfxt negate every lane      */
+    0x60008080u,                       /* vadd.q v0, v0, v0            */
+    0x03E00008u, 0x00000000u,
+};
+
+/* HLE: a call to the synthetic import stub, which runs the registered
+ * handler (writing 42 to $v0), then returns. */
+static const uint32_t HLE_STREAM[] = {
+    0x0E201040u,                       /* jal STUB                     */
+    0x00000000u,                       /* slot                         */
+    0x03E00008u, 0x00000000u,
+};
 
 static char *slurp(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -83,95 +100,143 @@ static char *slurp(const char *path) {
     return s;
 }
 
+static void write_state(FILE *f) {
+    for (int i = 0; i < PSP_NUM_GPR; i++) fprintf(f, "R%02d=%08X\n", i, psp_cpu.r[i]);
+    fprintf(f, "HI=%08X LO=%08X PC=%08X FCR=%08X CC=%08X\n",
+            psp_cpu.hi, psp_cpu.lo, psp_cpu.pc, psp_cpu.fcr31, psp_cpu.vfpu_cc);
+    for (int i = 0; i < 32; i++) fprintf(f, "F%02d=%08X\n", i, psp_f32_to_bits(psp_cpu.f[i]));
+    for (int i = 0; i < 128; i++) fprintf(f, "V%03d=%08X\n", i, psp_f32_to_bits(psp_cpu.v[i]));
+    fprintf(f, "PFX=%08X/%08X/%08X\n",
+            psp_mfv(0), psp_mfv(1), psp_mfv(2));
+}
+
+static void run_case(const char *name, const uint32_t *words, int n, int with_hle) {
+    printf("-- %s --\n", name);
+    for (int i = 0; i < n; i++) psp_write32(CODE + (uint32_t)i * 4, words[i]);
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = (const uint8_t *)psp_mem_ptr(CODE, (uint32_t)n * 4);
+    an.base = CODE;
+    an.size = (uint32_t)n * 4;
+    an.scan_base = CODE;
+    an.scan_size = (uint32_t)n * 4;
+    if (with_hle) { an.stub_addr = STUB; an.stub_size = 4; }
+    uint32_t seed = CODE;
+    CHECK(a_discover(&an, &seed, 1) == 0, "%s: discovery runs", name);
+    CHECK(an.nfuncs == 1, "%s: one function found, got %d", name, an.nfuncs);
+
+    /* --- interpreter side --- */
+    psp_cpu_reset();
+    psp_vfpu_reset();
+    psp_hle_register_unnamed(NID, "test", oracle_hle);
+    psp_interp_hle_clear();
+    if (with_hle) psp_interp_hle_add(STUB, NID);
+    psp_interp ip;
+    psp_interp_init(&ip, CODE);
+    psp_interp_run(&ip, 100, 0);
+    CHECK(ip.traps == 0 && ip.stopped, "%s: interpreter finished: traps=%llu",
+          name, (unsigned long long)ip.traps);
+    psp_cpu.pc = ip.pc;
+    FILE *f = fopen("./oracle-interp.txt", "wb");
+    CHECK(f != NULL, "%s: interpreter snapshot opens", name);
+    if (f) { write_state(f); fclose(f); }
+    char *want = slurp("./oracle-interp.txt");
+    int vl[4];
+    psp_vfpu_regs(0, 4, vl);
+    printf("  v0=%08X f2=%08X V0lane=%08X pfx=%08X cc=%08X\n",
+           psp_cpu.r[PSP_REG_V0], psp_f32_to_bits(psp_cpu.f[2]),
+           psp_f32_to_bits(psp_cpu.v[vl[0]]), psp_mfv(0), psp_cpu.vfpu_cc);
+
+    /* --- emitted C side --- */
+    psp_import_entry imports[1];
+    emit_opts eo;
+    memset(&eo, 0, sizeof eo);
+    eo.outdir = ".";
+    eo.prefix = "oracle";
+    eo.module = "oracle";
+    if (with_hle) { imports[0].addr = STUB; imports[0].nid = NID;
+                    eo.imports = imports; eo.nimports = 1; }
+    CHECK(a_emit(&an, &eo) == 0, "%s: corpus emitted", name);
+
+    f = fopen("./oracle_main.c", "wb");
+    CHECK(f != NULL, "%s: wrapper opens", name);
+    if (f) {
+        fprintf(f, "#include \"oracle_funcs.h\"\n"
+                   "#include <psprecomp/mem.h>\n"
+                   "#include <psprecomp/hle.h>\n"
+                   "#include <psprecomp/vfpu.h>\n"
+                   "#include <stdio.h>\n");
+        if (with_hle)
+            fprintf(f, "static void hle(void) { psp_cpu.r[PSP_REG_V0] = 42; }\n");
+        fprintf(f,
+            "int main(int argc, char **argv) {\n"
+            "    (void)argc;\n"
+            "    if (psp_mem_init() != 0) return 2;\n"
+            "    psp_cpu_reset();\n"
+            "    psp_vfpu_reset();\n"
+            "    psp_hle_init();\n");
+        if (with_hle)
+            fprintf(f, "    psp_hle_register_unnamed(0x%08Xu, \"test\", hle);\n", NID);
+        fprintf(f,
+            "    psp_func_%08X();\n"
+            "    FILE *f = fopen(argv[1], \"wb\");\n"
+            "    if (!f) return 3;\n", CODE);
+        if (with_hle)
+            fprintf(f, "    psp_cpu.pc = 0x%08Xu;  /* return site of the HLE call */\n", CODE + 8u);
+        fprintf(f,
+            "    for (int i = 0; i < PSP_NUM_GPR; i++) fprintf(f, \"R%%02d=%%08X\\n\", i, psp_cpu.r[i]);\n"
+            "    fprintf(f, \"HI=%%08X LO=%%08X PC=%%08X FCR=%%08X CC=%%08X\\n\",\n"
+            "            psp_cpu.hi, psp_cpu.lo, psp_cpu.pc, psp_cpu.fcr31, psp_cpu.vfpu_cc);\n"
+            "    for (int i = 0; i < 32; i++) fprintf(f, \"F%%02d=%%08X\\n\", i, psp_f32_to_bits(psp_cpu.f[i]));\n"
+            "    for (int i = 0; i < 128; i++) fprintf(f, \"V%%03d=%%08X\\n\", i, psp_f32_to_bits(psp_cpu.v[i]));\n"
+            "    fprintf(f, \"PFX=%%08X/%%08X/%%08X\\n\", psp_mfv(0), psp_mfv(1), psp_mfv(2));\n"
+            "    fclose(f);\n    return 0;\n}\n");
+        fclose(f);
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd,
+             "\"%s\" -std=c11 -I\"%s\" -I. ./oracle_funcs_000.c ./oracle_imports.c ./oracle_main.c \"%s\" -lm -o ./oracle_body",
+             ORACLE_CC, ORACLE_INCLUDE, ORACLE_RUNTIME);
+    int rc = system(cmd);
+    CHECK(rc == 0, "%s: emitted C compiles and links", name);
+    if (rc == 0) {
+        rc = system("./oracle_body ./oracle-emitted.txt");
+        CHECK(rc == 0, "%s: emitted C runs", name);
+        char *got = slurp("./oracle-emitted.txt");
+        CHECK(got && want && strcmp(got, want) == 0,
+              "%s: interpreter and emitted C agree on the full guest state", name);
+        if (got && want && strcmp(got, want) != 0) {
+            printf("first difference:\n");
+            const char *a = want, *b = got;
+            while (*a && *a == *b) { a++; b++; }
+            printf("interpreter: %.60s\nemitted:     %.60s\n", a, b);
+        }
+        free(got);
+    }
+    free(want);
+    a_analysis_free(&an);
+}
+
 int main(void) {
 #ifdef _WIN32
     printf("oracle diff harness requires a POSIX compiler invocation; skipped\n");
     return 0;
 #endif
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
+    psp_hle_init();
 
-    for (size_t i = 0; i < sizeof STREAM / sizeof STREAM[0]; i++)
-        psp_write32(CODE + (uint32_t)i * 4, STREAM[i]);
+    run_case("integer", INT_STREAM, 11, 0);
+    run_case("fpu", FPU_STREAM, 8, 0);
+    run_case("vfpu", VFPU_STREAM, 6, 0);
+    run_case("hle", HLE_STREAM, 4, 1);
 
-    a_analysis an;
-    memset(&an, 0, sizeof an);
-    /* a_discover fetches through an->code; point it at the mapped guest memory. */
-    an.code = (const uint8_t *)psp_mem_ptr(CODE, (uint32_t)sizeof STREAM);
-    CHECK(an.code != NULL, "code region is mapped");
-    an.base = CODE;
-    an.size = (uint32_t)sizeof STREAM;
-    uint32_t seed = CODE;
-    CHECK(a_discover(&an, &seed, 1) == 0, "discovery runs");
-    CHECK(an.nfuncs == 1, "one function found, got %d", an.nfuncs);
-
-    /* --- interpreter side --- */
-    psp_cpu_reset();
-    psp_interp ip;
-    psp_interp_init(&ip, CODE);
-    psp_interp_run(&ip, 100, 0);
-    CHECK(ip.traps == 0 && ip.stopped, "interpreter finished cleanly: traps=%llu",
-          (unsigned long long)ip.traps);
-    psp_cpu.pc = ip.pc;                 /* the return address it stopped at */
-    write_snapshot(SNAP);
-    char *want = slurp(SNAP);
-
-    /* --- emitted C side --- */
-    /* Emit the corpus exactly as a game repo would: the shared header carries
-     * the register aliases and instruments a single dumped body would not. */
-    emit_opts eo;
-    memset(&eo, 0, sizeof eo);
-    eo.outdir = ".";
-    eo.prefix = "oracle";
-    eo.module = "oracle";
-    CHECK(a_emit(&an, &eo) == 0, "corpus emitted");
-
-    FILE *out = fopen("./oracle_main.c", "wb");
-    CHECK(out != NULL, "emitted C wrapper opens");
-    if (out) {
-        fprintf(out,
-            "#include \"oracle_funcs.h\"\n"
-            "#include <psprecomp/mem.h>\n"
-            "#include <stdio.h>\n"
-            "int main(int argc, char **argv) {\n"
-            "    (void)argc;\n"
-            "    if (psp_mem_init() != 0) return 2;\n"
-            "    psp_cpu_reset();\n"
-            "    psp_func_%08X();\n"
-            "    FILE *f = fopen(argv[1], \"wb\");\n"
-            "    if (!f) return 3;\n"
-            "    for (int i = 0; i < PSP_NUM_GPR; i++) fprintf(f, \"R%%02d=%%08X\\n\", i, psp_cpu.r[i]);\n"
-            "    fprintf(f, \"PC=%%08X\\n\", psp_cpu.pc);\n"
-            "    fclose(f);\n"
-            "    return 0;\n"
-            "}\n", CODE);
-        fclose(out);
-    }
-
-    char cmd[1024];
-    snprintf(cmd, sizeof cmd,
-             "\"%s\" -std=c11 -I\"%s\" -I. ./oracle_funcs_000.c ./oracle_main.c \"%s\" -lm -o ./oracle_body",
-             ORACLE_CC, ORACLE_INCLUDE, ORACLE_RUNTIME);
-    int rc = system(cmd);
-    CHECK(rc == 0, "emitted C compiles and links (%s)", cmd);
-    if (rc == 0) {
-        rc = system("./oracle_body ./oracle-emitted.txt");
-        CHECK(rc == 0, "emitted C runs");
-        char *got = slurp("./oracle-emitted.txt");
-        CHECK(got && want && strcmp(got, want) == 0,
-              "interpreter and emitted C agree on all registers and PC");
-        if (got && want && strcmp(got, want) != 0) {
-            printf("--- interpreter ---\n%s--- emitted ---\n%s", want, got);
-        }
-        free(got);
-    }
-
-    free(want);
-    a_analysis_free(&an);
     psp_mem_free();
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
         return 1;
     }
-    printf("interpreter and emitted C agree (synthetic code, no game data)\n");
+    printf("interpreter and emitted C agree on all four streams (synthetic code, no game data)\n");
     return 0;
 }

@@ -5,10 +5,38 @@
 #include "psprecomp/mem.h"
 
 #include "decode.h"
+#include "psprecomp/hle.h"
+#include "psprecomp/recomp_rt.h"
+#include "psprecomp/vfpu.h"
 
 #include <stdio.h>
 
 static uint32_t reg(uint8_t n) { return n ? psp_cpu.r[n] : 0u; }
+
+/* Import stubs the interpreter can hand to the HLE layer. A game module names
+ * these addresses in its import table; the emitter uses the same table to
+ * generate thunks, so both paths end up in the same firmware handler. */
+#define MAX_HLE 64
+static struct { uint32_t addr, nid; } g_hle[MAX_HLE];
+static int g_nhle;
+
+void psp_interp_hle_add(uint32_t addr, uint32_t nid) {
+    for (int i = 0; i < g_nhle; i++)
+        if (g_hle[i].addr == addr) { g_hle[i].nid = nid; return; }
+    if (g_nhle < MAX_HLE) {
+        g_hle[g_nhle].addr = addr;
+        g_hle[g_nhle].nid = nid;
+        g_nhle++;
+    }
+}
+
+void psp_interp_hle_clear(void) { g_nhle = 0; }
+
+static int hle_at(uint32_t addr, uint32_t *nid) {
+    for (int i = 0; i < g_nhle; i++)
+        if (g_hle[i].addr == addr) { *nid = g_hle[i].nid; return 1; }
+    return 0;
+}
 static void setr(uint8_t n, uint32_t v) { psp_set_reg(n, v); }
 
 /* One non-control instruction. Control flow is handled by psp_interp_step so
@@ -103,6 +131,74 @@ static int exec(const a_insn *in) {
         const uint32_t mask = size >= 32 ? 0xFFFFFFFFu : ((1u << size) - 1u);
         setr(in->rt, (reg(in->rs) >> pos) & mask); return 1;
     }
+    /* COP1: the emitted C uses these exact helpers and operations, so the
+     * oracle can share their semantics rather than duplicate float rules. */
+    case A_MFC1: setr(in->rt, psp_f32_to_bits(psp_cpu.f[in->fs])); return 1;
+    case A_MTC1: psp_cpu.f[in->fs] = psp_bits_to_f32(reg(in->rt)); return 1;
+    case A_CFC1: setr(in->rt, psp_cpu.fcr31); return 1;
+    case A_CTC1: psp_cpu.fcr31 = reg(in->rt); return 1;
+    case A_LWC1: psp_cpu.f[in->ft] = psp_read_f32(reg(in->rs) + (uint32_t)in->imm); return 1;
+    case A_SWC1: psp_write_f32(reg(in->rs) + (uint32_t)in->imm, psp_cpu.f[in->ft]); return 1;
+    case A_ADD_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] + psp_cpu.f[in->ft]; return 1;
+    case A_SUB_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] - psp_cpu.f[in->ft]; return 1;
+    case A_MUL_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] * psp_cpu.f[in->ft]; return 1;
+    case A_DIV_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] / psp_cpu.f[in->ft]; return 1;
+    case A_MOV_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs]; return 1;
+    case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs]; return 1;
+    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs(psp_cpu.f[in->fs]); return 1;
+    case A_SQRT_S: psp_cpu.f[in->fd] = psp_fsqrt(psp_cpu.f[in->fs]); return 1;
+    case A_CVT_S_W: case A_ROUND_W_S: case A_TRUNC_W_S:
+    case A_CEIL_W_S: case A_FLOOR_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[in->fs]); return 1;
+    case A_CVT_W_S: psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]); return 1;
+    case A_C_COND_S:
+        psp_fpu_set_cond(psp_fcmp(in->fcond, psp_cpu.f[in->fs], psp_cpu.f[in->ft]));
+        return 1;
+
+    /* VFPU: the runtime owns the arithmetic, just as it does for emitted C.
+     * The oracle drives it from the decoded fields, including any prefixes
+     * left pending by vpfxs/vpfxt/vpfxd. */
+    case A_VPFXS: psp_vfpu_set_prefix(0, in->raw & 0xFFFFFFu); return 1;
+    case A_VPFXT: psp_vfpu_set_prefix(1, in->raw & 0xFFFFFFu); return 1;
+    case A_VPFXD: psp_vfpu_set_prefix(2, in->raw & 0xFFFFFFu); return 1;
+    case A_VADD: psp_vadd(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VSUB: psp_vsub(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VMUL: psp_vmul(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VDIV: psp_vdiv(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VMIN: psp_vmin(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VMAX: psp_vmax(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VDOT: psp_vdot(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VSCL: psp_vscl(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VHDP: psp_vhdp(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VCRS: psp_vcrs(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VDET: psp_vdet(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VCMP: psp_vcmp(in->vd & 0xF, in->vs, in->vt, in->vsize); return 1;
+    case A_VSGE: psp_vsge(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VSLT: psp_vslt(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VSCMP: psp_vscmp(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VMOV: psp_vunary(PSP_VU_MOV, in->vd, in->vs, in->vsize); return 1;
+    case A_VABS: psp_vunary(PSP_VU_ABS, in->vd, in->vs, in->vsize); return 1;
+    case A_VNEG: psp_vunary(PSP_VU_NEG, in->vd, in->vs, in->vsize); return 1;
+    case A_VZERO: psp_vunary(PSP_VU_ZERO, in->vd, in->vs, in->vsize); return 1;
+    case A_VONE: psp_vunary(PSP_VU_ONE, in->vd, in->vs, in->vsize); return 1;
+    case A_VRCP: psp_vunary(PSP_VU_RCP, in->vd, in->vs, in->vsize); return 1;
+    case A_VRSQ: psp_vunary(PSP_VU_RSQ, in->vd, in->vs, in->vsize); return 1;
+    case A_VSQRT: psp_vunary(PSP_VU_SQRT, in->vd, in->vs, in->vsize); return 1;
+    case A_VSIN: psp_vunary(PSP_VU_SIN, in->vd, in->vs, in->vsize); return 1;
+    case A_VCOS: psp_vunary(PSP_VU_COS, in->vd, in->vs, in->vsize); return 1;
+    case A_VEXP2: psp_vunary(PSP_VU_EXP2, in->vd, in->vs, in->vsize); return 1;
+    case A_VLOG2: psp_vunary(PSP_VU_LOG2, in->vd, in->vs, in->vsize); return 1;
+    case A_VI2F: psp_vunary(PSP_VU_I2F, in->vd, in->vs, in->vsize); return 1;
+    case A_VCST: psp_vcst(in->vd, in->vs, in->vsize); return 1;
+    case A_VMMUL: psp_vmmul(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VTFM2: psp_vtfm(in->vd, in->vs, in->vt, 2); return 1;
+    case A_VTFM3: psp_vtfm(in->vd, in->vs, in->vt, 3); return 1;
+    case A_VTFM4: psp_vtfm(in->vd, in->vs, in->vt, 4); return 1;
+    case A_VMSCL: psp_vmscl(in->vd, in->vs, in->vt, in->vsize); return 1;
+    case A_VMMOV: psp_vmmov(in->vd, in->vs, in->vsize); return 1;
+    case A_VMZERO: psp_vmzero(in->vd, in->vsize); return 1;
+    case A_VMONE: psp_vmone(in->vd, in->vsize); return 1;
+
     default: break;                 /* unsupported: counted by the caller */
     }
 
@@ -175,6 +271,14 @@ int psp_interp_step(psp_interp *ip) {
              * hardware and outside the oracle's modelled subset. */
             ip->traps++; ip->stopped = 1; return 0;
         }
+    }
+    /* A call into a registered import stub runs the same HLE handler the
+     * emitted thunk would, then resumes at the link address. */
+    uint32_t nid;
+    if (in.is_call && hle_at(to, &nid)) {
+        psp_hle_call(nid);
+        ip->pc = link ? link : ip->pc + 8u;
+        return 1;
     }
     /* Likely branches nullify the slot when not taken. A `jr $ra` is a guest
      * return: there is nothing below the entry to fall into, so stop here. */
