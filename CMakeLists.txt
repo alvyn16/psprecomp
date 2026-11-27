@@ -44,6 +44,7 @@ add_library(psprecomp STATIC
     src/traps.c
     src/window.c
     src/state.c
+    src/ui.c
     src/module.c
     src/hle/hle.c
     src/hle/sysmem.c
@@ -82,6 +83,7 @@ if(PSPRECOMP_SDL2_WINDOW AND NOT WIN32)
     if(TARGET PkgConfig::SDL2)
         target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2_WINDOW=1)
         target_link_libraries(psprecomp PUBLIC PkgConfig::SDL2)
+        target_sources(psprecomp PRIVATE src/render_gpu.c)
     else()
         # A fresh clone must still configure with nothing installed. The window
         # then reports that it cannot open, exactly as before this option.

@@ -60,6 +60,18 @@ twelve slots are d-pad, the four face buttons, L/R, Start and Select, and the
 values are `SceCtrlData` button bits. Pass `NULL` to restore the defaults. The
 map is copied, so call it before `psp_window_start()`.
 
+## Rendering and state UI
+
+With SDL2 enabled, `psp_render_select("gpu")` chooses an accelerated renderer:
+through-mode sprites are blitted through SDL's renderer into an offscreen target
+and read back into the guest framebuffer, while triangles and textured
+geometry keep using the software backend so the GE's depth/lighting rules stay
+correct. Without SDL2 the name is rejected and software remains active.
+
+`psp_ui_start()` / `psp_ui_stop()` in `<psprecomp/ui.h>` open a small SDL2
+window with Save/Load buttons, a slot selector and F5/F8 shortcuts. It calls the
+same `psp_state_*` API and is independent of the game window.
+
 ## Audio
 
 The SAS mixer always writes its stereo grain into guest memory. When the SDL2
@@ -76,7 +88,8 @@ thread, joins it, and only then calls `SDL_Quit()`. Calling it twice is safe, an
 ## What is not here
 
 The window presents pixels, input and audio. Firmware is still implemented by
-the runtime's HLE layer; there is no ImGui frontend or save-state UI. The
+the runtime's HLE layer; there is no Dear ImGui frontend — the state UI is a
+small SDL2 overlay. The
 Windows backend remains in
 `src/window.c` behind `#ifdef _WIN32` and is checked on a best-effort basis in
 CI; it is no longer the primary target.
