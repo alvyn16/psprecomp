@@ -19,13 +19,19 @@ failing — the same behaviour the core had before the SDL2 backend existed. Pas
 `-DPSPRECOMP_SDL2_WINDOW=OFF` explicitly for a dependency-free toolchain-only
 build.
 
-A game that waits on another guest thread needs cooperative host threads:
+Cooperative host threads are the Linux default: a guest that waits on another
+thread needs them, so the CPU baton is handed over at waits. The older inline
+model is available with `-DPSPRECOMP_REAL_THREADS=OFF` and is what Windows keeps
+as its default.
 
-```bash
-cmake -S . -B build-threads -DCMAKE_BUILD_TYPE=Release -DPSPRECOMP_REAL_THREADS=ON
-cmake --build build-threads -j"$(nproc)"
-ctest --test-dir build-threads -C Release
-```
+## Save states
+
+`psp_state_save(path)` / `psp_state_load(path)` in
+`<psprecomp/state.h>` snapshot the full CPU-visible register file (GPRs,
+HI/LO, PC, FPU, VFPU and prefixes) plus scratchpad, VRAM and main RAM. The file
+is versioned; a truncated or mismatched state is rejected rather than loaded
+partially. Host-only call frames are cleared on load, so a state is for
+rewinding a simple guest, not for snapshotting a live thread pool.
 
 ## Window controls
 

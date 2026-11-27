@@ -76,6 +76,10 @@ add_executable(test_audio_sink test_audio_sink.c)
 target_link_libraries(test_audio_sink PRIVATE psprecomp)
 add_test(NAME audio_sink COMMAND test_audio_sink)
 
+add_executable(test_state test_state.c)
+target_link_libraries(test_state PRIVATE psprecomp)
+add_test(NAME state COMMAND test_state)
+
 add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
