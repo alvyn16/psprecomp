@@ -36,6 +36,14 @@ add_executable(test_interp test_interp.c)
 target_link_libraries(test_interp PRIVATE psprecomp_interp)
 add_test(NAME interp COMMAND test_interp)
 
+add_executable(test_oracle_diff test_oracle_diff.c)
+target_link_libraries(test_oracle_diff PRIVATE psprecomp_interp allegrex_core)
+target_compile_definitions(test_oracle_diff PRIVATE
+  ORACLE_CC="${CMAKE_C_COMPILER}"
+  ORACLE_INCLUDE="${CMAKE_SOURCE_DIR}/include"
+  ORACLE_RUNTIME="${CMAKE_BINARY_DIR}/libpsprecomp.a")
+add_test(NAME oracle_diff COMMAND test_oracle_diff)
+
 add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
