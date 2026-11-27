@@ -249,6 +249,15 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VS2I]     = { "vs2i",     F_VD_VS },
     [A_VOCP]     = { "vocp",     F_VD_VS },
     [A_VSGN]     = { "vsgn",     F_VD_VS },
+    [A_VSRT1]    = { "vsrt1",    F_VD_VS },
+    [A_VSRT2]    = { "vsrt2",    F_VD_VS },
+    [A_VSRT3]    = { "vsrt3",    F_VD_VS },
+    [A_VSRT4]    = { "vsrt4",    F_VD_VS },
+    [A_VFAD]     = { "vfad",     F_VD_VS },
+    [A_VAVG]     = { "vavg",     F_VD_VS },
+    [A_VT4444]   = { "vt4444",   F_VD_VS },
+    [A_VT5551]   = { "vt5551",   F_VD_VS },
+    [A_VT5650]   = { "vt5650",   F_VD_VS },
     [A_VNOP]     = { "vnop",     F_NONE },
     [A_VPFXS]    = { "vpfxs",    F_UNKNOWN },
     [A_VPFXT]    = { "vpfxt",    F_UNKNOWN },
@@ -672,8 +681,17 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
             break;
         case 0x02:                                  /* VFPU9 */
             switch (RT_F(word)) {
-            case 0x04: op = A_VOCP; break;
-            case 0x0A: op = A_VSGN; break;
+            case 0x00: op = A_VSRT1;  break;
+            case 0x01: op = A_VSRT2;  break;
+            case 0x04: op = A_VOCP;   break;
+            case 0x06: op = A_VFAD;   break;
+            case 0x07: op = A_VAVG;   break;
+            case 0x08: op = A_VSRT3;  break;
+            case 0x09: op = A_VSRT4;  break;
+            case 0x0A: op = A_VSGN;   break;
+            case 0x19: op = A_VT4444; break;
+            case 0x1A: op = A_VT5551; break;
+            case 0x1B: op = A_VT5650; break;
             default:   op = A_VFPU_UNKNOWN; break;
             }
             break;
@@ -710,8 +728,12 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         op = (word == 0xFFFF0000u || word == 0xFFFF0320u || word == 0xFFFF040Du)
              ? A_VNOP : A_VFPU_UNKNOWN;           /* vnop, vsync, vflush */
         break;
+    case 0x3D:
+        op = (word & 2) ? A_SVR_Q : A_SVL_Q;
+        in.vt = (uint8_t)VT_MEM(word, 1);
+        break;
     case 0x1C: case 0x1D: case 0x1E:
-    case 0x35: case 0x3D:
+    case 0x35:
         op = A_VFPU_UNKNOWN;
         break;
 

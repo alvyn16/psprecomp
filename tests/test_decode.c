@@ -283,6 +283,19 @@ static void test_vfpu(void) {
     a_decode(0x60000080, 0, &in); CHECK(in.vsize == 2, "pair:   got %u", in.vsize);
     a_decode(0x60008000, 0, &in); CHECK(in.vsize == 3, "triple: got %u", in.vsize);
     a_decode(0x60008080, 0, &in); CHECK(in.vsize == 4, "quad:   got %u", in.vsize);
+
+    /* VFPU9 reductions, sort perms, color conversions, and svl.q/svr.q. */
+    in = dec(0xD0419697, 0x08900000, A_VSRT2, "vsrt2");
+    CHECK(in.vsize == 4 && in.vd == 23 && in.vs == 22, "vsrt2 operands");
+    in = dec(0xD0499594, 0x08900000, A_VSRT4, "vsrt4");
+    CHECK(in.vsize == 4 && in.vd == 20 && in.vs == 21, "vsrt4 operands");
+    dec(0xD0468363, 0x08900000, A_VFAD, "vfad");
+    dec(0xD0478080, 0x08900000, A_VAVG, "vavg");
+    dec(0xD0598089, 0x08900000, A_VT4444, "vt4444");
+    in = dec(0xF4800002, 0x08900000, A_SVR_Q, "svr.q");
+    CHECK(in.vt == 0 && in.rs == 4 && (in.imm & ~3) == 0, "svr.q operands");
+    in = dec(0xF480000C, 0x08900000, A_SVL_Q, "svl.q");
+    CHECK(in.vt == 0 && in.rs == 4 && (in.imm & ~3) == 12, "svl.q operands");
 }
 
 static void test_formatting(void) {

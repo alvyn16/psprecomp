@@ -23,6 +23,7 @@ typedef struct {
     const a_analysis *an;
     const a_func *func;
     const a_hints *hints;  /* forced entries from the hints file, or NULL */
+    const char *reg_name;  /* dispatch registration symbol name */
     uint8_t *is_label;     /* per word, within the current function */
     uint8_t *is_slot;      /* per word: consumed as a delay slot */
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
@@ -422,6 +423,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_sv_s(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
     case A_SV_Q:
         fprintf(f, "%spsp_sv_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_SVL_Q:
+        fprintf(f, "%spsp_svl_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_SVR_Q:
+        fprintf(f, "%spsp_svr_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
 
     case A_VADD:
         fprintf(f, "%spsp_vadd(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
@@ -499,6 +504,21 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         }
         break;
     }
+
+    case A_VSRT1: case A_VSRT2: case A_VSRT3: case A_VSRT4:
+        fprintf(f, "%spsp_vsrt(%u, %u, %u, %u);\n", ind,
+                (unsigned)(in->op - A_VSRT1 + 1), in->vd, in->vs, in->vsize);
+        return;
+    case A_VFAD:
+        fprintf(f, "%spsp_vfad(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
+        return;
+    case A_VAVG:
+        fprintf(f, "%spsp_vavg(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
+        return;
+    case A_VT4444: case A_VT5551: case A_VT5650:
+        fprintf(f, "%spsp_vcolor(%u, %u, %u, %u);\n", ind,
+                (unsigned)(in->op - A_VT4444 + 1), in->vd, in->vs, in->vsize);
+        return;
 
     /* The conversions carry a 5-bit scale in bits 20..16 (the rt field):
      * vi2f.q C200, C100, 16 turns 16.16 fixed point into floats. */
@@ -1255,17 +1275,19 @@ static void emit_header(FILE *f, const ectx *c, const emit_opts *o) {
     for (int i = 0; i < 32; i++)
         fprintf(f, "#define %-7s psp_cpu.r[%d]\n", RN[i], i);
 
+    const char *reg = c->reg_name ? c->reg_name : "psp_recomp_register";
     fprintf(f,
         "\n"
         "/* Register every recompiled function with the dispatch table. Call once\n"
         " * before running anything. */\n"
-        "void psp_recomp_register(void);\n"
+        "void %s(void);\n"
         "\n"
         "/* psp_syscall() and psp_unimplemented() are declared by\n"
         " * <psprecomp/recomp_rt.h>, which this header includes, and defined by\n"
         " * the runtime -- so the emitted C links without the host supplying\n"
         " * them. */\n"
-        "\n");
+        "\n",
+        reg);
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "void psp_func_%08X(void);\n", an->funcs[i].addr);
 
@@ -1446,6 +1468,10 @@ static void report_unapplied_hints(const ectx *c) {
 }
 
 int a_emit(const a_analysis *an, const emit_opts *o) {
+    return a_emit_named(an, o, "psp_recomp_register");
+}
+
+int a_emit_named(const a_analysis *an, const emit_opts *o, const char *register_name) {
     outfile of;
     char name[256];
     ectx c;
@@ -1459,6 +1485,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     c.an = an;
     c.func = NULL;
     c.hints = o->hints;
+    c.reg_name = (register_name && *register_name) ? register_name : "psp_recomp_register";
     c.is_label = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.entries = NULL;
@@ -1536,7 +1563,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     for (i = 0; i < c.nentries; i++)
         fprintf(of.f, "void psp_at_%08X(void);\n", c.entries[i]);
 
-    fprintf(of.f, "\nvoid psp_recomp_register(void) {\n");
+    fprintf(of.f, "\nvoid %s(void) {\n", c.reg_name);
     for (i = 0; i < an->nfuncs; i++)
         fprintf(of.f, "    psp_register(0x%08Xu, psp_func_%08X);\n",
                 an->funcs[i].addr, an->funcs[i].addr);

@@ -336,6 +336,21 @@ static uint32_t image_read32(const a_analysis *an, uint32_t addr) {
 #define JT_WINDOW 24
 #define JT_MAX_ENTRIES 512
 
+/* Verify that `addr` starts with a plausible MIPS instruction rather than an
+ * integer/float/pointer word that happens to decode (e.g. RAM pointers in
+ * 0x08xxxxxx / 0x09xxxxxx carry opcode 2 (`j`) with a target below 0x08000000,
+ * and IEEE floats like 0x3F800000 decode as `lui $zero, 0`). */
+static int is_plausible_entry_word(const a_analysis *an, uint32_t addr) {
+    a_insn in;
+    if (!a_decode(fetch(an, addr), addr, &in) || in.op == A_INVALID) return 0;
+    if (in.op == A_VFPU_UNKNOWN) return 0;
+    if ((in.op == A_J || in.op == A_JAL) && in.has_target &&
+        !a_in_range(an, in.target) && !is_import_stub(an, in.target))
+        return 0;
+    if (in.op == A_LUI && in.rt == 0) return 0;
+    return 1;
+}
+
 static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out) {
     if (!an->image) return 0;
 
@@ -438,8 +453,7 @@ static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out) {
         uint32_t entry = image_read32(an, table + i * 4);
         if (!a_in_range(an, entry)) break;
 
-        a_insn probe;
-        if (!a_decode(fetch(an, entry), entry, &probe) || probe.op == A_INVALID) break;
+        if (!is_plausible_entry_word(an, entry)) break;
 
         u32_push(out, entry);
         taken++;
@@ -491,6 +505,44 @@ static int insn_writes_gpr(const a_insn *in, uint8_t reg) {
     }
 }
 
+static void scan_lui_window(const a_analysis *an, const uint8_t *seen, int require_seen,
+                            uint32_t start, uint32_t lui_rt, uint32_t lui_imm,
+                            uint32_t sbase, uint32_t ssize, int k_limit,
+                            u32list *out_targets) {
+    for (int k = 0; k < k_limit; k++) {
+        uint32_t b = start + (uint32_t)k * 4;
+        if (!a_in_range(an, b)) break;
+        if (require_seen && !(seen[word_index(an, b)] & SEEN_CODE)) break;
+        a_insn in2;
+        a_decode(fetch(an, b), b, &in2);
+        if ((in2.op == A_ADDIU || in2.op == A_ORI) && in2.rs == lui_rt) {
+            uint32_t addr = (in2.op == A_ORI)
+                ? (((uint32_t)lui_imm << 16) | (uint32_t)in2.imm)
+                : (((uint32_t)lui_imm << 16) + (uint32_t)in2.imm);
+            /* The target must be in the scanned range too, not just the image:
+             * lui+addiu builds far more data pointers than code pointers, and
+             * nearly any data word decodes. */
+            if (a_in_range(an, addr) && !is_import_stub(an, addr) &&
+                addr >= sbase && addr - sbase < ssize &&
+                is_plausible_entry_word(an, addr)) {
+                u32_push(out_targets, addr);
+            }
+            if (in2.rt == lui_rt) break;
+        } else if (insn_writes_gpr(&in2, lui_rt)) {
+            break;
+        }
+        if (in2.is_return || in2.is_indirect) break;
+        if (in2.op == A_J || (in2.op == A_BEQ && in2.rs == 0 && in2.rt == 0)) {
+            if (k_limit > k + 2) k_limit = k + 2;
+        } else if (in2.is_call) {
+            /* A direct call preserves callee-saved registers ($s0..$s7). */
+            if (lui_rt < 16 || lui_rt > 23) {
+                if (k_limit > k + 2) k_limit = k + 2;
+            }
+        }
+    }
+}
+
 static void scan_lui_at(const a_analysis *an, const uint8_t *seen, int require_seen,
                         uint32_t a, uint32_t sbase, uint32_t ssize,
                         u32list *out_targets) {
@@ -498,32 +550,19 @@ static void scan_lui_at(const a_analysis *an, const uint8_t *seen, int require_s
     a_decode(fetch(an, a), a, &in);
     if (in.op != A_LUI || in.rt == 0) return;
 
-    int k_limit = 16;
-    for (int k = 1; k <= k_limit; k++) {
-        uint32_t b = a + (uint32_t)k * 4;
-        if (!a_in_range(an, b)) break;
-        if (require_seen && !(seen[word_index(an, b)] & SEEN_CODE)) break;
-        a_insn in2;
-        a_decode(fetch(an, b), b, &in2);
-        if ((in2.op == A_ADDIU || in2.op == A_ORI) && in2.rs == in.rt) {
-            uint32_t addr = (in2.op == A_ORI)
-                ? (((uint32_t)in.imm << 16) | (uint32_t)in2.imm)
-                : (((uint32_t)in.imm << 16) + (uint32_t)in2.imm);
-            /* The target must be in the scanned range too, not just the image:
-             * lui+addiu builds far more data pointers than code pointers, and
-             * nearly any data word decodes. */
-            if (a_in_range(an, addr) && !is_import_stub(an, addr) &&
-                addr >= sbase && addr - sbase < ssize) {
-                a_insn probe;
-                if (a_decode(fetch(an, addr), addr, &probe) && probe.op != A_INVALID)
-                    u32_push(out_targets, addr);
-            }
-            if (in2.rt == in.rt) break;
-        } else if (insn_writes_gpr(&in2, in.rt)) {
-            break;
+    scan_lui_window(an, seen, require_seen, a + 4, in.rt, (uint32_t)in.imm,
+                    sbase, ssize, 64, out_targets);
+
+    /* If this lui sits in a branch's delay slot (including `beql` where it runs
+     * only when taken), the paired addiu/ori lives at the branch target. */
+    if (a >= sbase + 4 && a_in_range(an, a - 4)) {
+        a_insn prev;
+        a_decode(fetch(an, a - 4), a - 4, &prev);
+        if (prev.has_delay_slot && prev.has_target && !prev.is_call &&
+            a_in_range(an, prev.target)) {
+            scan_lui_window(an, seen, require_seen, prev.target, in.rt,
+                            (uint32_t)in.imm, sbase, ssize, 16, out_targets);
         }
-        if (in2.has_delay_slot && k_limit > k + 1) k_limit = k + 1;
-        else if (in2.is_return || in2.is_indirect) break;
     }
 }
 

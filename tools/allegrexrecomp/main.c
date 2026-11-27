@@ -34,7 +34,7 @@ static int usage(void) {
         "  allegrexrecomp dis     <file> [start-addr] [count]\n"
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list] [--base <addr>] [--hints <path>]\n"
-        "  allegrexrecomp emit    <file> <outdir> [prefix] [--base <addr>] [--hints <path>]\n"
+        "  allegrexrecomp emit    <file> <outdir> [prefix] [--base <addr>] [--hints <path>] [--register-fn <name>]\n"
         "  allegrexrecomp dump    <file> <addr>\n"
         "  allegrexrecomp relocate <file> <base> <out>\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
@@ -782,7 +782,7 @@ static int cmd_funcs(const char *path, int list, uint32_t base, const char *hint
 /* ---- the emitter --------------------------------------------------------- */
 
 static int cmd_emit(const char *path, const char *outdir, const char *prefix, uint32_t base,
-                    const char *hintspath) {
+                    const char *hintspath, const char *regfn) {
     psp_blob b;
     elf_info e;
     a_analysis an;
@@ -844,7 +844,7 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix, ui
                hintspath, hints.nlabels, hints.nfuncs);
     printf("\n");
 
-    int rc = a_emit(&an, &o);
+    int rc = a_emit_named(&an, &o, regfn);
 
     if (rc == 0) {
         /* The instructions the emitter could not translate are the honest
@@ -1152,18 +1152,19 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
-        /* [prefix] [--base <addr>] [--hints <path>], in any order: the prefix
-         * stays optional so every existing command line keeps working. */
+        /* [prefix] [--base <addr>] [--hints <path>] [--register-fn <name>], in any order. */
         const char *prefix = NULL;
         const char *hintspath = NULL;
+        const char *regfn = NULL;
         uint32_t base = 0;
         for (int i = 4; i < argc; i++) {
             if (!strcmp(argv[i], "--hints") && i + 1 < argc) { hintspath = argv[++i]; continue; }
             if (!strcmp(argv[i], "--base") && i + 1 < argc) { base = (uint32_t)strtoul(argv[++i], NULL, 0); continue; }
+            if (!strcmp(argv[i], "--register-fn") && i + 1 < argc) { regfn = argv[++i]; continue; }
             if (!prefix && argv[i][0] != '-') { prefix = argv[i]; continue; }
             return usage();
         }
-        return cmd_emit(argv[2], argv[3], prefix, base, hintspath);
+        return cmd_emit(argv[2], argv[3], prefix, base, hintspath, regfn);
     }
     if (!strcmp(cmd, "dump")) {
         if (argc < 4) return usage();

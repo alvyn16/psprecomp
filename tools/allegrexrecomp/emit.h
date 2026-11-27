@@ -47,6 +47,7 @@ typedef struct {
  * the corpus compiles in parallel and rebuilds incrementally. A file whose
  * contents did not change is left untouched. Returns 0 on success. */
 int a_emit(const a_analysis *an, const emit_opts *o);
+int a_emit_named(const a_analysis *an, const emit_opts *o, const char *register_name);
 
 /* Emit one function to `out`, for reading rather than compiling. Returns -1 if
  * no discovered function starts at `addr`. */

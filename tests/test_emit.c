@@ -1220,6 +1220,22 @@ int main(void) {
         free(src);
     }
 
+    /* Named registration helper for secondary modules / overlays. */
+    {
+        emit_opts o_named = o;
+        o_named.prefix = "t_named";
+        CHECK(a_emit_named(&an, &o_named, "lv2_recomp_register") == 0,
+              "named-register emission succeeds");
+        char *nh = slurp("./t_named_funcs.h", NULL);
+        char *nr = slurp("./t_named_register.c", NULL);
+        CHECK(nh && strstr(nh, "void lv2_recomp_register(void);") != NULL,
+              "named-register header declares custom symbol");
+        CHECK(nr && strstr(nr, "void lv2_recomp_register(void) {") != NULL,
+              "named-register unit defines custom symbol");
+        free(nh);
+        free(nr);
+    }
+
     /* Re-emitting identical output must leave the files untouched. That is the
      * whole point of splitting the corpus: a build system can only skip work it
      * can see was not redone. A timestamp check cannot prove it (both emits
@@ -1438,6 +1454,16 @@ int main(void) {
             /* target at +0x50 (word 20): jr $ra; nop */
             words[20] = 0x03E00008u;
             words[21] = 0x00000000u;
+            /* fake vtable at +0x30 (word 12) and float at +0x38 (word 14), inside scan_size 0x60,
+             * loaded via lui+addiu in main body:
+             * words[1..4] load IMG_BASE + 0x30 and IMG_BASE + 0x38 */
+            words[1]  = 0x3C020890u; /* lui $v0, 0x0890 */
+            words[2]  = 0x24420030u; /* addiu $v0, $v0, 0x30 -> vtable */
+            words[3]  = 0x3C030890u; /* lui $v1, 0x0890 */
+            words[4]  = 0x24630038u; /* addiu $v1, $v1, 0x38 -> float 1.0f */
+            words[12] = 0x092F3D90u; /* RAM pointer decoding as out-of-range j */
+            words[13] = 0x092F3DB8u;
+            words[14] = 0x3F800000u; /* 1.0f decoding as lui $zero, 0 */
 
             uint8_t bytes[128];
             for (int k = 0; k < 32; k++) {
@@ -1459,13 +1485,64 @@ int main(void) {
             an.scan_calls = 1;
             uint32_t seed_list[2] = { IMG_BASE, IMG_BASE + 0x60u };
             CHECK(a_discover(&an, seed_list, 2) == 0, "lui+addiu discovery runs with image set");
-            int found_target = 0, found_data_target = 0;
+            int found_target = 0, found_data_target = 0, found_vtable = 0, found_float = 0;
             for (int k = 0; k < an.nfuncs; k++) {
                 if (an.funcs[k].addr == IMG_BASE + 0x40u) found_target = 1;
                 if (an.funcs[k].addr == IMG_BASE + 0x50u) found_data_target = 1;
+                if (an.funcs[k].addr == IMG_BASE + 0x30u) found_vtable = 1;
+                if (an.funcs[k].addr == IMG_BASE + 0x38u) found_float = 1;
             }
             CHECK(found_target, "lui+addiu target discovered across >4 insns");
             CHECK(found_data_target, "lui+addiu target discovered from seeded code outside scan_size");
+            CHECK(!found_vtable, "lui+addiu pointer to vtable word not treated as function");
+            CHECK(!found_float, "lui+addiu pointer to float word (lui $zero) not treated as function");
+            a_analysis_free(&an);
+        }
+
+        /* Hoisted lui separated by 32 instructions AND lui inside a branch
+         * delay slot pairing with an addiu at the branch target. */
+        {
+            uint32_t words[48];
+            memset(words, 0, sizeof words);
+            words[0]  = 0x3C050890u; /* +0x00: lui $a1, 0x0890 */
+            words[1]  = 0x50400001u; /* +0x04: beql $v0, $zero, +0x0C */
+            words[2]  = 0x3C060890u; /* +0x08: (delay slot) lui $a2, 0x0890 */
+            words[3]  = 0x24C600A8u; /* +0x0C: addiu $a2, $a2, 0xA8 (target of beql) */
+            /* 30 intervening stores/nops; then +0x88 (k=34): */
+            words[34] = 0x24A500B0u; /* +0x88: addiu $a1, $a1, 0xB0 */
+            words[35] = 0x03E00008u; /* +0x8C: jr $ra */
+            words[36] = 0x00000000u; /* +0x90: nop */
+            /* Unreachable entries seeded strictly via the two lui+addiu pairs above: */
+            words[42] = 0x03E00008u; /* +0xA8: jr $ra */
+            words[43] = 0x00000000u; /* +0xAC: nop */
+            words[44] = 0x03E00008u; /* +0xB0: jr $ra */
+            words[45] = 0x00000000u; /* +0xB4: nop */
+
+            uint8_t bytes[sizeof words];
+            for (size_t k = 0; k < sizeof words / 4; k++) {
+                bytes[k * 4 + 0] = (uint8_t)words[k];
+                bytes[k * 4 + 1] = (uint8_t)(words[k] >> 8);
+                bytes[k * 4 + 2] = (uint8_t)(words[k] >> 16);
+                bytes[k * 4 + 3] = (uint8_t)(words[k] >> 24);
+            }
+
+            a_analysis an;
+            memset(&an, 0, sizeof an);
+            an.code = bytes;
+            an.base = 0x08900000u;
+            an.size = sizeof bytes;
+            an.scan_base = 0x08900000u;
+            an.scan_size = sizeof bytes;
+            an.scan_calls = 1;
+            uint32_t seed = 0x08900000u;
+            CHECK(a_discover(&an, &seed, 1) == 0, "wide/branch-slot lui+addiu discovery runs");
+            int found_slot = 0, found_wide = 0;
+            for (int k = 0; k < an.nfuncs; k++) {
+                if (an.funcs[k].addr == 0x089000A8u) found_slot = 1;
+                if (an.funcs[k].addr == 0x089000B0u) found_wide = 1;
+            }
+            CHECK(found_slot, "delay-slot lui pairs with branch target addiu");
+            CHECK(found_wide, "hoisted lui pairs with addiu >16 insns later");
             a_analysis_free(&an);
         }
     }
