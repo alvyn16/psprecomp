@@ -48,6 +48,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
         return -1;
     }
 
+    const uint16_t e_type = (uint16_t)b[16] | ((uint16_t)b[17] << 8);
     m->base = vaddr;
     m->image_end = vaddr + filesz;
     m->entry = rd32(b + 24);
@@ -61,12 +62,17 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
      * is searched, and the entries must point into it too.
      * ponytail: right for WTF's modules (8 constructors just below .bss);
      * widen the window if another title keeps them elsewhere. */
-    const uint32_t lo = m->image_end > vaddr + 0x10000u ? m->image_end - 0x10000u : vaddr;
-    uint32_t t;
-    int count;
-    if (psp_ctors_find(lo, m->image_end, lo, m->image_end, &t, &count) == 0) {
-        m->ctors = t;
-        m->nctors = count;
+    /* ET_EXEC binaries (e_type == 2) run their own static initialisers via
+     * crt0 rather than the PRX loader; scanning the last 64 KB of .data as
+     * both table and code range mistakes .data pointer arrays for ctors. */
+    if (e_type != 2) {
+        const uint32_t lo = m->image_end > vaddr + 0x10000u ? m->image_end - 0x10000u : vaddr;
+        uint32_t t;
+        int count;
+        if (psp_ctors_find(lo, m->image_end, lo, m->image_end, &t, &count) == 0) {
+            m->ctors = t;
+            m->nctors = count;
+        }
     }
     return 0;
 }

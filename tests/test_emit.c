@@ -1404,6 +1404,49 @@ int main(void) {
             a_analysis_free(&an);
             free(img);
         }
+
+        /* Relocated / ET_EXEC images (an.image != NULL, an.base != 0) with
+         * scan_calls enabled must still harvest lui+addiu function pointers. */
+        {
+            const uint32_t IMG_BASE = 0x08900000u;
+            uint32_t words[32];
+            memset(words, 0, sizeof words);
+            /* entry at +0: lui $s1, 0x0890; addiu $a1, $s1, 0x40; jr $ra; nop */
+            words[0] = 0x3C110890u; /* lui $s1, 0x0890 */
+            words[1] = 0x26250040u; /* addiu $a1, $s1, 0x40 -> IMG_BASE + 0x40 */
+            words[2] = 0x03E00008u; /* jr $ra */
+            words[3] = 0x00000000u;
+            /* target at +0x40 (word 16): jr $ra; nop */
+            words[16] = 0x03E00008u;
+            words[17] = 0x00000000u;
+
+            uint8_t bytes[128];
+            for (int k = 0; k < 32; k++) {
+                bytes[k * 4 + 0] = (uint8_t)words[k];
+                bytes[k * 4 + 1] = (uint8_t)(words[k] >> 8);
+                bytes[k * 4 + 2] = (uint8_t)(words[k] >> 16);
+                bytes[k * 4 + 3] = (uint8_t)(words[k] >> 24);
+            }
+            a_analysis an;
+            memset(&an, 0, sizeof an);
+            an.code = bytes;
+            an.image = bytes;
+            an.image_base = IMG_BASE;
+            an.image_size = sizeof bytes;
+            an.base = IMG_BASE;
+            an.size = sizeof bytes;
+            an.scan_base = IMG_BASE;
+            an.scan_size = sizeof bytes;
+            an.scan_calls = 1;
+            uint32_t seed = IMG_BASE;
+            CHECK(a_discover(&an, &seed, 1) == 0, "lui+addiu discovery runs with image set");
+            int found_target = 0;
+            for (int k = 0; k < an.nfuncs; k++) {
+                if (an.funcs[k].addr == IMG_BASE + 0x40u) found_target = 1;
+            }
+            CHECK(found_target, "lui+addiu target discovered when an.image is set");
+            a_analysis_free(&an);
+        }
     }
 
     check_fall_out();

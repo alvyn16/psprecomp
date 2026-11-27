@@ -87,6 +87,20 @@ int main(void) {
     CHECK(start_k0 && psp_read32(start_k0 + 4), "k0 points at a thread block with a reent pointer");
 
     remove(path);
+
+    /* An ET_EXEC (e_type == 2) must not scan the tail of its image as a PRX
+     * constructor table, because .data pointer arrays look identical. */
+    f[16] = 2;
+    f[17] = 0;
+    o = fopen(path, "wb");
+    if (!o || fwrite(f, 1, sizeof f, o) != sizeof f) { printf("cannot write %s\n", path); return 1; }
+    fclose(o);
+    psp_module exec_m;
+    CHECK(psp_module_load(path, 0x10000u, &exec_m) == 0, "ET_EXEC module loads");
+    CHECK(exec_m.ctors == 0 && exec_m.nctors == 0,
+          "ET_EXEC skips PRX ctor scan (got %d ctors at 0x%08X)", exec_m.nctors, exec_m.ctors);
+    remove(path);
+
     psp_mem_free();
     printf(failures ? "module: %d failure(s)\n" : "module: all checks passed\n", failures);
     return failures ? 1 : 0;
