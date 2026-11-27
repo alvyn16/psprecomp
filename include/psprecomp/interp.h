@@ -42,6 +42,14 @@ int psp_interp_step(psp_interp *ip);
  * (pass 0 to ignore the break address). Returns the number of steps run. */
 uint64_t psp_interp_run(psp_interp *ip, uint64_t max_steps, uint32_t stop_pc);
 
+/* Interpret one guest function beginning at `entry` until its `jr $ra`.
+ * Registered functions reached by a call run through the recompiled path, so
+ * this is usable as a fallback for code the static recompiler never saw (a
+ * module relocated at run time, for example). Returns the number of guest
+ * instructions executed; `traps` receives the count of unsupported ones. */
+uint64_t psp_interp_call(uint32_t entry, uint64_t max_steps, uint64_t *traps);
+void psp_interp_stats(uint64_t *calls, uint64_t *steps, uint64_t *traps);
+
 #ifdef __cplusplus
 }
 #endif

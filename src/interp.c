@@ -6,6 +6,7 @@
 
 #include "decode.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/dispatch.h"
 #include "psprecomp/recomp_rt.h"
 #include "psprecomp/vfpu.h"
 
@@ -288,10 +289,21 @@ int psp_interp_step(psp_interp *ip) {
     /* A call into a registered import stub runs the same HLE handler the
      * emitted thunk would, then resumes at the link address. */
     uint32_t nid;
-    if (take && in.is_call && hle_at(to, &nid)) {
-        psp_hle_call(nid);
-        ip->pc = link ? link : ip->pc + 8u;
-        return 1;
+    if (take && in.is_call) {
+        if (hle_at(to, &nid)) {
+            psp_hle_call(nid);
+            ip->pc = link ? link : ip->pc + 8u;
+            return 1;
+        }
+        /* Interpreted code may call back into the recompiled module. Hand
+         * those calls to the same entry the static caller would use rather
+         * than interpreting a body that may contain unsupported encodings. */
+        psp_fn_t fn = psp_lookup(to);
+        if (fn) {
+            psp_call_guest_fn(fn, link ? link : ip->pc + 8u);
+            ip->pc = link ? link : ip->pc + 8u;
+            return 1;
+        }
     }
     /* Likely branches nullify the slot when not taken. A `jr $ra` is a guest
      * return: there is nothing below the entry to fall into, so stop here. */
@@ -310,4 +322,23 @@ uint64_t psp_interp_run(psp_interp *ip, uint64_t max_steps, uint32_t stop_pc) {
         n++;
     }
     return n;
+}
+
+static uint64_t g_calls, g_steps, g_traps;
+
+uint64_t psp_interp_call(uint32_t entry, uint64_t max_steps, uint64_t *traps) {
+    psp_interp ip;
+    psp_interp_init(&ip, entry);
+    uint64_t n = psp_interp_run(&ip, max_steps, 0);
+    g_calls++;
+    g_steps += n;
+    g_traps += ip.traps;
+    if (traps) *traps = ip.traps;
+    return n;
+}
+
+void psp_interp_stats(uint64_t *calls, uint64_t *steps, uint64_t *traps) {
+    if (calls) *calls = g_calls;
+    if (steps) *steps = g_steps;
+    if (traps) *traps = g_traps;
 }

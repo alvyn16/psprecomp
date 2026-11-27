@@ -4,6 +4,7 @@
 #include "psprecomp/interp.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/dispatch.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -196,6 +197,32 @@ static void test_allegrex_semantics(void) {
     CHECK(psp_cpu.r[PSP_REG_RA] == 0xCAFEBABEu, "jalr rd!=31 leaves $ra alone (0x%08X)", psp_cpu.r[PSP_REG_RA]);
 }
 
+static void host_fn(void) { psp_cpu.r[PSP_REG_V0] = 7; }
+
+static void test_call_entry(void) {
+    /* psp_interp_call runs one guest function until its jr $ra, and hands
+     * calls to registered recompiled functions to the recompiled path. */
+    static const uint32_t words[] = {
+        0x0E201040u,   /* jal  CODE+0x100   */
+        0x00000000u,   /* nop               */
+        0x24020005u,   /* addiu $v0, zero, 5 */
+        0x03E00008u,   /* jr $ra            */
+        0x00000000u,   /* nop               */
+    };
+    psp_cpu_reset();
+    load(words, 5);
+    psp_register(CODE + 0x100u, host_fn);
+    psp_cpu.r[PSP_REG_RA] = 0x12345678u;
+    uint64_t traps = 9;
+    uint64_t steps = psp_interp_call(CODE, 100, &traps);
+    CHECK(steps == 3 && traps == 0, "three steps (jal, addiu, jr), no traps: %llu/%llu",
+          (unsigned long long)steps, (unsigned long long)traps);
+    CHECK(reg_v0() == 5, "the registered call ran and the caller resumed, v0=%u", reg_v0());
+    uint64_t c, st, tr;
+    psp_interp_stats(&c, &st, &tr);
+    CHECK(c && st >= steps, "the call is counted in the interpreter stats");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     test_arithmetic();
@@ -204,6 +231,7 @@ int main(void) {
     test_memory();
     test_trap();
     test_allegrex_semantics();
+    test_call_entry();
     psp_mem_free();
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
