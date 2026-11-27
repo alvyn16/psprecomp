@@ -196,8 +196,8 @@ lifted at the address it really loads at.*
   let a mixer thread spin and starve every other thread under real threads.
 
 **Known open**
-- `emit --trampoline` (#37) waits on a rebase over #32's call helpers.
-- Jump-table operands traced to their definitions (#19) is in review.
+- Jump-table operands traced to their definitions (#19) is in review; it is held
+  on a licence question about the resolver's structure, not on the code.
 
 ### v0.5.0 — *"Taking Turns"* (October 2026)
 

@@ -399,7 +399,7 @@ static void test_vmmul_orientation(void) {
 
 static void test_matrix_transform(void) {
     psp_vfpu_reset();
-    float m[4][4], v[4];
+    float m[4][4];
 
     /* Transforming a basis vector must yield the corresponding matrix column.
      * That is the property which distinguishes this convention from its

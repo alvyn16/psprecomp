@@ -1,6 +1,8 @@
 # Roadmap
 
-Phased plan. Phase 1 is done; phase 2 is the gate everything else waits behind.
+Phased plan. Phases 1 and 2a are done; 2b is useful but not a gate. For what
+is implemented *now*, see the Status table in README.md and the CHANGELOG —
+the checkboxes below record original intent, not necessarily current state.
 
 ## Phase 1 — the container stack and the decoder ✅
 
@@ -143,10 +145,10 @@ about being self-contained, which is a goal but not a gate.
       recognise pointers by shape: in the code extent, instruction-aligned, and
       pointing at something that decodes. Deliberately kept separate and named
       as a **heuristic** rather than enumeration. **70% -> 88%** on `hell2k`.
-- [ ] **Jump-table resolution** — the `lui`/`addiu`/`sll`/`addu`/`lw`/`jr`
-      idiom that MIPS compilers emit for `switch`. 38 unresolved sites in
-      Lumberjack. Unresolved tables become dispatch-table lookups rather than
-      analysis failures.
+- [x] **Jump-table resolution** — the `lui`/`addiu`/`sll`/`addu`/`lw`/`jr`
+      idiom that MIPS compilers emit for `switch` (added in v0.2.0). Remaining
+      work is refining operand tracing (#19); unresolved tables become
+      dispatch-table lookups rather than analysis failures.
 - [x] **The delay-slot problem.** Ordinary branches capture their condition
       into a temporary before the slot runs (so a slot that writes a compared
       register cannot flip the branch); likely branches duplicate the slot into
@@ -168,6 +170,7 @@ about being self-contained, which is a goal but not a gate.
       *below* its entry point (so functions carry a `start` as well as an `end`).
 - [ ] **Hints file** — per-title force-code/force-data, function names, and
       HLE overrides, so a title's hard-won analysis is data rather than a patch.
+      The `[[label]]` force-label kind landed in v0.6.0 (#34); the rest is open.
 
 ## Phase 4 — the HLE library
 
@@ -192,8 +195,8 @@ library, which means it is implemented, not emulated.
 
 ## Phase 5 — running the recompiled C
 
-- [ ] **Dispatch table** — `addr -> psp_fn_t`, for indirect calls and jump
-      tables. Static `jal` stays a direct C call.
+- [x] **Dispatch table** — `addr -> psp_fn_t`, for indirect calls and jump
+      tables. Static `jal` stays a direct C call. Implemented in `src/dispatch.c`.
 - [ ] **The interpreter oracle** — an Allegrex interpreter sharing this repo's
       decoder and runtime, so the recompiled path can be diffed against it
       instruction-for-instruction. When they disagree, the bug is in exactly
