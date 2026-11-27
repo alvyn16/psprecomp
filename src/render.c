@@ -367,7 +367,9 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
     int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
 
-    if (a->behind || b->behind || c->behind) return;   /* ponytail: no near-plane clipping */
+    /* Transformed primitives are clipped at the near plane in ge.c before
+     * they reach the backend; keep the guard for a caller that did not. */
+    if (a->behind || b->behind || c->behind) return;
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
     if (maxx > 479) maxx = 479;

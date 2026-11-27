@@ -187,19 +187,23 @@ static void xf_reset(void) {
     g_xf.uscale = g_xf.vscale = 1;
 }
 
-/* Model space to screen pixels. Returns 0 for a point behind the eye.
- * ponytail: no near-plane clipping, so a primitive with any vertex behind the
- * eye is dropped whole; add clipping when 3D scenes lose triangles. */
-static int transform(const float p[3], float *sx, float *sy, float *sz) {
+/* Clip-space near plane. A small positive w is used rather than zero so the
+ * intersection's projected coordinates stay bounded for the integer rasterizer. */
+#define NEAR_EPS 0.01f
+
+/* Model space to clip space, then to screen pixels. Returns 0 when the point
+ * is behind the eye; the clip coordinates are still written so a triangle
+ * straddling the plane can be clipped and reprojected. */
+static int transform(const float p[3], float *sx, float *sy, float *sz, float c[4]) {
     const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
-    float w[3], v[3], c[4];
+    float w[3], v[3];
     for (int r = 0; r < 3; r++)
         w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
     for (int r = 0; r < 3; r++)
         v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
     for (int r = 0; r < 4; r++)
         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
-    if (c[3] <= 0) return 0;
+    if (c[3] <= NEAR_EPS) return 0;
     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
     *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
     *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
@@ -508,6 +512,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
     if (!VT_POS(vtype)) return 0;
     read3(addr + (uint32_t)pos_off, (int)VT_POS(vtype), through, pos);
     out->behind = 0;
+    out->clip[0] = out->clip[1] = out->clip[2] = 0;
+    out->clip[3] = 1;
     if (through) {
         /* Through mode's depth is an unsigned 16-bit value. */
         out->x = (int)pos[0];
@@ -521,13 +527,77 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         out->rgba = light_vertex(pos, n, out->rgba);
     }
     float sx, sy, sz;
-    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
+    if (!transform(pos, &sx, &sy, &sz, out->clip)) { out->behind = 1; g_xf.behind++; return 1; }
     out->x = (int)floorf(sx);
     out->y = (int)floorf(sy);
     out->z = sz;
     return 1;
 }
 
+
+/* ---- near-plane clipping --------------------------------------------------
+ *
+ * A primitive with a vertex behind the eye used to be dropped whole, which
+ * punched holes in transformed geometry. Clip each triangle against w >= eps
+ * instead, in homogeneous space: screen coordinates are c/w, so interpolating
+ * them linearly would put the new vertex in the wrong place. Attributes are
+ * perspective-correct -- interpolate attr/w and divide by the interpolated w.
+ */
+static float clip_w(float w) {
+    return (w < 0 ? -1.0f : 1.0f) * (fabsf(w) < NEAR_EPS ? NEAR_EPS : fabsf(w));
+}
+
+static psp_vertex clip_lerp(const psp_vertex *a, const psp_vertex *b, float t) {
+    psp_vertex o = *a;
+    for (int i = 0; i < 4; i++) o.clip[i] = a->clip[i] + t * (b->clip[i] - a->clip[i]);
+    const float wa = clip_w(a->clip[3]), wb = clip_w(b->clip[3]);
+    const float ia = 1.0f / wa, ib = 1.0f / wb;
+    /* Perspective-correct: interpolate attr/w, then divide by interpolated 1/w. */
+    const float denom = (1.0f - t) * ia + t * ib;
+
+    o.rgba = 0;
+    for (int ch = 0; ch < 4; ch++) {
+        const float va = (float)((a->rgba >> (8 * ch)) & 0xFFu);
+        const float vb = (float)((b->rgba >> (8 * ch)) & 0xFFu);
+        float x = ((1.0f - t) * va * ia + t * vb * ib) / denom;
+        if (x < 0) x = 0;
+        if (x > 255) x = 255;
+        o.rgba |= ((uint32_t)(x + 0.5f)) << (8 * ch);
+    }
+    o.u = ((1.0f - t) * a->u * ia + t * b->u * ib) / denom;
+    o.v = ((1.0f - t) * a->v * ia + t * b->v * ib) / denom;
+    o.behind = 0;
+    return o;
+}
+
+static void clip_project(psp_vertex *v) {
+    float w = v->clip[3];
+    if (w < NEAR_EPS) w = NEAR_EPS;
+    v->x = (int)floorf(v->clip[0] / w * g_xf.xscale + g_xf.xpos - g_xf.offx);
+    v->y = (int)floorf(v->clip[1] / w * g_xf.yscale + g_xf.ypos - g_xf.offy);
+    v->z = v->clip[2] / w * g_xf.zscale + g_xf.zpos;
+    /* Edge functions are integer; keep clamped intersections from overflowing
+     * them when a vertex is very close to the near plane. */
+    if (v->x < -16384) v->x = -16384; else if (v->x > 16384) v->x = 16384;
+    if (v->y < -16384) v->y = -16384; else if (v->y > 16384) v->y = 16384;
+    v->behind = 0;
+}
+
+/* Sutherland-Hodgman against the near plane; a triangle yields 3 or 4 corners. */
+static int clip_near(const psp_vertex tri[3], psp_vertex out[4]) {
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        const psp_vertex *cur = &tri[i], *nxt = &tri[(i + 1) % 3];
+        const int ic = cur->clip[3] > NEAR_EPS, inx = nxt->clip[3] > NEAR_EPS;
+        if (ic) out[n++] = *cur;
+        if (ic != inx) {
+            const float t = (NEAR_EPS - cur->clip[3]) / (nxt->clip[3] - cur->clip[3]);
+            out[n++] = clip_lerp(cur, nxt, t);
+        }
+    }
+    for (int i = 0; i < n; i++) clip_project(&out[i]);
+    return n;
+}
 
 /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
  * what it is, its vertex format, and the texture state it is drawn with. */
@@ -579,7 +649,21 @@ static void draw_prim(uint32_t type, uint32_t count) {
             fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                     (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
     }
-    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
+    if (!n) return;
+    int need_clip = 0;
+    if (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
+        type == PSP_PRIM_TRIANGLE_FAN)
+        for (uint32_t k = 0; k < n; k++) if (v[k].behind) { need_clip = 1; break; }
+    if (need_clip) {
+        static psp_vertex out[4];
+        for (uint32_t i = 0; i + 2 < n; i++) {
+            psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
+            const int m = clip_near(tri, out);
+            if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+        }
+    } else {
+        psp_render_current()->draw((int)type, v, (int)n, &g_ds);
+    }
 }
 
 /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
