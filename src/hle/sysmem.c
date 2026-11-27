@@ -54,16 +54,38 @@ void psp_sysmem_reset(void) {
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
 
+static mem_block *alloc_slot(void) {
+    for (int i = 0; i < MAX_BLOCKS; i++)
+        if (!g_block[i].used) return &g_block[i];
+    return NULL;
+}
+
 static mem_block *find_uid(uint32_t uid) {
+    /* uid 0 is a reservation, not an allocation the guest owns. */
+    if (!uid) return NULL;
     for (int i = 0; i < MAX_BLOCKS; i++)
         if (g_block[i].used && g_block[i].uid == uid) return &g_block[i];
     return NULL;
 }
 
-static mem_block *alloc_slot(void) {
-    for (int i = 0; i < MAX_BLOCKS; i++)
-        if (!g_block[i].used) return &g_block[i];
-    return NULL;
+void psp_sysmem_set_floor(uint32_t lo) {
+    if (lo < g_heap_lo && lo < g_heap_hi) g_heap_lo = lo;
+}
+
+int psp_sysmem_reserve(uint32_t addr, uint32_t size) {
+    if (!size) return 0;
+    if (size > UINT32_MAX - addr) return -1;
+    mem_block *b = alloc_slot();
+    if (!b) return -1;
+    memset(b, 0, sizeof *b);
+    /* Keep the whole range, even the part below the current heap floor: a
+     * loader may lower that floor later, and the module must stay claimed
+     * when it does. psp_sysmem_free counts only the part inside the heap. */
+    b->addr = addr;
+    b->size = size;
+    snprintf(b->name, sizeof b->name, "reserved");
+    b->used = 1;
+    return 0;                  /* uid stays 0: the guest cannot free it */
 }
 
 /* Does [addr, addr+size) overlap anything already handed out? */
@@ -121,10 +143,16 @@ static uint32_t place_high(uint32_t size, uint32_t align) {
 }
 
 uint32_t psp_sysmem_free(void) {
-    uint32_t used = 0;
-    for (int i = 0; i < MAX_BLOCKS; i++)
-        if (g_block[i].used) used += g_block[i].size;
-    return (g_heap_hi - g_heap_lo) - used;
+    uint64_t used = 0;
+    for (int i = 0; i < MAX_BLOCKS; i++) {
+        if (!g_block[i].used) continue;
+        uint64_t lo = g_block[i].addr < g_heap_lo ? g_heap_lo : g_block[i].addr;
+        uint64_t hi = (uint64_t)g_block[i].addr + g_block[i].size;
+        if (hi > g_heap_hi) hi = g_heap_hi;
+        if (hi > lo) used += hi - lo;
+    }
+    uint64_t total = (uint64_t)g_heap_hi - g_heap_lo;
+    return used < total ? (uint32_t)(total - used) : 0;
 }
 
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
@@ -149,7 +177,10 @@ uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
 
 void psp_sysmem_release(uint32_t addr) {
     for (int i = 0; i < MAX_BLOCKS; i++)
-        if (g_block[i].used && g_block[i].addr == addr) { g_block[i].used = 0; return; }
+        if (g_block[i].used && g_block[i].uid && g_block[i].addr == addr) {
+            g_block[i].used = 0;
+            return;
+        }
 }
 
 /* ---- the calls ----------------------------------------------------------- */
@@ -292,4 +323,9 @@ void psp_sysmem_register(void) {
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
     psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
+    /* PPSSPP's table calls this sceKernelSetCompiledSdkVersion500_505: a
+     * firmware-revision marker rather than a name whose SHA-1 gives the NID
+     * (it hashes to 0xC28A2329), so it stays unnamed like the other observed
+     * NIDs. It is as advisory as the two version calls above. */
+    psp_hle_register_unnamed(0x91DE343C, "SysMemUserForUser", hle_SetCompiledSdkVersion);
 }

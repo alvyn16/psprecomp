@@ -5,6 +5,7 @@
 #include "psprecomp/cpu.h"
 #include "psprecomp/ctors.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/hle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,13 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
         fprintf(stderr, "psprecomp: cannot place %s at 0x%08X\n", path, vaddr);
         return -1;
     }
+
+    /* The module is mapped at the bottom of the memory the game sees. The
+     * allocator must not hand any of it -- .bss included -- to the game as a
+     * fresh partition: Dante's Inferno reads a pointer out of .bss after it
+     * has allocated its heaps, and a hidden overlap there is far harder to
+     * spot than an allocation failure. */
+    psp_sysmem_reserve(vaddr, span);
 
     const uint16_t e_type = (uint16_t)b[16] | ((uint16_t)b[17] << 8);
     m->base = vaddr;
@@ -114,6 +122,18 @@ uint32_t psp_module_start(const psp_module *m) {
             psp_cpu.r[PSP_REG_A1] = CMDLINE_ADDR;
         }
     }
+    /* On a PSP the user heap is all of user RAM the module does not occupy.
+     * This port maps the module a megabyte higher than the loader does, so the
+     * default heap floor would throw that megabyte away; Dante's Inferno sizes
+     * its engine and macro heaps to nearly all the remaining memory and then
+     * asks for an 850 KB VPL that no longer fits. Claim the page holding the
+     * loader's own TCB, reent and command line, then let the heap reach down
+     * to the bottom of user RAM. */
+    psp_sysmem_reserve(TCB_ADDR, 0x1000);
+    if (m->base > TCB_ADDR + 0x1000 &&
+        m->base < PSP_RAM_BASE + PSP_RAM_SIZE)
+        psp_sysmem_set_floor(TCB_ADDR);
+
     psp_cpu.r[26] = TCB_ADDR;                   /* $k0 */
     psp_write32(TCB_ADDR + 4, REENT_ADDR);
     if (m->ctors) psp_ctors_run(m->ctors);

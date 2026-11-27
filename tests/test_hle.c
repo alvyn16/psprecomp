@@ -166,6 +166,50 @@ static void test_sysmem(void) {
     CHECK(psp_sysmem_free() == before, "everything freed restores the heap");
 }
 
+/* A loaded module and the loader's own TCB page are not free memory. Lowering
+ * the heap floor is only safe once those regions are claimed: otherwise the
+ * PSP's "everything the module does not occupy is yours" rule hands the game
+ * a partition that overlaps its own code. */
+static void test_sysmem_reservations(void) {
+    psp_sysmem_reset();
+    const uint32_t NID_ALLOC = psp_nid("sceKernelAllocPartitionMemory");
+    const uint32_t NID_FREE  = psp_nid("sceKernelFreePartitionMemory");
+    const uint32_t NID_HEAD  = psp_nid("sceKernelGetBlockHeadAddr");
+
+    const uint32_t before = psp_sysmem_free();
+    CHECK(psp_sysmem_reserve(0x08900000u, 0x301000u) == 0, "reserve a module span");
+    /* Only the part of the reservation inside the heap is counted as used,
+     * but the whole span stays claimed for when the floor is lowered. */
+    CHECK(psp_sysmem_free() == before - 0x1000u,
+          "the part of a reservation inside the heap is not free (got %u)", psp_sysmem_free());
+
+    uint32_t uid = call5(NID_ALLOC, 2, 0, 0, 0x1000, 0);
+    uint32_t addr = call(NID_HEAD, uid, 0, 0, 0);
+    CHECK(addr >= 0x08C01000u, "a low allocation skips the reserved span, got 0x%08X", addr);
+    CHECK(call(NID_FREE, 0, 0, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_UID,
+          "a reservation has no UID the guest can free");
+    CHECK(psp_sysmem_reserve(0x05000000u, 0x1000u) == 0,
+          "reserving below the heap is a harmless no-op");
+    CHECK(psp_sysmem_free() < before, "the reservation still counts");
+
+    CHECK(psp_sysmem_reserve(0x08800000u, 0x1000u) == 0, "claim the loader's TCB page");
+    psp_sysmem_set_floor(0x08800000u);
+    CHECK(psp_sysmem_free() > before, "lowering the floor exposes user RAM below the module");
+    uint32_t low = psp_sysmem_alloc(0x1000, 0);
+    CHECK(low >= 0x08801000u && low + 0x1000 <= 0x08900000u,
+          "the exposed memory is allocatable but skips the TCB page, got 0x%08X", low);
+    psp_sysmem_release(low);
+
+    /* The floor only moves down. Raising it under live blocks would orphan
+     * them, so an attempted raise is refused rather than partially applied. */
+    uint32_t exposed = psp_sysmem_free();
+    psp_sysmem_set_floor(0x08C00000u);
+    CHECK(psp_sysmem_free() == exposed, "the floor cannot be raised");
+
+    call(NID_FREE, uid, 0, 0, 0);
+    psp_sysmem_reset();
+}
+
 static void test_semaphores(void) {
     psp_threadman_reset();
 
@@ -909,6 +953,7 @@ int main(void) {
     test_sha1_vectors();
     test_nids_match_names();
     test_sysmem();
+    test_sysmem_reservations();
     test_semaphores();
     test_event_flags();
     test_threads();

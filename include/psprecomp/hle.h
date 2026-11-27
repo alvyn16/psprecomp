@@ -283,6 +283,21 @@ uint64_t psp_threadman_started(void);
  * the allocator is behaving. */
 uint32_t psp_sysmem_free(void);
 
+/* The heap starts above the loaded module by default, which is safe but costs
+ * a megabyte on a game whose module is not at the bottom of user memory. On a
+ * PSP everything in user RAM that the module does not occupy belongs to the
+ * game, so a loader may lower the floor once it knows where the module sits.
+ * Raising the floor is ignored: shrinking the range under live blocks is not
+ * something the allocator can do safely. */
+void psp_sysmem_set_floor(uint32_t lo);
+
+/* Claim [addr, addr+size) so no allocation is placed over it: a loaded module
+ * and its .bss, or the loader's own TCB page. The intersection with the heap
+ * is what gets claimed; a region wholly outside it is a no-op. Reserved space
+ * counts as used in psp_sysmem_free and has no UID, so the guest cannot free
+ * it. Returns 0, or -1 if the bookkeeping is full. */
+int psp_sysmem_reserve(uint32_t addr, uint32_t size);
+
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */
