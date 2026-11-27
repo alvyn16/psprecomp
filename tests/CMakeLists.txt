@@ -144,3 +144,17 @@ set_tests_properties(ctrl_latch PROPERTIES TIMEOUT 30)
 add_executable(test_hints test_hints.c)
 target_link_libraries(test_hints PRIVATE allegrex_core)
 add_test(NAME hints COMMAND test_hints)
+
+# Install layout: a Linux host must be able to consume the toolkit from a
+# prefix without pointing at the build tree. The consumer test is fenced so it
+# always runs after the install step.
+add_test(NAME install_tree
+  COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix ${CMAKE_BINARY_DIR}/install-root)
+set_tests_properties(install_tree PROPERTIES FIXTURES_SETUP installed)
+add_test(NAME install_consumer
+  COMMAND ${CMAKE_COMMAND}
+          "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+          "-DCFLAGS=${CMAKE_C_FLAGS}"
+          "-DPREFIX=${CMAKE_BINARY_DIR}/install-root"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer.cmake)
+set_tests_properties(install_consumer PROPERTIES FIXTURES_REQUIRED installed)
