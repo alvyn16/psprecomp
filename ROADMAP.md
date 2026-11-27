@@ -212,10 +212,11 @@ library, which means it is implemented, not emulated.
       concrete decoder or container bug, and the aggregate VFPU percentage
       tells us which titles are cheap targets.
 - [ ] VFPU completion, driven by what the corpus says is actually used.
-- [ ] Save states, a Dear ImGui frontend and controller remapping. The SDL2
-      window itself is in place and is the default on Linux hosts; the core
-      stays dependency-free when the option is disabled. See
-      [`docs/LINUX.md`](docs/LINUX.md).
+- [ ] A Dear ImGui frontend and controller remapping UI. The SDL2 window is the
+      default on Linux, controller buttons can be rebound through
+      `psp_window_set_button_map()`, and core save states exist in
+      `<psprecomp/state.h>`. The core stays dependency-free when the window is
+      disabled. See [`docs/LINUX.md`](docs/LINUX.md).
 
 ## Cross-cutting — the build loop ✅
 

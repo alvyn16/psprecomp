@@ -43,6 +43,7 @@ add_library(psprecomp STATIC
     src/vfpu.c
     src/traps.c
     src/window.c
+    src/state.c
     src/module.c
     src/hle/hle.c
     src/hle/sysmem.c
@@ -91,8 +92,14 @@ if(PSPRECOMP_SDL2_WINDOW AND NOT WIN32)
     endif()
 endif()
 
-# Real scheduling is experimental; the existing inline model stays the default.
-option(PSPRECOMP_REAL_THREADS "Enable experimental cooperative host-thread scheduling" OFF)
+# On Linux a real game stalls at its first guest semaphore in the inline model,
+# so cooperative host threads are the default there. Windows keeps the inline
+# default for compatibility; either side can opt out explicitly.
+if(WIN32)
+    option(PSPRECOMP_REAL_THREADS "Enable cooperative host-thread scheduling" OFF)
+else()
+    option(PSPRECOMP_REAL_THREADS "Enable cooperative host-thread scheduling" ON)
+endif()
 target_compile_definitions(psprecomp PUBLIC
     PSPRECOMP_REAL_THREADS=$<BOOL:${PSPRECOMP_REAL_THREADS}>
 )

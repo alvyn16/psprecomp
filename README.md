@@ -175,7 +175,7 @@ It does not yet render. Being specific about which parts are real:
 | **VFPU** | 🔨 Partial | Arithmetic, matrix ops, constants, immediates, prefixes applied, register moves, integer packing, rotations and cross products. In WTF only words that are data, not code, still trap |
 | **HLE firmware** | 🔨 Partial | 112 registrations across sysmem, threadman, GE, display, sascore, io, ctrl. Every NID verified against SHA-1 of its own name |
 | **GE rasterizer** | 🔨 Partial | Triangles, strips, fans, sprites; through mode and transformed (world/view/projection, viewport). Textures in every format including DXT, swizzled or not, with CLUTs; texture function, alpha test, depth test, blending, clear mode, scissor; per-vertex lighting; indexed drawing. Tests assert *where* pixels land and what colour they are. No near-plane clipping, fog or culling yet |
-| **Threading** | 🔨 Experimental opt-in | Inline execution by default; `PSPRECOMP_REAL_THREADS=ON` enables cooperative host threads, one CPU handed over at waits. See [threading modes](docs/THREADING.md) |
+| **Threading** | 🔨 Cooperative on Linux | Real threads are the Linux default; Windows and explicit `-DPSPRECOMP_REAL_THREADS=OFF` keep the inline model, which stalls at a guest semaphore. See [threading modes](docs/THREADING.md) |
 | **A game on screen** | 🔨 In game | With `PSPRECOMP_REAL_THREADS=ON` the flagship goes from its title screen through its menu into games of Lumberjack and Pendemonium (lit 3D, DXT textures, depth), drawn by the software renderer, with sound mixed (not yet played to a device). With default inline execution it stops at a semaphore wait. See [BRINGUP.md](docs/BRINGUP.md) |
 
 ### Bring-up instruments
@@ -244,7 +244,7 @@ ctest --test-dir build -C Release
 ```
 
 Pass `-DPSPRECOMP_SDL2_WINDOW=OFF` for a strictly dependency-free core build, or
-`-DPSPRECOMP_REAL_THREADS=ON` to run a game that stalls on a guest semaphore.
+`-DPSPRECOMP_REAL_THREADS=OFF` to keep the older inline guest model.
 See [docs/LINUX.md](docs/LINUX.md) for the Linux host setup and controls.
 
 ```
