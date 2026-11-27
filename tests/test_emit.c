@@ -1058,6 +1058,57 @@ static void check_loop_hook(void) {
     }
 }
 
+/* ---- compile the emitted C ------------------------------------------------
+ *
+ * String checks catch the shape of a transfer but not a dangling `goto` or an
+ * unbalanced brace. Compile each generated unit with the host compiler, with
+ * the runtime headers on the include path. The trampoline variant matters
+ * most: it rewrites every body-ending transfer. */
+
+#ifndef EMIT_CC
+#  define EMIT_CC "cc"
+#endif
+#ifndef EMIT_SYNTAX_FLAG
+#  define EMIT_SYNTAX_FLAG "-fsyntax-only"
+#endif
+#ifndef EMIT_INCLUDE_FLAG
+#  define EMIT_INCLUDE_FLAG "-I"
+#endif
+#ifndef EMIT_INCLUDE_DIR
+#  define EMIT_INCLUDE_DIR "."
+#endif
+
+static void syntax_check(const char *prefix) {
+    static const char * const parts[] = { "funcs_000.c", "imports.c", "register.c" };
+    for (size_t i = 0; i < sizeof parts / sizeof parts[0]; i++) {
+        char path[160], cmd[640];
+        snprintf(path, sizeof path, "./%s_%s", prefix, parts[i]);
+        snprintf(cmd, sizeof cmd, "\"%s\" %s \"%s\" %s \"%s\"",
+                 EMIT_CC, EMIT_SYNTAX_FLAG, path, EMIT_INCLUDE_FLAG, EMIT_INCLUDE_DIR);
+        int rc = system(cmd);
+        CHECK(rc == 0, "%s compiles (%s)", path, cmd);
+    }
+}
+
+static void check_emitted_c_compiles(void) {
+    uint32_t seed = BASE;
+
+#ifdef EMIT_HAS_TRAMPOLINE
+    synth_trampoline = 0;
+#endif
+    char *src = emit_synthetic("t_syntax", CODE, sizeof CODE / sizeof CODE[0], &seed, 1, NULL);
+    free(src);
+    syntax_check("t_syntax");
+
+#ifdef EMIT_HAS_TRAMPOLINE
+    synth_trampoline = 1;
+    src = emit_synthetic("t_syntax_tr", CODE, sizeof CODE / sizeof CODE[0], &seed, 1, NULL);
+    free(src);
+    syntax_check("t_syntax_tr");
+    synth_trampoline = 0;
+#endif
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -1298,6 +1349,7 @@ int main(void) {
     check_jump_runs_foreign_slot();
     check_jump_to_own_entry_is_a_loop();
     check_loop_hook();
+    check_emitted_c_compiles();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

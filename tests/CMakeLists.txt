@@ -30,6 +30,26 @@ add_test(NAME kirk COMMAND test_kirk)
 
 add_executable(test_emit test_emit.c)
 target_link_libraries(test_emit PRIVATE allegrex_core)
+# Generated C is checked with the same compiler that builds the tests. MSVC's
+# /Zs is the equivalent of -fsyntax-only; no object file is written.
+if(MSVC)
+  set(EMIT_SYNTAX_FLAG "/Zs")
+  set(EMIT_INCLUDE_FLAG "/I")
+else()
+  set(EMIT_SYNTAX_FLAG "-fsyntax-only")
+  set(EMIT_INCLUDE_FLAG "-I")
+endif()
+target_compile_definitions(test_emit PRIVATE
+  EMIT_CC="${CMAKE_C_COMPILER}"
+  EMIT_SYNTAX_FLAG="${EMIT_SYNTAX_FLAG}"
+  EMIT_INCLUDE_FLAG="${EMIT_INCLUDE_FLAG}"
+  EMIT_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/include")
+# #37 adds a trampoline switch to this test; compile that variant too when it
+# is present, and leave the check valid on revisions that predate it.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/test_emit.c" TEST_EMIT_SOURCE)
+if(TEST_EMIT_SOURCE MATCHES "static int synth_trampoline")
+  target_compile_definitions(test_emit PRIVATE EMIT_HAS_TRAMPOLINE=1)
+endif()
 add_test(NAME emit COMMAND test_emit)
 
 add_executable(test_hle test_hle.c)
