@@ -3,6 +3,9 @@
 
 #include "psprecomp/window.h"
 #include "psprecomp/mem.h"
+#if defined(PSPRECOMP_SDL2_WINDOW)
+#  include <SDL.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +42,21 @@ int main(void) {
     psp_window_stop();                       /* safe before any start */
 
     CHECK(psp_window_start("lifecycle", 1) == 0, "first window opens");
+    /* Drive the new event paths headlessly: focus changes, then the F11
+     * fullscreen toggle. None of these may kill the window thread. */
+    SDL_Event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = SDL_WINDOWEVENT;
+    ev.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+    CHECK(SDL_PushEvent(&ev) == 1, "focus-lost event queued");
+    ev.window.event = SDL_WINDOWEVENT_FOCUS_GAINED;
+    CHECK(SDL_PushEvent(&ev) == 1, "focus-gained event queued");
+    ev.type = SDL_KEYDOWN;
+    ev.key.keysym.scancode = SDL_SCANCODE_F11;
+    ev.key.repeat = 0;
+    CHECK(SDL_PushEvent(&ev) == 1, "fullscreen toggle queued");
+    SDL_Delay(50);
+    CHECK(!psp_window_closed(), "the window survives focus and fullscreen events");
     psp_window_stop();
     CHECK(psp_window_closed() != 0, "stop closes it and joins the thread");
 

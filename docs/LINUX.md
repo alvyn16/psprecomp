@@ -42,6 +42,11 @@ at 60 Hz.
 | Q / W | LB or LT / RB or RT | L / R |
 | Enter | Start | Start |
 | Backspace | Back | Select |
+| F11 | — | Toggle fullscreen |
+
+Keys are only forwarded while the window has input focus; the controller is
+always sampled. The SDL2 renderer requests VSync for natural 60 Hz pacing and
+falls back to a fixed 16 ms tick with a software renderer.
 
 `psp_window_closed()` reports that the user closed the window. A game host should
 call `psp_window_stop()` before tearing down its runtime: it signals the window

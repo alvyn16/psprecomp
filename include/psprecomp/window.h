@@ -15,6 +15,7 @@
  *   Q / W               LB, LT / RB, RT         L / R
  *   Enter               Start                   Start
  *   Backspace           Back                    Select
+ *   F11 (SDL2)          —                       toggle fullscreen
  *
  * Windows uses Win32 + GDI + XInput with no dependencies. Linux and other
  * non-Windows hosts use SDL2 by default when it is found at configure time,

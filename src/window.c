@@ -192,6 +192,7 @@ static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 static SDL_GameController *g_pad;
 static SDL_Thread *g_thread;
+static int g_focused;
 
 static uint32_t keyboard(void) {
     static const struct { SDL_Scancode sc; uint32_t bit; } K[] = {
@@ -202,6 +203,10 @@ static uint32_t keyboard(void) {
         { SDL_SCANCODE_Q, B_L }, { SDL_SCANCODE_W, B_R },
         { SDL_SCANCODE_RETURN, B_START }, { SDL_SCANCODE_BACKSPACE, B_SELECT },
     };
+    /* Keys belong to the focused window: a game must not keep moving while
+     * the player is typing into another application. The controller has no
+     * such ambiguity and is always sampled. */
+    if (!g_focused) return 0;
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
@@ -265,8 +270,15 @@ static int SDLCALL window_main(void *arg) {
                                        SDL_WINDOWPOS_CENTERED, W * g_scale, H * g_scale,
                                        SDL_WINDOW_SHOWN);
     if (!win) { g_closed = 1; return 1; }
-    SDL_Renderer *r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    g_focused = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    /* VSync gives natural 60 Hz pacing; the software fallback keeps the old
+     * fixed-tick delay because SDL cannot vsync a software renderer. */
+    SDL_Renderer *r = SDL_CreateRenderer(win, -1,
+                                         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!r) r = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    SDL_RendererInfo rinfo;
+    const int vsync = r && SDL_GetRendererInfo(r, &rinfo) == 0 &&
+                      (rinfo.flags & SDL_RENDERER_PRESENTVSYNC);
     SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
                                              SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
     if (tex) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
@@ -276,18 +288,32 @@ static int SDLCALL window_main(void *arg) {
     Uint32 next = SDL_GetTicks();
     while (!g_closed && r && tex) {
         SDL_Event e;
-        while (SDL_PollEvent(&e))
+        while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT ||
-                (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE))
+                (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE)) {
                 g_closed = 1;
+            } else if (e.type == SDL_WINDOWEVENT) {
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) g_focused = 1;
+                else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) g_focused = 0;
+            } else if (e.type == SDL_KEYDOWN && !e.key.repeat &&
+                       e.key.keysym.scancode == SDL_SCANCODE_F11) {
+                const Uint32 flags = SDL_GetWindowFlags(win);
+                SDL_SetWindowFullscreen(win,
+                    (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+        }
         if (g_closed) break;
         uint8_t ax = 128, ay = 128;
         psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
         render(r, tex);
-        next += 16;
-        const Uint32 now = SDL_GetTicks();
-        if ((int)(next - now) > 0) SDL_Delay(next - now);
-        else next = now;
+        if (vsync) {
+            next = SDL_GetTicks();            /* SDL_RenderPresent paced us */
+        } else {
+            next += 16;
+            const Uint32 now = SDL_GetTicks();
+            if ((int)(next - now) > 0) SDL_Delay(next - now);
+            else next = now;
+        }
     }
     SDL_GameControllerClose(g_pad); g_pad = NULL;
     SDL_DestroyTexture(tex);
