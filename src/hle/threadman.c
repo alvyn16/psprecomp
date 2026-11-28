@@ -84,7 +84,7 @@
 /* Virtual microseconds in one scheduler tick, and the most real time a park
  * will ever spend (see the clock note above). */
 #define TICK_US      1000ull
-#define REAL_TICK_US 50ull
+#define REAL_TICK_US 250ull
 #define FRAME_US     16667ull      /* 59.94 Hz, the vblank a frame wait means */
 
 #define HOST_STACK_BYTES (16u * 1024u * 1024u)
@@ -438,7 +438,9 @@ static int park_us(uint64_t timeout_us) {
     if (g_prof_tm && t && t->prof_last_us) t->prof_active_us += enter_us - t->prof_last_us;
     int woken = 0;
     if (t) {
-        const uint64_t cap = (t->wait_kind == W_DELAY && timeout_us > TICK_US) ? 500ull : REAL_TICK_US;
+        const uint64_t cap =
+            (t->wait_kind == W_DELAY && timeout_us > TICK_US) ? 1500ull :
+            ((t->wait_kind != W_DELAY && timeout_us >= 5000ull) ? timeout_us : REAL_TICK_US);
         uint64_t real = timeout_us < cap ? timeout_us : cap;
         uint64_t t0 = g_prof_tm ? enter_us : 0;
         host_mutex_lock(&t->wlock);
@@ -890,7 +892,14 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
             }
         }
         uint64_t step = TICK_US;
-        if (deadline && deadline - g_vtime_us < step) step = deadline - g_vtime_us;
+        if (deadline) {
+            if (deadline - g_vtime_us < step) step = deadline - g_vtime_us;
+        } else if (kind == W_MUTEX || kind == W_SEMA || kind == W_FLAG ||
+                   kind == W_VPL || kind == W_THREAD_END) {
+#if PSPRECOMP_REAL_THREADS
+            if (others_alive()) step = 5000ull;
+#endif
+        }
         if (step == 0) step = 1;
         park_for(kind, step);
     }

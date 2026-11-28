@@ -139,6 +139,8 @@ int  psp_render_get_tex_filter(void);
 /* Copy the latest hi-res host front buffer if available (returns 0 on success). */
 int psp_render_copy_front(uint32_t *dst_buf, uint32_t dst_cap_px, int *out_w, int *out_h);
 void psp_render_set_front_reader(int (*fn)(uint32_t *dst_buf, uint32_t dst_cap_px, int *out_w, int *out_h));
+uint64_t psp_render_front_gen(void);
+void     psp_render_bump_front_gen(void);
 
 /* The active backend. Never NULL -- defaults to software. */
 const psp_render_backend *psp_render_current(void);

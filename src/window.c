@@ -378,30 +378,39 @@ static void render(SDL_Renderer *r, SDL_Texture **tex, int *tex_w, int *tex_h,
 
     int fw = W, fh = H;
     const uint32_t *src_px = NULL;
-    if (psp_render_copy_front(g_hires_px, (uint32_t)(W * 4 * H * 4), &fw, &fh) == 0 &&
-        fw >= W && fh >= H && fw <= W * 4 && fh <= H * 4) {
-        src_px = g_hires_px;
-    } else if (psp_display_read(g_px) == 0) {
-        fw = W; fh = H;
-        src_px = g_px;
-    }
-    if (src_px) {
-        if (*tex_w != fw || *tex_h != fh || !*tex) {
-            SDL_Texture *nt = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
-                                                SDL_TEXTUREACCESS_STREAMING, fw, fh);
-            if (nt) {
-                SDL_SetTextureScaleMode(nt, cur_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
-                if (*tex) SDL_DestroyTexture(*tex);
-                *tex = nt;
-                *tex_w = fw;
-                *tex_h = fh;
-            }
+    static uint64_t last_front_gen = 0;
+    const uint64_t gen = psp_render_front_gen();
+    if (gen != 0 && gen == last_front_gen && *tex && *tex_w >= W) {
+        /* Hi-res front buffer unchanged since last host present: skip 2-8 MB upload. */
+        SDL_RenderCopy(r, *tex, NULL, &dst);
+    } else {
+        if (psp_render_copy_front(g_hires_px, (uint32_t)(W * 4 * H * 4), &fw, &fh) == 0 &&
+            fw >= W && fh >= H && fw <= W * 4 && fh <= H * 4) {
+            src_px = g_hires_px;
+            last_front_gen = gen;
+        } else if (psp_display_read(g_px) == 0) {
+            fw = W; fh = H;
+            src_px = g_px;
+            last_front_gen = 0;
         }
-        if (*tex && *tex_w == fw && *tex_h == fh) {
-            /* The front buffer is 0xAABBGGRR (little-endian bytes RR,GG,BB,AA),
-             * which is SDL_PIXELFORMAT_ABGR8888 (SDL_PIXELFORMAT_RGBA32). */
-            SDL_UpdateTexture(*tex, NULL, src_px, fw * 4);
-            SDL_RenderCopy(r, *tex, NULL, &dst);
+        if (src_px) {
+            if (*tex_w != fw || *tex_h != fh || !*tex) {
+                SDL_Texture *nt = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
+                                                    SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                if (nt) {
+                    SDL_SetTextureScaleMode(nt, cur_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+                    if (*tex) SDL_DestroyTexture(*tex);
+                    *tex = nt;
+                    *tex_w = fw;
+                    *tex_h = fh;
+                }
+            }
+            if (*tex && *tex_w == fw && *tex_h == fh) {
+                /* The front buffer is 0xAABBGGRR (little-endian bytes RR,GG,BB,AA),
+                 * which is SDL_PIXELFORMAT_ABGR8888 (SDL_PIXELFORMAT_RGBA32). */
+                SDL_UpdateTexture(*tex, NULL, src_px, fw * 4);
+                SDL_RenderCopy(r, *tex, NULL, &dst);
+            }
         }
     }
 #ifdef PSPRECOMP_IMGUI_UI

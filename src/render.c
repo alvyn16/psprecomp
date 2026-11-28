@@ -756,6 +756,7 @@ static int g_tex_filter = 0;
 typedef int (*psp_front_reader_fn)(uint32_t *dst_buf, uint32_t dst_cap_px,
                                    int *out_w, int *out_h);
 static psp_front_reader_fn g_front_reader = NULL;
+static uint64_t g_front_gen = 0;
 
 static const psp_render_backend *find_backend(const char *name) {
     if (!name) return NULL;
@@ -822,4 +823,12 @@ int psp_render_copy_front(uint32_t *dst_buf, uint32_t dst_cap_px,
     psp_front_reader_fn fn = __atomic_load_n(&g_front_reader, __ATOMIC_ACQUIRE);
     if (!fn) return -1;
     return fn(dst_buf, dst_cap_px, out_w, out_h);
+}
+
+uint64_t psp_render_front_gen(void) {
+    return __atomic_load_n(&g_front_gen, __ATOMIC_ACQUIRE);
+}
+
+void psp_render_bump_front_gen(void) {
+    __atomic_fetch_add(&g_front_gen, 1u, __ATOMIC_RELEASE);
 }

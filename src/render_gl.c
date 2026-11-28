@@ -89,6 +89,7 @@ typedef void (APIENTRY *PFN_GL_GENTEXTURES)(GLsizei, GLuint *);
 typedef void (APIENTRY *PFN_GL_DELETETEXTURES)(GLsizei, const GLuint *);
 typedef void (APIENTRY *PFN_GL_BINDTEXTURE)(GLenum, GLuint);
 typedef void (APIENTRY *PFN_GL_TEXIMAGE2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+typedef void (APIENTRY *PFN_GL_TEXSUBIMAGE2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
 typedef void (APIENTRY *PFN_GL_TEXPARAMETERI)(GLenum, GLenum, GLint);
 typedef void (APIENTRY *PFN_GL_PIXELSTOREI)(GLenum, GLint);
 typedef void (APIENTRY *PFN_GL_READPIXELS)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
@@ -117,6 +118,7 @@ typedef struct {
     PFN_GL_DELETETEXTURES            DeleteTextures;
     PFN_GL_BINDTEXTURE               BindTexture;
     PFN_GL_TEXIMAGE2D                TexImage2D;
+    PFN_GL_TEXSUBIMAGE2D             TexSubImage2D;
     PFN_GL_TEXPARAMETERI             TexParameteri;
     PFN_GL_PIXELSTOREI               PixelStorei;
     PFN_GL_READPIXELS                ReadPixels;
@@ -141,6 +143,7 @@ typedef struct {
     PFNGLBINDBUFFERPROC              BindBuffer;
     PFNGLBUFFERDATAPROC              BufferData;
     PFNGLBUFFERSUBDATAPROC           BufferSubData;
+    PFNGLGETBUFFERSUBDATAPROC        GetBufferSubData;
     PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray;
     PFNGLVERTEXATTRIBPOINTERPROC     VertexAttribPointer;
     PFNGLCREATESHADERPROC            CreateShader;
@@ -193,6 +196,15 @@ static GLuint g_prog = 0;
 static GLuint g_vao = 0;
 static GLuint g_vbo = 0;
 static size_t g_vbo_cap = 0;
+static size_t g_vbo_used = 0;
+
+static GLuint g_pbo[2] = { 0, 0 };
+static int    g_pbo_idx = 0;
+static int    g_pbo_primed = 0;
+static int    g_pbo_w = 0;
+static int    g_pbo_h = 0;
+
+static uint32_t g_tex_scratch[1024 * 1024];
 
 /* Cached uniform locations */
 static GLint u_tex_enable = -1;
@@ -278,6 +290,7 @@ static int load_gl_procs(void) {
     LOAD_GL(DeleteTextures,          PFN_GL_DELETETEXTURES,            "glDeleteTextures");
     LOAD_GL(BindTexture,             PFN_GL_BINDTEXTURE,               "glBindTexture");
     LOAD_GL(TexImage2D,              PFN_GL_TEXIMAGE2D,                "glTexImage2D");
+    LOAD_GL(TexSubImage2D,           PFN_GL_TEXSUBIMAGE2D,             "glTexSubImage2D");
     LOAD_GL(TexParameteri,           PFN_GL_TEXPARAMETERI,             "glTexParameteri");
     LOAD_GL(PixelStorei,             PFN_GL_PIXELSTOREI,               "glPixelStorei");
     LOAD_GL(ReadPixels,              PFN_GL_READPIXELS,                "glReadPixels");
@@ -302,6 +315,7 @@ static int load_gl_procs(void) {
     LOAD_GL(BindBuffer,              PFNGLBINDBUFFERPROC,              "glBindBuffer");
     LOAD_GL(BufferData,              PFNGLBUFFERDATAPROC,              "glBufferData");
     LOAD_GL(BufferSubData,           PFNGLBUFFERSUBDATAPROC,           "glBufferSubData");
+    LOAD_GL(GetBufferSubData,        PFNGLGETBUFFERSUBDATAPROC,        "glGetBufferSubData");
     LOAD_GL(EnableVertexAttribArray, PFNGLENABLEVERTEXATTRIBARRAYPROC, "glEnableVertexAttribArray");
     LOAD_GL(VertexAttribPointer,     PFNGLVERTEXATTRIBPOINTERPROC,     "glVertexAttribPointer");
     LOAD_GL(CreateShader,            PFNGLCREATESHADERPROC,            "glCreateShader");
@@ -718,17 +732,155 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
     gl_tex_entry *e = &g_tex_cache[slot];
     if (!e->tex) g_gl.GenTextures(1, &e->tex);
 
-    const size_t n_px = (size_t)w * (size_t)h;
-    uint32_t *rgba = (uint32_t *)malloc(n_px * 4u);
-    if (!rgba) return 0;
-
-    psp_draw_state tmp = *st;
-    tmp.tex_clamp_u = 1;
-    tmp.tex_clamp_v = 1;
-    for (int y = 0; y < h; y++) {
-        uint32_t *row = rgba + (size_t)y * (size_t)w;
-        for (int x = 0; x < w; x++) {
-            row[x] = psp_tex_fetch(&tmp, x, y);
+    uint32_t *rgba = g_tex_scratch;
+    int decoded = 0;
+    const int fmt = st->tex_fmt;
+    const int bw = st->tex_bw > 0 ? st->tex_bw : w;
+    if (fmt >= 0 && fmt <= PSP_TPSM_T8 && bw >= w) {
+        const uint32_t rowb = (uint32_t)bw * (uint32_t)GL_TEX_BPP[fmt] / 8u;
+        const size_t total_bytes = (size_t)rowb * (size_t)h;
+        const uint8_t *src = total_bytes ? (const uint8_t *)psp_mem_ptr(st->tex_addr, (uint32_t)total_bytes) : NULL;
+        if (src && (!st->tex_swizzle || ((rowb & 15u) == 0u && rowb >= 16u && (h & 7) == 0))) {
+            if (fmt == PSP_TPSM_8888) {
+                if (!st->tex_swizzle) {
+                    if (bw == w) {
+                        memcpy(rgba, src, (size_t)w * (size_t)h * 4u);
+                    } else {
+                        for (int y = 0; y < h; y++)
+                            memcpy(rgba + (size_t)y * (size_t)w, src + (size_t)y * rowb, (size_t)w * 4u);
+                    }
+                    decoded = 1;
+                } else {
+                    const uint32_t blocks = rowb >> 4;
+                    const uint32_t w_blocks = (uint32_t)(w * 4) >> 4;
+                    if ((w & 3) == 0) {
+                        for (int by = 0; by < h; by += 8) {
+                            const uint8_t *brow = src + (size_t)((uint32_t)(by >> 3) * blocks) * 128u;
+                            for (uint32_t bx = 0; bx < w_blocks; bx++) {
+                                const uint8_t *blk = brow + (size_t)bx * 128u;
+                                for (int ry = 0; ry < 8; ry++) {
+                                    memcpy(rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 4u),
+                                           blk + ry * 16, 16);
+                                }
+                            }
+                        }
+                        decoded = 1;
+                    }
+                }
+            } else if (!st->tex_swizzle && (fmt == PSP_TPSM_565 || fmt == PSP_TPSM_5551 || fmt == PSP_TPSM_4444)) {
+                for (int y = 0; y < h; y++) {
+                    const uint16_t *srow = (const uint16_t *)(src + (size_t)y * rowb);
+                    uint32_t *drow = rgba + (size_t)y * (size_t)w;
+                    if (fmt == PSP_TPSM_565) {
+                        for (int x = 0; x < w; x++) {
+                            uint32_t p = srow[x];
+                            uint32_t r = p & 0x1Fu, g = (p >> 5) & 0x3Fu, b = (p >> 11) & 0x1Fu;
+                            drow[x] = 0xFF000000u | ((r << 3) | (r >> 2)) |
+                                      (((g << 2) | (g >> 4)) << 8) | (((b << 3) | (b >> 2)) << 16);
+                        }
+                    } else if (fmt == PSP_TPSM_5551) {
+                        for (int x = 0; x < w; x++) {
+                            uint32_t p = srow[x];
+                            uint32_t r = p & 0x1Fu, g = (p >> 5) & 0x1Fu, b = (p >> 10) & 0x1Fu;
+                            drow[x] = ((p & 0x8000u) ? 0xFF000000u : 0u) | ((r << 3) | (r >> 2)) |
+                                      (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16);
+                        }
+                    } else {
+                        for (int x = 0; x < w; x++) {
+                            uint32_t p = srow[x];
+                            uint32_t r = p & 0xFu, g = (p >> 4) & 0xFu, b = (p >> 8) & 0xFu, a = (p >> 12) & 0xFu;
+                            drow[x] = ((r << 4) | r) | (((g << 4) | g) << 8) |
+                                      (((b << 4) | b) << 16) | (((a << 4) | a) << 24);
+                        }
+                    }
+                }
+                decoded = 1;
+            } else if ((fmt == PSP_TPSM_T4 || fmt == PSP_TPSM_T8) && st->clut) {
+                uint32_t pal[256];
+                const int pcnt = (fmt == PSP_TPSM_T4) ? 16 : 256;
+                for (int i = 0; i < pcnt; i++) {
+                    uint32_t ci = (((uint32_t)i >> st->clut_shift) & (uint32_t)st->clut_mask) |
+                                  ((uint32_t)st->clut_start << 4);
+                    if (st->clut_fmt == 3) {
+                        if (ci < 256u) memcpy(&pal[i], st->clut + ci * 4u, 4);
+                        else pal[i] = 0;
+                    } else if (ci < 512u) {
+                        uint16_t pv;
+                        memcpy(&pv, st->clut + ci * 2u, 2);
+                        pal[i] = psp_color_expand(pv, st->clut_fmt);
+                    } else {
+                        pal[i] = 0;
+                    }
+                }
+                if (fmt == PSP_TPSM_T8) {
+                    if (!st->tex_swizzle) {
+                        for (int y = 0; y < h; y++) {
+                            const uint8_t *srow = src + (size_t)y * rowb;
+                            uint32_t *drow = rgba + (size_t)y * (size_t)w;
+                            for (int x = 0; x < w; x++) drow[x] = pal[srow[x]];
+                        }
+                        decoded = 1;
+                    } else if ((w & 15) == 0) {
+                        const uint32_t blocks = rowb >> 4;
+                        const uint32_t w_blocks = (uint32_t)w >> 4;
+                        for (int by = 0; by < h; by += 8) {
+                            const uint8_t *brow = src + (size_t)((uint32_t)(by >> 3) * blocks) * 128u;
+                            for (uint32_t bx = 0; bx < w_blocks; bx++) {
+                                const uint8_t *blk = brow + (size_t)bx * 128u;
+                                for (int ry = 0; ry < 8; ry++) {
+                                    const uint8_t *sb = blk + ry * 16;
+                                    uint32_t *db = rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 16u);
+                                    for (int rx = 0; rx < 16; rx++) db[rx] = pal[sb[rx]];
+                                }
+                            }
+                        }
+                        decoded = 1;
+                    }
+                } else { /* PSP_TPSM_T4 */
+                    if (!st->tex_swizzle && (w & 1) == 0) {
+                        for (int y = 0; y < h; y++) {
+                            const uint8_t *srow = src + (size_t)y * rowb;
+                            uint32_t *drow = rgba + (size_t)y * (size_t)w;
+                            for (int x = 0; x < w; x += 2) {
+                                uint8_t b = srow[x >> 1];
+                                drow[x] = pal[b & 0xFu];
+                                drow[x + 1] = pal[b >> 4];
+                            }
+                        }
+                        decoded = 1;
+                    } else if (st->tex_swizzle && (w & 31) == 0) {
+                        const uint32_t blocks = rowb >> 4;
+                        const uint32_t w_blocks = (uint32_t)(w >> 1) >> 4;
+                        for (int by = 0; by < h; by += 8) {
+                            const uint8_t *brow = src + (size_t)((uint32_t)(by >> 3) * blocks) * 128u;
+                            for (uint32_t bx = 0; bx < w_blocks; bx++) {
+                                const uint8_t *blk = brow + (size_t)bx * 128u;
+                                for (int ry = 0; ry < 8; ry++) {
+                                    const uint8_t *sb = blk + ry * 16;
+                                    uint32_t *db = rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 32u);
+                                    for (int rx = 0; rx < 16; rx++) {
+                                        uint8_t b = sb[rx];
+                                        db[rx * 2] = pal[b & 0xFu];
+                                        db[rx * 2 + 1] = pal[b >> 4];
+                                    }
+                                }
+                            }
+                        }
+                        decoded = 1;
+                    }
+                }
+            }
+        }
+    }
+    if (!decoded) {
+        psp_draw_state tmp = *st;
+        tmp.tex_clamp_u = 1;
+        tmp.tex_clamp_v = 1;
+        for (int y = 0; y < h; y++) {
+            uint32_t *row = rgba + (size_t)y * (size_t)w;
+            for (int x = 0; x < w; x++) {
+                row[x] = psp_tex_fetch(&tmp, x, y);
+            }
         }
     }
 
@@ -740,8 +892,11 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
                     st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                     st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    free(rgba);
+    if (e->w == w && e->h == h) {
+        g_gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    } else {
+        g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
 
     e->hash = hash;
     e->w = w;
@@ -816,24 +971,60 @@ static void sync_scale_if_needed(void) {
     if (req != g_scale && req >= 1 && req <= MAX_SCALE) {
         drop_all_fbos();
         g_scale = req;
+        g_pbo_primed = 0;
     }
 }
 
-static void capture_fbo_to_front(gl_fbo *f) {
+static void capture_fbo_to_front(gl_fbo *f, int sync_now) {
     if (!f || !f->has_draws || !g_front_lock || !g_front_px) return;
     const int w = BASE_W * f->scale;
     const int h = BASE_H * f->scale;
     if (w > BASE_W * MAX_SCALE || h > BASE_H * MAX_SCALE) return;
+    const size_t bytes = (size_t)w * (size_t)h * 4u;
 
     uint64_t rt0 = g_prof_gl > 0 ? prof_us() : 0;
-    SDL_LockMutex(g_front_lock);
     g_gl.BindFramebuffer(GL_FRAMEBUFFER, f->fbo);
     g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
-    g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
-    g_front_w = w;
-    g_front_h = h;
-    g_front_valid = 1;
-    SDL_UnlockMutex(g_front_lock);
+
+    if (sync_now || !g_pbo[0] || !g_pbo_primed || g_pbo_w != w || g_pbo_h != h) {
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        SDL_LockMutex(g_front_lock);
+        g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
+        g_front_w = w;
+        g_front_h = h;
+        g_front_valid = 1;
+        SDL_UnlockMutex(g_front_lock);
+        psp_render_bump_front_gen();
+
+        if (!sync_now && g_pbo[0]) {
+            for (int i = 0; i < 2; i++) {
+                g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[i]);
+                g_gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
+            }
+            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[0]);
+            g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            g_pbo_w = w;
+            g_pbo_h = h;
+            g_pbo_idx = 1;
+            g_pbo_primed = 1;
+        }
+    } else {
+        const int read_idx = g_pbo_idx ^ 1;
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[read_idx]);
+        SDL_LockMutex(g_front_lock);
+        g_gl.GetBufferSubData(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)bytes, g_front_px);
+        g_front_w = w;
+        g_front_h = h;
+        g_front_valid = 1;
+        SDL_UnlockMutex(g_front_lock);
+        psp_render_bump_front_gen();
+
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[g_pbo_idx]);
+        g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        g_pbo_idx ^= 1;
+    }
     if (g_prof_gl > 0) g_prof_gl_read_us += prof_us() - rt0;
 }
 
@@ -965,8 +1156,15 @@ static int gl_init(int width, int height) {
     g_ctx_tid = SDL_ThreadID();
     g_gl.GenVertexArrays(1, &g_vao);
     g_gl.GenBuffers(1, &g_vbo);
+    g_gl.GenBuffers(2, g_pbo);
+    g_pbo_idx = 0;
+    g_pbo_primed = 0;
+    g_pbo_w = g_pbo_h = 0;
     g_gl.BindVertexArray(g_vao);
     g_gl.BindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    g_vbo_cap = 1024u * 1024u;
+    g_vbo_used = 0;
+    g_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_vbo_cap, NULL, GL_STREAM_DRAW);
     g_gl.EnableVertexAttribArray(0);
     g_gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, (GLsizei)sizeof(gl_vert), (void *)offsetof(gl_vert, x));
     g_gl.EnableVertexAttribArray(1);
@@ -1009,11 +1207,14 @@ static void gl_shutdown(void) {
     if (g_ready && ensure_context_current() == 0) {
         drop_all_fbos();
         drop_all_textures();
+        if (g_pbo[0] || g_pbo[1]) { g_gl.DeleteBuffers(2, g_pbo); g_pbo[0] = g_pbo[1] = 0; }
         if (g_vbo)  { g_gl.DeleteBuffers(1, &g_vbo); g_vbo = 0; }
         if (g_vao)  { g_gl.DeleteVertexArrays(1, &g_vao); g_vao = 0; }
         if (g_prog) { g_gl.DeleteProgram(g_prog); g_prog = 0; }
     }
     g_vbo_cap = 0;
+    g_vbo_used = 0;
+    g_pbo_primed = 0;
     free(g_vbuf);
     g_vbuf = NULL;
     g_vbuf_cap = 0;
@@ -1250,20 +1451,24 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     g_gl.Uniform1i(u_atest_ref, st->atest_ref);
     g_gl.Uniform1i(u_atest_mask, st->atest_mask);
 
-    /* Upload vertices & draw. */
+    /* Upload vertices & draw using ring buffer (orphan only on wrap/resize). */
     g_gl.BindVertexArray(g_vao);
     g_gl.BindBuffer(GL_ARRAY_BUFFER, g_vbo);
     const size_t bytes = (size_t)emit_n * sizeof(gl_vert);
     if (bytes > g_vbo_cap) {
-        size_t cap = g_vbo_cap ? g_vbo_cap : 16384u;
+        size_t cap = g_vbo_cap ? g_vbo_cap : 1024u * 1024u;
         while (cap < bytes) cap *= 2u;
         g_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cap, NULL, GL_STREAM_DRAW);
         g_vbo_cap = cap;
-    } else {
+        g_vbo_used = 0;
+    } else if (g_vbo_used + bytes > g_vbo_cap) {
         g_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_vbo_cap, NULL, GL_STREAM_DRAW);
+        g_vbo_used = 0;
     }
-    g_gl.BufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes, g_vbuf);
-    g_gl.DrawArrays(gl_prim, 0, emit_n);
+    const GLint first_v = (GLint)(g_vbo_used / sizeof(gl_vert));
+    g_gl.BufferSubData(GL_ARRAY_BUFFER, (GLintptr)g_vbo_used, (GLsizeiptr)bytes, g_vbuf);
+    g_vbo_used += bytes;
+    g_gl.DrawArrays(gl_prim, first_v, emit_n);
 
     fb->has_draws = 1;
     psp_render_add_pixels((uint64_t)emit_n * (uint64_t)S * (uint64_t)S);
@@ -1280,7 +1485,7 @@ static void gl_finish(void) {
         if (!g_presented_this_list) {
             gl_fbo *front = find_fbo(psp_display_framebuffer());
             if (front && front->has_draws) {
-                capture_fbo_to_front(front);
+                capture_fbo_to_front(front, 1);
             }
         }
         g_presented_this_list = 0;
@@ -1310,7 +1515,7 @@ static void gl_present(void) {
     if (ensure_context_current() == 0) {
         gl_fbo *front = find_fbo(psp_display_framebuffer());
         if (front && front->has_draws) {
-            capture_fbo_to_front(front);
+            capture_fbo_to_front(front, 0);
             front->has_draws = 0;
         } else {
             /* CPU wrote VRAM directly without GL draws: let window fall back cleanly. */
@@ -1318,6 +1523,7 @@ static void gl_present(void) {
                 SDL_LockMutex(g_front_lock);
                 g_front_valid = 0;
                 SDL_UnlockMutex(g_front_lock);
+                psp_render_bump_front_gen();
             }
         }
         g_presented_this_list = 1;
