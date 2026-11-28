@@ -152,6 +152,7 @@ void psp_ge_dump_stats(FILE *out);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
+uint64_t psp_ge_finish_count(void);
 
 void psp_sas_init(void);
 void psp_sas_register(void);

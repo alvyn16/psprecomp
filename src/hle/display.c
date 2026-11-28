@@ -72,11 +72,24 @@ int psp_display_read(uint32_t *out) {
     const uint32_t addr = g_fb_addr, stride = g_fb_width, fmt = g_fb_format;
     if (!addr) return -1;
     const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
+    const uint32_t row_bytes = (uint32_t)PSP_SCREEN_W * (uint32_t)bpp;
     for (int y = 0; y < PSP_SCREEN_H; y++) {
-        for (int x = 0; x < PSP_SCREEN_W; x++) {
-            uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
-            uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
-            out[y * PSP_SCREEN_W + x] = psp_color_expand(px, (int)fmt);
+        const uint32_t row_at = addr + (uint32_t)(y * (int)stride) * (uint32_t)bpp;
+        const uint8_t *row = (const uint8_t *)psp_mem_ptr(row_at, row_bytes);
+        if (row && fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+            memcpy(&out[y * PSP_SCREEN_W], row, row_bytes);
+        } else if (row) {
+            for (int x = 0; x < PSP_SCREEN_W; x++) {
+                uint16_t px;
+                memcpy(&px, row + x * 2, 2);
+                out[y * PSP_SCREEN_W + x] = psp_color_expand(px, (int)fmt);
+            }
+        } else {
+            for (int x = 0; x < PSP_SCREEN_W; x++) {
+                uint32_t at = row_at + (uint32_t)x * (uint32_t)bpp;
+                uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
+                out[y * PSP_SCREEN_W + x] = psp_color_expand(px, (int)fmt);
+            }
         }
     }
     return 0;

@@ -175,8 +175,8 @@ static uint32_t g_zbp, g_zbw;
  * projection is 4x4. The viewport maps clip space into the GE's 4096-wide
  * drawing space, and the offset moves the screen's top-left within it. */
 static struct {
-    float world[12], view[12], proj[16], bone[8][12];
-    int   wi, vi, pi, bi;
+    float world[12], view[12], proj[16], bone[8][12], wvp[16];
+    int   wi, vi, pi, bi, wvp_dirty;
     float xscale, yscale, xpos, ypos;
     float offx, offy;                   /* pixels */
     float uscale, vscale, uoff, voff;
@@ -198,6 +198,23 @@ static void xf_reset(void) {
     g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
     for (int i = 0; i < 8; i++) g_xf.bone[i][0] = g_xf.bone[i][4] = g_xf.bone[i][8] = 1;
     g_xf.uscale = g_xf.vscale = 1;
+    g_xf.wvp_dirty = 1;
+}
+
+static void update_wvp(void) {
+    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
+    float vw[12];
+    for (int j = 0; j < 3; j++)
+        for (int r = 0; r < 3; r++)
+            vw[j * 3 + r] = V[r] * W[j * 3] + V[3 + r] * W[j * 3 + 1] + V[6 + r] * W[j * 3 + 2];
+    for (int r = 0; r < 3; r++)
+        vw[9 + r] = V[r] * W[9] + V[3 + r] * W[10] + V[6 + r] * W[11] + V[9 + r];
+    for (int j = 0; j < 3; j++)
+        for (int r = 0; r < 4; r++)
+            g_xf.wvp[j * 4 + r] = P[r] * vw[j * 3] + P[4 + r] * vw[j * 3 + 1] + P[8 + r] * vw[j * 3 + 2];
+    for (int r = 0; r < 4; r++)
+        g_xf.wvp[12 + r] = P[r] * vw[9] + P[4 + r] * vw[10] + P[8 + r] * vw[11] + P[12 + r];
+    g_xf.wvp_dirty = 0;
 }
 
 /* Clip-space near plane. A small positive w is used rather than zero so the
@@ -208,18 +225,15 @@ static void xf_reset(void) {
  * is behind the eye; the clip coordinates are still written so a triangle
  * straddling the plane can be clipped and reprojected. */
 static int transform(const float p[3], float *sx, float *sy, float *sz, float c[4]) {
-    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
-    float w[3], v[3];
-    for (int r = 0; r < 3; r++)
-        w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
-    for (int r = 0; r < 3; r++)
-        v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
+    if (g_xf.wvp_dirty) update_wvp();
+    const float *M = g_xf.wvp;
     for (int r = 0; r < 4; r++)
-        c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
+        c[r] = M[r] * p[0] + M[4 + r] * p[1] + M[8 + r] * p[2] + M[12 + r];
     if (c[3] <= NEAR_EPS) return 0;
-    *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
-    *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
-    *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
+    const float invw = 1.0f / c[3];
+    *sx = c[0] * invw * g_xf.xscale + g_xf.xpos - g_xf.offx;
+    *sy = c[1] * invw * g_xf.yscale + g_xf.ypos - g_xf.offy;
+    *sz = c[2] * invw * g_xf.zscale + g_xf.zpos;
     return 1;
 }
 
@@ -405,6 +419,7 @@ void psp_ge_dump_stats(FILE *out) {
 
 uint64_t psp_ge_command_count(void) { return g_ge.commands; }
 uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+uint64_t psp_ge_finish_count(void)  { return g_ge.finishes; }
 
 /* ---- rasterizer ----------------------------------------------------------
  *
@@ -843,11 +858,11 @@ static void run_list(ge_queue *q) {
             break;
 
         case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
-        case GE_WORLD: if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg); break;
+        case GE_WORLD: if (g_xf.wi < 12) { g_xf.world[g_xf.wi++] = f24(arg); g_xf.wvp_dirty = 1; } break;
         case GE_VMS:   g_xf.vi = (int)(arg & 0xF); break;
-        case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
+        case GE_VIEW:  if (g_xf.vi < 12) { g_xf.view[g_xf.vi++] = f24(arg); g_xf.wvp_dirty = 1; } break;
         case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
-        case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
+        case GE_PROJ:  if (g_xf.pi < 16) { g_xf.proj[g_xf.pi++] = f24(arg); g_xf.wvp_dirty = 1; } break;
         case GE_XSCALE:  g_xf.xscale = f24(arg); break;
         case GE_YSCALE:  g_xf.yscale = f24(arg); break;
         case GE_XPOS:    g_xf.xpos = f24(arg); break;

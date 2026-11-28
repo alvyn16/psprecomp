@@ -63,6 +63,9 @@ typedef struct {
     int            sc_x0, sc_y0, sc_x1, sc_y1;
     uint32_t       pmask;
     uint32_t       amask;
+    int            stest_eff;
+    uint32_t       dxt_last_off;
+    uint32_t       dxt_lut[4];
 } render_ctx;
 
 uint32_t psp_color_expand(uint32_t px, int fmt) {
@@ -144,31 +147,34 @@ static int wrap(int c, int size, int clamp) {
  * byte per row, two bits per texel -- then the two 565 endpoint colours, the
  * reverse of the desktop order. DXT3 and DXT5 follow the colour half with
  * their alpha half. Blocks run left to right in rows of tex_bw / 4. */
-static uint32_t dxt_texel(const render_ctx *ctx, const psp_draw_state *st, uint32_t x, uint32_t y) {
+static uint32_t dxt_texel(render_ctx *ctx, const psp_draw_state *st, uint32_t x, uint32_t y) {
     const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
     const uint32_t bpr = ctx ? ctx->dxt_bpr : (uint32_t)st->tex_bw / 4u;
     const uint32_t blk_off = ((y >> 2) * bpr + (x >> 2)) * size;
     const uint8_t *base = ctx ? ctx->tex_base : NULL;
     const uint32_t i = (y & 3) * 4 + (x & 3);
 
-    const uint32_t c0 = tex_r16(base, st->tex_addr, blk_off + 4);
-    const uint32_t c1 = tex_r16(base, st->tex_addr, blk_off + 6);
-    const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
-    uint32_t out;
-    switch ((tex_r32(base, st->tex_addr, blk_off) >> (2 * i)) & 3) {
-    case 0:  out = a; break;
-    case 1:  out = b; break;
-    case 2:
-        out = c0 > c1 || st->tex_fmt != PSP_TPSM_DXT1
-            ? rgba((2 * R(a) + R(b)) / 3, (2 * G(a) + G(b)) / 3, (2 * B(a) + B(b)) / 3, 255)
-            : rgba((R(a) + R(b)) / 2, (G(a) + G(b)) / 2, (B(a) + B(b)) / 2, 255);
-        break;
-    default:
-        out = c0 > c1 || st->tex_fmt != PSP_TPSM_DXT1
-            ? rgba((R(a) + 2 * R(b)) / 3, (G(a) + 2 * G(b)) / 3, (B(a) + 2 * B(b)) / 3, 255)
-            : 0;                                /* DXT1 three-colour mode: transparent */
-        break;
+    uint32_t *lut;
+    uint32_t local_lut[4];
+    if (ctx && ctx->dxt_last_off == blk_off) {
+        lut = ctx->dxt_lut;
+    } else {
+        lut = ctx ? ctx->dxt_lut : local_lut;
+        const uint32_t c0 = tex_r16(base, st->tex_addr, blk_off + 4);
+        const uint32_t c1 = tex_r16(base, st->tex_addr, blk_off + 6);
+        const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
+        lut[0] = a;
+        lut[1] = b;
+        if (c0 > c1 || st->tex_fmt != PSP_TPSM_DXT1) {
+            lut[2] = rgba((2 * R(a) + R(b)) / 3, (2 * G(a) + G(b)) / 3, (2 * B(a) + B(b)) / 3, 255);
+            lut[3] = rgba((R(a) + 2 * R(b)) / 3, (G(a) + 2 * G(b)) / 3, (B(a) + 2 * B(b)) / 3, 255);
+        } else {
+            lut[2] = rgba((R(a) + R(b)) / 2, (G(a) + G(b)) / 2, (B(a) + B(b)) / 2, 255);
+            lut[3] = 0;                         /* DXT1 three-colour mode: transparent */
+        }
+        if (ctx) ctx->dxt_last_off = blk_off;
     }
+    uint32_t out = lut[(tex_r32(base, st->tex_addr, blk_off) >> (2 * i)) & 3];
     if (st->tex_fmt == PSP_TPSM_DXT3) {
         const uint32_t al = (tex_r16(base, st->tex_addr, blk_off + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
         out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
@@ -189,7 +195,7 @@ static uint32_t dxt_texel(const render_ctx *ctx, const psp_draw_state *st, uint3
     return out;
 }
 
-static uint32_t tex_fetch_ctx(const render_ctx *ctx, const psp_draw_state *st, int x, int y) {
+static uint32_t tex_fetch_ctx(render_ctx *ctx, const psp_draw_state *st, int x, int y) {
     if (st->tex_fmt > PSP_TPSM_DXT5 || st->tex_w <= 0 || st->tex_h <= 0 || st->tex_bw <= 0) {
         g_bad_texels++;
         return 0xFFFF00FFu;                     /* nonsense: loud magenta */
@@ -401,7 +407,7 @@ static void fb_write_stencil(const render_ctx *ctx, int x, int y, uint32_t at,
 }
 
 /* One fragment through the pipeline (coordinates already clamped to screen + scissor). */
-static void fragment_fast(const render_ctx *ctx, const psp_draw_state *st, int x, int y,
+static void fragment_fast(render_ctx *ctx, const psp_draw_state *st, int x, int y,
                           uint32_t c, float u, float v, float zf) {
     const uint32_t at = ctx->fb_base ? 0u : g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * ctx->bytes;
     const int z = zf < 0.0f ? 0 : (zf > 65535.0f ? 65535 : (int)(zf + 0.5f));
@@ -424,7 +430,7 @@ static void fragment_fast(const render_ctx *ctx, const psp_draw_state *st, int x
     if (!st->atest) {
         /* When alpha test is disabled, stencil and Z tests cannot depend on the
          * texture sample, so reject occluded pixels before fetching/decoding texels. */
-        if (st->stest) {
+        if (ctx->stest_eff) {
             fb = fb_read_fast(ctx, x, y, at);
             have_fb = 1;
             const int dst_a = (int)A(fb);
@@ -441,11 +447,7 @@ static void fragment_fast(const render_ctx *ctx, const psp_draw_state *st, int x
                 }
                 if (st->zwrite) z_write_fast(ctx, st, x, y, zat, (uint16_t)z);
             }
-            if (ctx->pmask == 0xFFFFFFFFu && st->szpass == 0) {
-                if (st->szpass != 0)
-                    fb_write_stencil(ctx, x, y, at, fb, stencil_op(st->szpass, dst_a, st->sref));
-                return;
-            }
+            if (ctx->pmask == 0xFFFFFFFFu && st->szpass == 0) return;
         } else if (st->ztest && ctx->have_z) {
             if (!depth_pass(st->zfunc, z, z_read_fast(ctx, st, x, y, zat))) return;
             if (st->zwrite) z_write_fast(ctx, st, x, y, zat, (uint16_t)z);
@@ -464,7 +466,7 @@ static void fragment_fast(const render_ctx *ctx, const psp_draw_state *st, int x
             c = tex_combine(st, tex_fetch_ctx(ctx, st, tx, ty), c);
         }
         if (!alpha_pass(st, c)) return;
-        if (st->stest) {
+        if (ctx->stest_eff) {
             fb = fb_read_fast(ctx, x, y, at);
             have_fb = 1;
             const int dst_a = (int)A(fb);
@@ -491,11 +493,19 @@ static void fragment_fast(const render_ctx *ctx, const psp_draw_state *st, int x
         if (!have_fb) { fb = fb_read_fast(ctx, x, y, at); have_fb = 1; }
         c = blend(st, c, fb);
     }
-    if (st->stest) {
+    if (ctx->stest_eff) {
         const int dst_a = (int)A(fb);
         c = (c & 0x00FFFFFFu) | ((uint32_t)stencil_op(st->szpass, dst_a, st->sref) << 24);
     }
     if (ctx->pmask) {
+        if (ctx->fb_base && ctx->bytes == 4u && ctx->pmask == 0xFF000000u && !have_fb) {
+            uint8_t *p = ctx->fb_base + ((size_t)y * (size_t)g_fb_stride + (size_t)x) * 4u;
+            p[0] = (uint8_t)c;
+            p[1] = (uint8_t)(c >> 8);
+            p[2] = (uint8_t)(c >> 16);
+            g_pixels++;
+            return;
+        }
         if (!have_fb) fb = fb_read_fast(ctx, x, y, at);
         c = (fb & ctx->pmask) | (c & ~ctx->pmask);
     }
@@ -509,6 +519,7 @@ static int64_t edge64(const psp_vertex *p, const psp_vertex *q, int x, int y) {
 
 static void render_ctx_init(render_ctx *ctx, const psp_draw_state *st) {
     memset(ctx, 0, sizeof *ctx);
+    ctx->dxt_last_off = 0xFFFFFFFFu;
     ctx->bytes = g_fb_fmt == 3 ? 4u : 2u;
     ctx->have_z = st->zaddr && st->zbw > 0;
     ctx->sc_x0 = st->sc_x0 > 0 ? st->sc_x0 : 0;
@@ -517,6 +528,14 @@ static void render_ctx_init(render_ctx *ctx, const psp_draw_state *st) {
     ctx->sc_y1 = st->sc_y1 < 271 ? st->sc_y1 : 271;
     ctx->amask = (st->mask_a & 0xFFu) << 24;
     ctx->pmask = ctx->amask | (st->mask_rgb & 0x00FFFFFFu);
+    ctx->stest_eff = st->stest;
+    if (st->stest && st->sfunc == 1 && st->szfail == 0 && st->szpass == 0) {
+        /* Stencil ALWAYS passes and KEEP preserves destination alpha on every outcome,
+         * so skip pre-Z framebuffer reads and simply mask alpha writes. */
+        ctx->stest_eff = 0;
+        ctx->amask = 0xFF000000u;
+        ctx->pmask |= 0xFF000000u;
+    }
     if (ctx->sc_x0 > ctx->sc_x1 || ctx->sc_y0 > ctx->sc_y1) return;
 
     const int watch = psp_mem_watching();
@@ -555,7 +574,7 @@ static void render_ctx_init(render_ctx *ctx, const psp_draw_state *st) {
 /* Barycentric fill with incremental integer edge functions, so a shared edge
  * belongs to exactly one triangle: adjacent geometry neither double-draws nor
  * leaves seams. Colour is interpolated when Gouraud is on; flat uses `c`. */
-static void sw_tri(const render_ctx *ctx, const psp_vertex *a, const psp_vertex *b,
+static void sw_tri(render_ctx *ctx, const psp_vertex *a, const psp_vertex *b,
                    const psp_vertex *c, const psp_draw_state *st) {
     if (!g_fb_addr || !g_fb_stride || a->behind || b->behind || c->behind) return;
 
@@ -621,7 +640,7 @@ static void sw_tri(const render_ctx *ctx, const psp_vertex *a, const psp_vertex 
 /* A sprite is the PSP's 2D quad: two vertices giving opposite corners of an
  * axis-aligned rectangle, coloured by the second. The far edge is exclusive
  * so adjacent sprites tile without overlapping. */
-static void sw_sprite(const render_ctx *ctx, const psp_vertex *a, const psp_vertex *b,
+static void sw_sprite(render_ctx *ctx, const psp_vertex *a, const psp_vertex *b,
                       const psp_draw_state *st) {
     if (!g_fb_addr || !g_fb_stride) return;
     int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;

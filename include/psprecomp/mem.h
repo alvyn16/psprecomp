@@ -87,50 +87,80 @@ void psp_write32_slow(uint32_t addr, uint32_t val);
 void psp_write_f32_slow(uint32_t addr, float val);
 
 static inline uint8_t psp_read8(uint32_t addr) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_r && off < PSP_RAM_SIZE) return psp_mem.ram[off];
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_r && off < PSP_VRAM_SIZE) return psp_mem.vram[off];
     return psp_read8_slow(addr);
 }
 static inline uint16_t psp_read16(uint32_t addr) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_r && off <= PSP_RAM_SIZE - 2u) {
         uint16_t v; memcpy(&v, psp_mem.ram + off, 2); return v;
+    }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_r && off <= PSP_VRAM_SIZE - 2u) {
+        uint16_t v; memcpy(&v, psp_mem.vram + off, 2); return v;
     }
     return psp_read16_slow(addr);
 }
 static inline uint32_t psp_read32(uint32_t addr) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_r && off <= PSP_RAM_SIZE - 4u) {
         uint32_t v; memcpy(&v, psp_mem.ram + off, 4); return v;
+    }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_r && off <= PSP_VRAM_SIZE - 4u) {
+        uint32_t v; memcpy(&v, psp_mem.vram + off, 4); return v;
     }
     return psp_read32_slow(addr);
 }
 static inline float psp_read_f32(uint32_t addr) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_r && off <= PSP_RAM_SIZE - 4u) {
         float v; memcpy(&v, psp_mem.ram + off, 4); return v;
+    }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_r && off <= PSP_VRAM_SIZE - 4u) {
+        float v; memcpy(&v, psp_mem.vram + off, 4); return v;
     }
     return psp_read_f32_slow(addr);
 }
 
 static inline void psp_write8(uint32_t addr, uint8_t val) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_w && off < PSP_RAM_SIZE) { psp_mem.ram[off] = val; return; }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_w && off < PSP_VRAM_SIZE) { psp_mem.vram[off] = val; return; }
     psp_write8_slow(addr, val);
 }
 static inline void psp_write16(uint32_t addr, uint16_t val) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_w && off <= PSP_RAM_SIZE - 2u) { memcpy(psp_mem.ram + off, &val, 2); return; }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_w && off <= PSP_VRAM_SIZE - 2u) { memcpy(psp_mem.vram + off, &val, 2); return; }
     psp_write16_slow(addr, val);
 }
 static inline void psp_write32(uint32_t addr, uint32_t val) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_w && off <= PSP_RAM_SIZE - 4u) { memcpy(psp_mem.ram + off, &val, 4); return; }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_w && off <= PSP_VRAM_SIZE - 4u) { memcpy(psp_mem.vram + off, &val, 4); return; }
     psp_write32_slow(addr, val);
 }
 static inline void psp_write_f32(uint32_t addr, float val) {
-    uint32_t off = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    uint32_t off = a - PSP_RAM_BASE;
     if (psp_mem_fast_w && off <= PSP_RAM_SIZE - 4u) { memcpy(psp_mem.ram + off, &val, 4); return; }
+    off = a - PSP_VRAM_BASE;
+    if (psp_mem_fast_w && off <= PSP_VRAM_SIZE - 4u) { memcpy(psp_mem.vram + off, &val, 4); return; }
     psp_write_f32_slow(addr, val);
 }
 

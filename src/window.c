@@ -210,6 +210,10 @@ int psp_window_closed(void) { return g_closed != 0; }
 #include <SDL.h>
 #include <stdint.h>
 
+#ifdef PSPRECOMP_IMGUI_UI
+#include "ui_overlay.h"
+#endif
+
 static volatile int g_closed;
 static int g_scale;
 static int g_win_w = W * 2, g_win_h = H * 2;
@@ -227,6 +231,7 @@ static SDL_AudioDeviceID g_audio_dev;
 static int32_t  g_audio_mix[AUDIO_RING_FRAMES * 2u];
 static uint64_t g_audio_src_pos[AUDIO_SOURCES];
 static uint64_t g_audio_tail, g_audio_max_head;
+static volatile int g_audio_vol_256 = 256;
 
 /* Mix each guest audio stream (hardware channels 0..7, Output2 stream 8, or
  * raw SAS fallback 9) by its own write cursor into a shared accumulation ring
@@ -269,12 +274,20 @@ static void audio_callback(void *user, Uint8 *stream, int len) {
     int16_t *out = (int16_t *)stream;
     size_t want = (size_t)len / 4;            /* stereo int16 frames */
     if (!g_audio_lock) { memset(stream, 0, (size_t)len); return; }
+    const int vol = g_audio_vol_256;
     SDL_LockMutex(g_audio_lock);
     for (size_t i = 0; i < want; i++) {
         if (g_audio_tail >= g_audio_max_head) { out[i * 2] = out[i * 2 + 1] = 0; continue; }
         size_t idx = (size_t)(g_audio_tail & (AUDIO_RING_FRAMES - 1u)) * 2u;
-        out[i * 2]     = clamp_pcm(g_audio_mix[idx]);
-        out[i * 2 + 1] = clamp_pcm(g_audio_mix[idx + 1]);
+        if (vol == 0) {
+            out[i * 2] = out[i * 2 + 1] = 0;
+        } else if (vol == 256) {
+            out[i * 2]     = clamp_pcm(g_audio_mix[idx]);
+            out[i * 2 + 1] = clamp_pcm(g_audio_mix[idx + 1]);
+        } else {
+            out[i * 2]     = clamp_pcm((g_audio_mix[idx] * vol) >> 8);
+            out[i * 2 + 1] = clamp_pcm((g_audio_mix[idx + 1] * vol) >> 8);
+        }
         g_audio_mix[idx] = g_audio_mix[idx + 1] = 0;
         g_audio_tail++;
     }
@@ -341,11 +354,19 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
     return b;
 }
 
-static void render(SDL_Renderer *r, SDL_Texture *tex) {
+static void render(SDL_Renderer *r, SDL_Texture *tex, int aspect_mode) {
     int cw, ch;
     SDL_GetRendererOutputSize(r, &cw, &ch);
-    int dw = cw, dh = cw * H / W;
-    if (dh > ch) { dh = ch; dw = ch * W / H; }
+    int dw = cw, dh = ch;
+    if (aspect_mode == 0) {
+        dh = cw * H / W;
+        if (dh > ch) { dh = ch; dw = ch * W / H; }
+    } else if (aspect_mode == 1) {
+        int k = cw / W;
+        if (ch / H < k) k = ch / H;
+        if (k >= 1) { dw = W * k; dh = H * k; }
+        else { dh = cw * H / W; if (dh > ch) { dh = ch; dw = ch * W / H; } }
+    }
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
     const SDL_Rect dst = { (cw - dw) / 2, (ch - dh) / 2, dw, dh };
@@ -357,6 +378,9 @@ static void render(SDL_Renderer *r, SDL_Texture *tex) {
         SDL_UpdateTexture(tex, NULL, g_px, W * 4);
         SDL_RenderCopy(r, tex, NULL, &dst);
     }
+#ifdef PSPRECOMP_IMGUI_UI
+    psp_overlay_render(r);
+#endif
     SDL_RenderPresent(r);
 }
 
@@ -373,18 +397,26 @@ static int SDLCALL window_main(void *arg) {
                                          SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!r) r = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     SDL_RendererInfo rinfo;
-    const int vsync = r && SDL_GetRendererInfo(r, &rinfo) == 0 &&
-                      (rinfo.flags & SDL_RENDERER_PRESENTVSYNC);
+    int vsync = r && SDL_GetRendererInfo(r, &rinfo) == 0 &&
+                (rinfo.flags & SDL_RENDERER_PRESENTVSYNC);
     SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
                                              SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
     if (tex) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
     if (!tex) g_closed = 1;
+#ifdef PSPRECOMP_IMGUI_UI
+    psp_overlay_state ov = { 1, 0, 0, 1, vsync ? 1 : 0, 0, 0, 0, 100, 0, 0 };
+    int cur_vsync = ov.vsync, cur_filter = ov.linear_filter;
+    if (r && tex) psp_overlay_attach(win, r, &ov);
+#endif
     SDL_SemPost((SDL_sem *)arg);              /* the window exists, or failed */
 
     Uint32 next = SDL_GetTicks();
     while (!g_closed && r && tex) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+#ifdef PSPRECOMP_IMGUI_UI
+            psp_overlay_handle_event(&e);
+#endif
             if (e.type == SDL_QUIT ||
                 (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE)) {
                 g_closed = 1;
@@ -412,13 +444,38 @@ static int SDLCALL window_main(void *arg) {
                     (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
         }
+#ifdef PSPRECOMP_IMGUI_UI
+        if (ov.quit_req) g_closed = 1;
+        if (ov.fullscreen_req) {
+            ov.fullscreen_req = 0;
+            const Uint32 flags = SDL_GetWindowFlags(win);
+            SDL_SetWindowFullscreen(win,
+                (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+        }
+        if (ov.vsync != cur_vsync) {
+            cur_vsync = ov.vsync;
+            if (SDL_RenderSetVSync(r, cur_vsync ? 1 : 0) == 0) vsync = cur_vsync;
+            else vsync = 0;
+        }
+        if (ov.linear_filter != cur_filter) {
+            cur_filter = ov.linear_filter;
+            SDL_SetTextureScaleMode(tex, cur_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        }
+        g_audio_vol_256 = ov.audio_mute ? 0 : (ov.audio_vol_pct * 256 / 100);
+#endif
         if (g_closed) break;
         /* Sync focus from SDL window flags directly so concurrent UI event
          * polling cannot leave g_focused stale when clicking into the game window. */
         g_focused = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
         uint8_t ax = 128, ay = 128;
+#ifdef PSPRECOMP_IMGUI_UI
+        uint32_t kbd = psp_overlay_want_keyboard() ? 0u : keyboard();
+        psp_ctrl_set(kbd | pad(&ax, &ay), ax, ay);
+        render(r, tex, ov.aspect_mode);
+#else
         psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
-        render(r, tex);
+        render(r, tex, 0);
+#endif
         if (vsync) {
             next = SDL_GetTicks();            /* SDL_RenderPresent paced us */
         } else {
@@ -428,6 +485,9 @@ static int SDLCALL window_main(void *arg) {
             else next = now;
         }
     }
+#ifdef PSPRECOMP_IMGUI_UI
+    psp_overlay_detach();
+#endif
     if (g_pad) { SDL_GameControllerClose(g_pad); g_pad = NULL; }
     g_pad_instance = -1;
     if (tex) SDL_DestroyTexture(tex);
@@ -478,6 +538,7 @@ int psp_window_start(const char *title, int scale) {
     memset(g_audio_mix, 0, sizeof g_audio_mix);
     memset(g_audio_src_pos, 0, sizeof g_audio_src_pos);
     g_audio_tail = g_audio_max_head = 0;
+    g_audio_vol_256 = 256;
     g_audio_lock = SDL_CreateMutex();
     if (g_audio_lock) {
         SDL_AudioSpec want;
