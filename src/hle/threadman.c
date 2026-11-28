@@ -151,6 +151,10 @@ typedef struct {
     uint64_t wakeups;             /* sceKernelWakeupThread, not yet consumed */
     uint64_t parks;
     uint32_t last_wait_kind;
+    uint64_t prof_last_us;
+    uint64_t prof_active_us;
+    uint64_t prof_sleep_us;
+    uint64_t prof_handover_us;
 
     int terminated;               /* sceKernelTerminateThread asked for it */
     int delete_after;             /* sceKernelExitDeleteThread: free on the way out */
@@ -424,10 +428,12 @@ static int park_us(uint64_t timeout_us) {
     }
 
     if (g_prof_tm < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_tm = (p && p[0] == '1') ? 1 : 0; }
+    uint64_t enter_us = g_prof_tm ? host_deadline_us() : 0;
+    if (g_prof_tm && t && t->prof_last_us) t->prof_active_us += enter_us - t->prof_last_us;
     int woken = 0;
     if (t) {
         uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
-        uint64_t t0 = g_prof_tm ? host_deadline_us() : 0;
+        uint64_t t0 = g_prof_tm ? enter_us : 0;
         host_mutex_lock(&t->wlock);
         if (!t->woken) {
             uint64_t dl = host_deadline_us() + real;
@@ -441,7 +447,11 @@ static int park_us(uint64_t timeout_us) {
         t->waiting = 0;
         t->wait_kind = W_NONE;
         host_mutex_unlock(&t->wlock);
-        if (g_prof_tm) g_prof_sleep_us += host_deadline_us() - t0;
+        if (g_prof_tm) {
+            uint64_t dt = host_deadline_us() - t0;
+            g_prof_sleep_us += dt;
+            t->prof_sleep_us += dt;
+        }
     }
 
     if (depth) {
@@ -460,6 +470,7 @@ static int park_us(uint64_t timeout_us) {
             uint64_t h2 = host_deadline_us();
             g_prof_handover_us += h1 - h0;
             g_prof_wait_us += h2 - h1;
+            if (t) t->prof_handover_us += h2 - h0;
         }
         g_baton_owned = 1;
         g_baton_takes++;
@@ -474,7 +485,10 @@ static int park_us(uint64_t timeout_us) {
 
     if (timeout_us) g_vtime_us += timeout_us;
     g_parks++;
-    if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
+    if (t) {
+        t->parks++; psp_cpu = t->ctx; g_current = t;
+        if (g_prof_tm) t->prof_last_us = host_deadline_us();
+    }
     TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
     return woken;
 }
@@ -679,7 +693,7 @@ void psp_threadman_dump(FILE *out) {
 #if PSPRECOMP_REAL_THREADS
         host_mutex_unlock(&t->wlock);
 #endif
-        fprintf(out, "  thread %u %-16s %-9s %s, parks %llu, wakeups %llu%s\n",
+        fprintf(out, "  thread %u %-16s %-9s %s, parks %llu, wakeups %llu%s",
                 t->uid, t->name,
                 t->state == TH_RUNNING ? "running" :
                 t->state == TH_SUSPENDED ? "suspended" :
@@ -688,6 +702,13 @@ void psp_threadman_dump(FILE *out) {
                 (unsigned long long)t->parks,
                 (unsigned long long)t->wakeups,
                 t->exited ? ", exited" : "");
+        if (g_prof_tm > 0) {
+            fprintf(out, " [active=%.1fms sleep=%.1fms handover=%.1fms]",
+                    (double)t->prof_active_us / 1000.0,
+                    (double)t->prof_sleep_us / 1000.0,
+                    (double)t->prof_handover_us / 1000.0);
+        }
+        fputc('\n', out);
     }
 }
 
