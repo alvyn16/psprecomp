@@ -653,20 +653,22 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
     *out_w = w;
     *out_h = h;
 
-    /* Check render-to-texture FBO first (keeps dynamic effects hi-res). */
+    /* Check render-to-texture FBO first (keeps dynamic effects hi-res).
+     * FBO color_tex covers [0..BASE_W, 0..BASE_H] even when the game binds it
+     * with power-of-two tex_w/tex_h (e.g. 512x512) and texel UVs in 0..480, 0..272. */
     const uint32_t ta = norm_vram_addr(st->tex_addr);
     const uint32_t cur = norm_vram_addr(g_cur_fb_addr);
     if (ta >= PSP_VRAM_BASE && ta < PSP_VRAM_BASE + PSP_VRAM_SIZE && ta != cur) {
         gl_fbo *rt = find_fbo(ta);
         if (rt && rt->has_draws) {
             const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
+            *out_w = BASE_W;
+            *out_h = BASE_H;
             g_gl.BindTexture(GL_TEXTURE_2D, rt->color_tex);
             g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
             g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fil);
-            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                            st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                            st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             return rt->color_tex;
         }
     }

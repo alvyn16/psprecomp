@@ -1016,7 +1016,47 @@ static void test_hires_scale_and_gl_fallback(void) {
                       "gl 2x front pixel(10,10) matches 0xFF112233: 0x%08X",
                       front2x[10 * 960 + 10]);
             }
-            free(front2x);
+        /* Render-to-texture into 0x04088000, then sample as a 512x512 texture
+         * with UVs (0..480, 0..272) into display buffer FB (0x04000000). */
+        psp_ge_reset();
+        g_pc = 0;
+        cmd(0x9C, 0x088000u);
+        cmd(0x9D, 512u);
+        cmd(0xD4, 0);
+        cmd(0xD5, (271u << 10) | 479u);
+        cmd(0x12, VTYPE_2D);
+        cmd(0x10, (VERTS >> 8) & 0xFF0000);
+        cmd(0x01, VERTS & 0xFFFFFF);
+        vertex(0, 0, 0, 0xFF0000FFu);
+        vertex(1, 480, 272, 0xFF0000FFu);
+        vertex(2, 100, 200, 0xFF00FF00u);
+        vertex(3, 120, 220, 0xFF00FF00u);
+        cmd(0x04, (6u << 16) | 2u);
+        cmd(0x01, (VERTS + 24) & 0xFFFFFF);
+        cmd(0x04, (6u << 16) | 2u);
+        cmd(0x9C, FB & 0xFFFFFF);
+        cmd(0x9D, ((FB >> 8) & 0xFF0000) | 512u);
+        cmd(0x1E, 1);                              /* TME */
+        cmd(0xC2, 3);                              /* TPSM 8888 */
+        cmd(0xA0, 0x088000u);                      /* TBP0 */
+        cmd(0xA8, (0x04u << 16) | 512u);           /* TBW0 */
+        cmd(0xB8, (9u << 8) | 9u);                 /* TSIZE0 512x512 */
+        cmd(0xC9, 3);                              /* TFUNC replace */
+        cmd(0x12, VTYPE_TEX);
+        tvertex(4, 0, 0, 0, 0, 0xFFFFFFFFu);
+        tvertex(5, 480, 272, 480, 272, 0xFFFFFFFFu);
+        cmd(0x01, (VERTS + 64) & 0xFFFFFF);
+        cmd(0x04, (6u << 16) | 2u);
+        end_list();
+        if (front2x && psp_render_copy_front(front2x, 960u * 544u, &fw, &fh) == 0 && fw == 960) {
+            CHECK(front2x[410 * 960 + 210] == 0xFF00FF00u,
+                  "gl 2x RTT 512x512 UV preserves marker at (210,410): 0x%08X",
+                  front2x[410 * 960 + 210]);
+            CHECK(front2x[20 * 960 + 20] == 0xFF0000FFu,
+                  "gl 2x RTT 512x512 background at (20,20): 0x%08X",
+                  front2x[20 * 960 + 20]);
+        }
+        if (front2x) free(front2x);
         }
     }
     psp_render_set_scale(1);
