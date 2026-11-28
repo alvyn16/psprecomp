@@ -90,6 +90,16 @@ typedef struct {
     int      zwrite;         /* !ZMSK */
     uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
     int      zbw;            /* ZBW: width in pixels */
+
+    int      cull;           /* BCE: back-face culling enable */
+    int      cull_ccw;       /* FFACE: 0 = CW front, 1 = CCW front */
+
+    int      stest;          /* STE: stencil test enable */
+    int      sfunc, sref, smask;       /* STST: func, ref, mask */
+    int      sfail, szfail, szpass;    /* SOP: sfail, zfail, zpass */
+
+    uint32_t mask_rgb;       /* PMSKC: bits 0..23 mask RGB writes (1 = keep dst) */
+    uint32_t mask_a;         /* PMSKA: bits 0..7 mask A writes (1 = keep dst) */
 } psp_draw_state;
 
 typedef struct {

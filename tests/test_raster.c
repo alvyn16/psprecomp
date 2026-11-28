@@ -884,6 +884,87 @@ static void test_list_offset_origin_and_uncached_stall(void) {
     CHECK(psp_mem_bad_access == 0, "no bad access finishing after stall update");
 }
 
+/* Hardware skinning: up to 8 bone matrices blended per vertex via VT_WEIGHT. */
+static void test_skinning(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    /* Viewport centred at (240, 136), half-extents (240, -136); unit identities. */
+    fcmd(0x42, 240.0f); fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4); cmd(0x4D, (2048 - 136) << 4);
+    cmd(0x3A, 0); for (int i = 0; i < 12; i++) fcmd(0x3B, (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f);
+    cmd(0x3C, 0); for (int i = 0; i < 12; i++) fcmd(0x3D, (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f);
+    cmd(0x3E, 0); for (int i = 0; i < 16; i++) fcmd(0x3F, (i % 5 == 0) ? 1.0f : 0.0f);
+
+    /* Bone 0 translates +0.5 X; bone 1 is identity. */
+    cmd(0x2A, 0);
+    const float b0[12] = { 1, 0, 0,  0, 1, 0,  0, 0, 1,  0.5f, 0, 0 };
+    for (int i = 0; i < 12; i++) fcmd(0x2B, b0[i]);
+    const float b1[12] = { 1, 0, 0,  0, 1, 0,  0, 0, 1,  0, 0, 0 };
+    for (int i = 0; i < 12; i++) fcmd(0x2B, b1[i]);
+
+    /* VTYPE: 2 u8 weights (0.5 each), 8888 col, f32 pos -> 2 + 2pad + 4 + 12 = 20B stride. */
+    uint32_t vt = (7u << 2) | (3u << 7) | (1u << 9) | (1u << 14);
+    cmd(0x12, vt);
+    cmd(0x01, VERTS & 0xFFFFFFu);
+    const float tri[3][3] = { { 0.0f, 0.2f, 0.0f }, { 0.2f, -0.2f, 0.0f }, { -0.2f, -0.2f, 0.0f } };
+    for (int i = 0; i < 3; i++) {
+        uint32_t a = VERTS + (uint32_t)i * 20u;
+        psp_write8(a + 0, 64); psp_write8(a + 1, 64);  /* 0.5 + 0.5 -> +0.25 X (+60 px) */
+        psp_write32(a + 4, 0xFF00FF00u);
+        psp_write_f32(a + 8,  tri[i][0]);
+        psp_write_f32(a + 12, tri[i][1]);
+        psp_write_f32(a + 16, tri[i][2]);
+    }
+    cmd(0x04, (3u << 16) | 3u);
+    end_list();
+
+    CHECK(pixel(240 + 60, 136) == 0xFF00FF00u, "skinned vertex moved +60 px X: 0x%08X", pixel(300, 136));
+    CHECK(pixel(240, 136) == 0, "unskinned origin left empty: 0x%08X", pixel(240, 136));
+}
+
+/* Stencil test/op, back-face culling, and PMSKC/PMSKA write masks (shadow-volume pattern). */
+static void test_stencil_cull_and_mask(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    /* Clear alpha/stencil to 0x80 and colour to 0x00404040 via CLEAR mode. */
+    cmd(0xD3, 0x0301); /* clear=1, color=1, alpha=1 */
+    vertex(0, 0, 0, 0x80404040u);
+    vertex(1, 100, 100, 0x80404040u);
+    cmd(0x04, (6u << 16) | 2u);
+    cmd(0xD3, 0);
+
+    /* Mask RGB, write only alpha (PMSKC=0xFFFFFF, PMSKA=0), STE=1, STST ALWAYS,
+     * cull CCW (FFACE=0 -> CW front), SOP zpass=DECR -> decrements [10..50, 10..50] to 0x7F. */
+    cmd(0xE8, 0xFFFFFFu);
+    cmd(0xE9, 0);
+    cmd(0x24, 1);          /* STE */
+    cmd(0xDC, 0xFF0001u);  /* ALWAYS */
+    cmd(0xDD, 0x050000u);  /* zpass = DECR (5) */
+    cmd(0x1D, 1);          /* BCE = 1 */
+    cmd(0x9B, 0);          /* FFACE = CW front (screen area > 0) */
+    /* CW triangle on screen (+y down): (10,10)->(50,10)->(10,50) passes; CCW one culled. */
+    vertex(2, 10, 10, 0xFFFFFFFFu); vertex(3, 50, 10, 0xFFFFFFFFu); vertex(4, 10, 50, 0xFFFFFFFFu);
+    vertex(5, 60, 10, 0xFFFFFFFFu); vertex(6, 60, 50, 0xFFFFFFFFu); vertex(7, 90, 10, 0xFFFFFFFFu);
+    cmd(0x04, (3u << 16) | 6u);
+
+    /* Unmask RGB, draw red quad where (0x80 > stencil) -> only decremented CW triangle. */
+    cmd(0x1D, 0);
+    cmd(0xE8, 0);
+    cmd(0xDC, 0xFF8006u);  /* GREATER: (0x80 & 0xFF) > (dst & 0xFF) */
+    cmd(0xDD, 0);          /* KEEP */
+    vertex(8, 0, 0, 0xFF0000FFu);
+    vertex(9, 100, 100, 0xFF0000FFu);
+    cmd(0x04, (6u << 16) | 2u);
+    end_list();
+
+    CHECK(pixel(20, 20) == 0x7F0000FFu, "stenciled CW shadow darkened & kept stencil 0x7F: 0x%08X", pixel(20, 20));
+    CHECK(pixel(70, 20) == 0x80404040u, "culled CCW triangle left pixel untouched: 0x%08X", pixel(70, 20));
+    CHECK(pixel(80, 80) == 0x80404040u, "unshadowed region stayed lit: 0x%08X", pixel(80, 80));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -911,6 +992,8 @@ int main(void) {
     test_lighting();
     test_backend_selection();
     test_list_offset_origin_and_uncached_stall();
+    test_skinning();
+    test_stencil_cull_and_mask();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
