@@ -62,6 +62,9 @@ static char    g_root[512];
 static uint64_t g_bytes_read;
 static char     g_iso[512];
 
+#define ASYNC_MAX_FDS 128
+static int64_t g_async_res[ASYNC_MAX_FDS];
+
 void psp_io_set_iso(const char *path) {
     snprintf(g_iso, sizeof g_iso, "%s", path ? path : "");
 }
@@ -105,6 +108,7 @@ void psp_io_reset(void) {
 #endif
     }
     memset(g_dir, 0, sizeof g_dir);
+    memset(g_async_res, 0, sizeof g_async_res);
     g_bytes_read = 0;
     if (!g_root[0]) psp_io_set_root(".");
 }
@@ -490,15 +494,82 @@ static void hle_Dclose(void) {
     psp_ret(0);
 }
 
+/* ---- synchronous implementations backing the Async entry points ---------- */
+
+static void record_async(int32_t fd, int64_t res) {
+    if (fd >= 0 && fd < ASYNC_MAX_FDS) g_async_res[fd] = res;
+}
+
+static void hle_OpenAsync(void) {
+    hle_Open();
+    int32_t fd = (int32_t)psp_cpu.r[PSP_REG_V0];
+    if (fd >= 3) record_async(fd, fd);
+}
+
+static void hle_ReadAsync(void) {
+    int32_t fd = (int32_t)psp_arg(0);
+    hle_Read();
+    int32_t got = (int32_t)psp_cpu.r[PSP_REG_V0];
+    record_async(fd, got);
+    psp_ret(got < 0 ? (uint32_t)got : SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_LseekAsync(void) {
+    int32_t fd = (int32_t)psp_arg(0);
+    hle_Lseek();
+    uint64_t pos = (uint64_t)psp_cpu.r[PSP_REG_V0] |
+                   ((uint64_t)psp_cpu.r[PSP_REG_V1] << 32);
+    record_async(fd, (int64_t)pos);
+    psp_ret((int64_t)pos < 0 ? (uint32_t)pos : SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_CloseAsync(void) {
+    int32_t fd = (int32_t)psp_arg(0);
+    hle_Close();
+    record_async(fd, (int32_t)psp_cpu.r[PSP_REG_V0]);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void write_async_res(int32_t fd, uint32_t res_ptr) {
+    int64_t v = (fd >= 0 && fd < ASYNC_MAX_FDS) ? g_async_res[fd] : 0;
+    if (res_ptr && psp_mem_ptr(res_ptr, 8)) {
+        psp_write32(res_ptr, (uint32_t)(uint64_t)v);
+        psp_write32(res_ptr + 4, (uint32_t)((uint64_t)v >> 32));
+    }
+}
+
+static void hle_PollAsync(void) {
+    write_async_res((int32_t)psp_arg(0), psp_arg(1));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_WaitAsyncCB(void) {
+    psp_hle_call(0x349D6D6Cu); /* sceKernelCheckCallback */
+    write_async_res((int32_t)psp_arg(0), psp_arg(1));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_IoOk(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_io_register(void) {
-    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat", hle_Getstat);
-    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
-    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",  hle_Close);
-    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",   hle_Read);
-    psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",  hle_Write);
-    psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",  hle_Lseek);
-    psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename", hle_Rename);
-    psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
-    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
-    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
+    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat",     hle_Getstat);
+    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",        hle_Open);
+    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",       hle_Close);
+    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",        hle_Read);
+    psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",       hle_Write);
+    psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",       hle_Lseek);
+    psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename",      hle_Rename);
+    psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",       hle_Dopen);
+    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",       hle_Dread);
+    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose",      hle_Dclose);
+    psp_hle_register(0x89AA9906, "IoFileMgrForUser", "sceIoOpenAsync",   hle_OpenAsync);
+    psp_hle_register(0xA0B5A7C2, "IoFileMgrForUser", "sceIoReadAsync",   hle_ReadAsync);
+    psp_hle_register(0x71B19E77, "IoFileMgrForUser", "sceIoLseekAsync",  hle_LseekAsync);
+    psp_hle_register(0xFF5940B6, "IoFileMgrForUser", "sceIoCloseAsync",  hle_CloseAsync);
+    psp_hle_register(0x3251EA56, "IoFileMgrForUser", "sceIoPollAsync",   hle_PollAsync);
+    psp_hle_register(0xE23EEC33, "IoFileMgrForUser", "sceIoWaitAsync",   hle_PollAsync);
+    psp_hle_register(0x35DBD746, "IoFileMgrForUser", "sceIoWaitAsyncCB", hle_WaitAsyncCB);
+    psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl",      hle_IoOk);
+    psp_hle_register(0x55F4717Du, "IoFileMgrForUser", "sceIoChdir",      hle_IoOk);
+    psp_hle_register(0xAB96437F, "IoFileMgrForUser", "sceIoSync",        hle_IoOk);
 }

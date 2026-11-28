@@ -373,7 +373,134 @@ static void hle_SetChannelDataLen(void) {
 /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
 
+static int      g_vmem_locked;
+static uint32_t g_umd_cbid;
+static uint64_t g_rtc_start_ns;
+
+static uint64_t rtc_now_ns(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void hle_IsCpuIntrEnable(void) {
+    psp_ret(psp_threadman_intr_disabled() ? 0u : 1u);
+}
+
+static void hle_VolatileMemLock(int trylock) {
+    uint32_t type = psp_arg(0);
+    uint32_t addr_ptr = psp_arg(1);
+    uint32_t size_ptr = psp_arg(2);
+    if (type != 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    if (trylock && g_vmem_locked) { psp_ret(0x802B0200u); return; }
+    g_vmem_locked = 1;
+    if (addr_ptr) psp_write32(addr_ptr, 0x08400000u);
+    if (size_ptr) psp_write32(size_ptr, 0x00400000u);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_VolatileMemTryLock(void) { hle_VolatileMemLock(1); }
+static void hle_VolatileMemLockBlocking(void) { hle_VolatileMemLock(0); }
+static void hle_VolatileMemUnlock(void) { g_vmem_locked = 0; psp_ret(SCE_KERNEL_ERROR_OK); }
+
+static void hle_DmacMemcpy(void) {
+    uint32_t dst = psp_arg(0), src = psp_arg(1), size = psp_arg(2);
+    void *d = psp_mem_ptr(dst, size);
+    const void *s = psp_mem_ptr(src, size);
+    if (d && s) {
+        memmove(d, s, size);
+    } else {
+        for (uint32_t i = 0; i < size; i++) psp_write8(dst + i, psp_read8(src + i));
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+#define PSP_UMD_PRESENT  0x02u
+#define PSP_UMD_READY    0x20u
+#define PSP_UMD_READABLE 0x10u
+
+static void hle_UmdCheckMedium(void) { psp_ret(1u); }
+static void hle_UmdActivate(void) {
+    if (g_umd_cbid) {
+        uint32_t saved_a0 = psp_cpu.r[PSP_REG_A0], saved_a1 = psp_cpu.r[PSP_REG_A1];
+        psp_cpu.r[PSP_REG_A0] = g_umd_cbid;
+        psp_cpu.r[PSP_REG_A1] = PSP_UMD_PRESENT | PSP_UMD_READY | PSP_UMD_READABLE;
+        psp_hle_call(0xC11BA8C4u); /* sceKernelNotifyCallback */
+        psp_cpu.r[PSP_REG_A0] = saved_a0;
+        psp_cpu.r[PSP_REG_A1] = saved_a1;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_UmdGetDriveStat(void) {
+    psp_ret(PSP_UMD_PRESENT | PSP_UMD_READY | PSP_UMD_READABLE);
+}
+static void hle_UmdRegisterCallback(void) {
+    uint32_t cbid = psp_arg(1);
+    if (!cbid) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    g_umd_cbid = cbid;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcGetCurrentTick(void) {
+    uint32_t tick_ptr = psp_arg(0);
+    if (!tick_ptr) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    uint64_t now = rtc_now_ns();
+    if (!g_rtc_start_ns) g_rtc_start_ns = now;
+    uint64_t us = (now - g_rtc_start_ns) / 1000ull;
+    psp_write32(tick_ptr, (uint32_t)us);
+    psp_write32(tick_ptr + 4, (uint32_t)(us >> 32));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcGetCurrentClockLocalTime(void) {
+    uint32_t p = psp_arg(0);
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    time_t sec = ts.tv_sec;
+    struct tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &sec);
+#else
+    localtime_r(&sec, &tm_buf);
+#endif
+    psp_write16(p + 0,  (uint16_t)(tm_buf.tm_year + 1900));
+    psp_write16(p + 2,  (uint16_t)(tm_buf.tm_mon + 1));
+    psp_write16(p + 4,  (uint16_t)tm_buf.tm_mday);
+    psp_write16(p + 6,  (uint16_t)tm_buf.tm_hour);
+    psp_write16(p + 8,  (uint16_t)tm_buf.tm_min);
+    psp_write16(p + 10, (uint16_t)tm_buf.tm_sec);
+    psp_write32(p + 12, (uint32_t)(ts.tv_nsec / 1000l));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityGetSystemParamInt(void) {
+    uint32_t id = psp_arg(0), out = psp_arg(1);
+    uint32_t val = 0;
+    switch (id) {
+    case 8:  val = 1; break;  /* PSP_SYSTEMPARAM_ID_INT_LANGUAGE: English */
+    case 9:  val = 1; break;  /* PSP_SYSTEMPARAM_ID_INT_BUTTON_PREFERENCE: X confirm */
+    default: break;
+    }
+    if (out) psp_write32(out, val);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityGetSystemParamString(void) {
+    uint32_t out = psp_arg(1);
+    uint32_t len = psp_arg(2);
+    static const char k_name[] = "PSP";
+    if (out && len) {
+        uint32_t n = len < sizeof(k_name) ? len - 1u : (uint32_t)(sizeof(k_name) - 1u);
+        for (uint32_t i = 0; i < n; i++) psp_write8(out + i, (uint8_t)k_name[i]);
+        psp_write8(out + n, 0);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_misc_reset(void) {
+    g_vmem_locked = 0;
+    g_umd_cbid = 0;
+    g_rtc_start_ns = 0;
     /* The interrupt mask is per thread and lives in the scheduler; a reset
      * here cannot reach another thread's bracket, and should not. */
     g_exit_requested = 0;
@@ -394,11 +521,14 @@ void psp_misc_reset(void) {
 void psp_misc_init(void) { psp_misc_reset(); }
 
 void psp_misc_register(void) {
-    psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
-    psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
+    psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr",  hle_CpuSuspendIntr);
+    psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",   hle_CpuResumeIntr);
+    psp_hle_register(0xB55249D2, "Kernel_Library", "sceKernelIsCpuIntrEnable", hle_IsCpuIntrEnable);
 
-    psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",           hle_CacheOp);
-    psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll", hle_CacheOp);
+    psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",              hle_CacheOp);
+    psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll",    hle_CacheOp);
+    psp_hle_register(0x3EE30821, "UtilsForUser", "sceKernelDcacheWritebackRange",            hle_CacheOp);
+    psp_hle_register(0x34B9FA9E, "UtilsForUser", "sceKernelDcacheWritebackInvalidateRange",  hle_CacheOp);
     psp_hle_register(0x27CC57F0, "UtilsForUser", "sceKernelLibcTime",         hle_LibcTime);
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);
@@ -410,9 +540,30 @@ void psp_misc_register(void) {
     psp_hle_register(0xA6BAB2E9, "StdioForUser", "sceKernelStdout", hle_Stdout);
     psp_hle_register(0xF78BA90A, "StdioForUser", "sceKernelStderr", hle_Stderr);
 
-    psp_hle_register(0xEADB1BD7, "sceSuspendForUser", "sceKernelPowerLock",   hle_ok);
-    psp_hle_register(0x3AEE7261, "sceSuspendForUser", "sceKernelPowerUnlock", hle_ok);
-    psp_hle_register(0x090CCB3F, "sceSuspendForUser", "sceKernelPowerTick",   hle_ok);
+    psp_hle_register(0xEADB1BD7, "sceSuspendForUser", "sceKernelPowerLock",          hle_ok);
+    psp_hle_register(0x3AEE7261, "sceSuspendForUser", "sceKernelPowerUnlock",        hle_ok);
+    psp_hle_register(0x090CCB3F, "sceSuspendForUser", "sceKernelPowerTick",          hle_ok);
+    psp_hle_register(0xA14F40B2, "sceSuspendForUser", "sceKernelVolatileMemTryLock", hle_VolatileMemTryLock);
+    psp_hle_register(0x3E0271D3, "sceSuspendForUser", "sceKernelVolatileMemLock",    hle_VolatileMemLockBlocking);
+    psp_hle_register(0xA569E425, "sceSuspendForUser", "sceKernelVolatileMemUnlock",  hle_VolatileMemUnlock);
+
+    psp_hle_register(0x617F3FE6, "sceDmac", "sceDmacMemcpy", hle_DmacMemcpy);
+    psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ok);
+
+    psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",         hle_UmdCheckMedium);
+    psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",            hle_UmdActivate);
+    psp_hle_register(0x6B4A146C, "sceUmdUser", "sceUmdGetDriveStat",        hle_UmdGetDriveStat);
+    psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",       hle_ok);
+    psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB",     hle_ok);
+    psp_hle_register(0xAEE7404D, "sceUmdUser", "sceUmdRegisterUMDCallBack", hle_UmdRegisterCallback);
+
+    psp_hle_register(0x3F7AD767, "sceRtc", "sceRtcGetCurrentTick",           hle_RtcGetCurrentTick);
+    psp_hle_register(0xE7C27D1B, "sceRtc", "sceRtcGetCurrentClockLocalTime", hle_RtcGetCurrentClockLocalTime);
+
+    psp_hle_register(0xA5DA2406, "sceUtility", "sceUtilityGetSystemParamInt",    hle_UtilityGetSystemParamInt);
+    psp_hle_register(0x34B78343, "sceUtility", "sceUtilityGetSystemParamString", hle_UtilityGetSystemParamString);
+    psp_hle_register(0x2A2B3DE0, "sceUtility", "sceUtilityLoadModule",           hle_ok);
+    psp_hle_register(0xE49BFE92, "sceUtility", "sceUtilityUnloadModule",         hle_ok);
 
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);

@@ -976,6 +976,151 @@ static void test_callbacks(void) {
           (unsigned long long)psp_power_registered());
 }
 
+#ifdef _WIN32
+#include <direct.h>
+#define test_mkdir(p) _mkdir(p)
+#define test_rmdir(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define test_mkdir(p) mkdir(p, 0755)
+#define test_rmdir(p) rmdir(p)
+#endif
+
+static void write_guest_str(uint32_t addr, const char *s) {
+    for (size_t i = 0; ; i++) {
+        psp_write8(addr + (uint32_t)i, (uint8_t)s[i]);
+        if (s[i] == '\0') break;
+    }
+}
+
+static void test_extra_hle(void) {
+    /* Mutexes (non-recursive and recursive). */
+    write_guest_str(0x08800100u, "mtx");
+    int32_t mid = (int32_t)call(0xB7D098C6u, 0x08800100u, 0, 0, 0); /* sceKernelCreateMutex */
+    CHECK(mid >= 0, "CreateMutex failed");
+    CHECK(call(0xB011B11Fu, (uint32_t)mid, 1, 0, 0) == 0, "LockMutex");
+    CHECK((int32_t)call(0x0DDCD2C9u, (uint32_t)mid, 1, 0, 0) < 0, "TryLockMutex busy");
+    CHECK(call(0x6B30100Fu, (uint32_t)mid, 1, 0, 0) == 0, "UnlockMutex");
+    CHECK(call(0x0DDCD2C9u, (uint32_t)mid, 1, 0, 0) == 0, "TryLockMutex free");
+    CHECK(call(0x6B30100Fu, (uint32_t)mid, 1, 0, 0) == 0, "UnlockMutex 2");
+    CHECK(call(0xF8170FBEu, (uint32_t)mid, 0, 0, 0) == 0, "DeleteMutex");
+
+    write_guest_str(0x08800120u, "rmtx");
+    int32_t rmid = (int32_t)call(0xB7D098C6u, 0x08800120u, 0x200u, 1, 0);
+    CHECK(rmid >= 0, "CreateMutex recursive");
+    CHECK(call(0xB011B11Fu, (uint32_t)rmid, 1, 0, 0) == 0, "LockMutex recursive");
+    CHECK(call(0x6B30100Fu, (uint32_t)rmid, 2, 0, 0) == 0, "UnlockMutex recursive");
+    CHECK(call(0xF8170FBEu, (uint32_t)rmid, 0, 0, 0) == 0, "DeleteMutex recursive");
+
+    /* WaitSemaCB + GetSystemTimeLow + ReferSystemStatus */
+    write_guest_str(0x08800140u, "scb");
+    int32_t sid = (int32_t)call(0xD6DA4BA1u, 0x08800140u, 0, 1, 4); /* sceKernelCreateSema */
+    CHECK(sid >= 0, "CreateSema for CB");
+    CHECK(call(0x6D212BACu, (uint32_t)sid, 1, 0, 0) == 0, "WaitSemaCB");
+    CHECK(call(0x28B6489Cu, (uint32_t)sid, 0, 0, 0) == 0, "DeleteSema");
+    (void)call(0x369ED59Du, 0, 0, 0, 0); /* sceKernelGetSystemTimeLow */
+    psp_write32(0x08800200u, 32);
+    CHECK(call(0x627E6F3Au, 0x08800200u, 0, 0, 0) == 0, "ReferSystemStatus");
+    CHECK(psp_read32(0x08800200u) == 32, "ReferSystemStatus size preserved");
+
+    /* Interrupt enable query, display hold mode, power CPU clock */
+    CHECK(call(0xB55249D2u, 0, 0, 0, 0) == 1, "IsCpuIntrEnable initially 1");
+    uint32_t intr_state = call(0x092968F4u, 0, 0, 0, 0);
+    CHECK(call(0xB55249D2u, 0, 0, 0, 0) == 0, "IsCpuIntrEnable 0 while suspended");
+    call(0x5F10D406u, intr_state, 0, 0, 0);
+    CHECK(call(0xB55249D2u, 0, 0, 0, 0) == 1, "IsCpuIntrEnable restored to 1");
+    CHECK(call(0x7ED59BC4u, 0, 0, 0, 0) == 0, "sceDisplaySetHoldMode");
+    CHECK(call(0xFDB5BFE9u, 0, 0, 0, 0) == 222u, "scePowerGetCpuClockFrequencyInt");
+
+    /* Volatile mem + DmacMemcpy */
+    CHECK(call(0xA14F40B2u, 0, 0x08800300u, 0x08800304u, 0) == 0, "VolatileMemTryLock");
+    CHECK(psp_read32(0x08800300u) == 0x08400000u && psp_read32(0x08800304u) == 0x00400000u,
+          "VolatileMem addr/size");
+    CHECK(call(0xA14F40B2u, 0, 0x08800300u, 0x08800304u, 0) != 0, "VolatileMemTryLock busy");
+    CHECK(call(0xA569E425u, 0, 0, 0, 0) == 0, "VolatileMemUnlock");
+    CHECK(call(0x3E0271D3u, 0, 0x08800300u, 0x08800304u, 0) == 0, "VolatileMemLock");
+    CHECK(call(0xA569E425u, 0, 0, 0, 0) == 0, "VolatileMemUnlock 2");
+
+    for (uint32_t i = 0; i < 16; i++) psp_write8(0x08800400u + i, (uint8_t)(0xA0u + i));
+    CHECK(call(0x617F3FE6u, 0x08800440u, 0x08800400u, 16, 0) == 0, "sceDmacMemcpy");
+    for (uint32_t i = 0; i < 16; i++) {
+        CHECK(psp_read8(0x08800440u + i) == (uint8_t)(0xA0u + i), "sceDmacMemcpy byte");
+    }
+
+    /* UMD + RTC + Utility params + Impose */
+    CHECK(call(0x46EBB729u, 0, 0, 0, 0) == 1, "sceUmdCheckMedium");
+    write_guest_str(0x08800480u, "disc0:");
+    CHECK(call(0xC6183D47u, 1, 0x08800480u, 0, 0) == 0, "sceUmdActivate");
+    CHECK((call(0x6B4A146Cu, 0, 0, 0, 0) & 0x32u) == 0x32u, "sceUmdGetDriveStat");
+    CHECK(call(0x8EF08FCEu, 0x32u, 0, 0, 0) == 0, "sceUmdWaitDriveStat");
+    CHECK(call(0x4A9E5E29u, 0x32u, 0, 0, 0) == 0, "sceUmdWaitDriveStatCB");
+
+    CHECK(call(0x3F7AD767u, 0x08800500u, 0, 0, 0) == 0, "sceRtcGetCurrentTick");
+    uint64_t tick0 = (uint64_t)psp_read32(0x08800500u) |
+                     ((uint64_t)psp_read32(0x08800504u) << 32);
+    CHECK(call(0x3F7AD767u, 0x08800500u, 0, 0, 0) == 0, "sceRtcGetCurrentTick 2");
+    uint64_t tick1 = (uint64_t)psp_read32(0x08800500u) |
+                     ((uint64_t)psp_read32(0x08800504u) << 32);
+    CHECK(tick1 >= tick0, "sceRtcGetCurrentTick monotonic");
+    CHECK(call(0xE7C27D1Bu, 0x08800520u, 0, 0, 0) == 0, "sceRtcGetCurrentClockLocalTime");
+    uint16_t yr = psp_read16(0x08800520u);
+    uint16_t mo = psp_read16(0x08800522u);
+    uint16_t dy = psp_read16(0x08800524u);
+    CHECK(yr >= 2024 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31, "LocalTime valid date");
+
+    CHECK(call(0xA5DA2406u, 8, 0x08800540u, 0, 0) == 0, "UtilityGetSystemParamInt lang");
+    CHECK(psp_read32(0x08800540u) == 1, "Default language is English (1)");
+    CHECK(call(0x34B78343u, 1, 0x08800560u, 16, 0) == 0, "UtilityGetSystemParamString");
+    CHECK(psp_read8(0x08800560u) == 'P' && psp_read8(0x08800561u) == 'S' &&
+          psp_read8(0x08800562u) == 'P' && psp_read8(0x08800563u) == '\0', "ParamString PSP");
+    CHECK(call(0x36AA6E91u, 1, 1, 0, 0) == 0, "sceImposeSetLanguageMode");
+    CHECK(call(0x2A2B3DE0u, 0x300, 0, 0, 0) == 0, "sceUtilityLoadModule");
+    CHECK(call(0xE49BFE92u, 0x300, 0, 0, 0) == 0, "sceUtilityUnloadModule");
+
+    /* Async file I/O + helpers */
+    test_mkdir("/tmp/psprecomp_hle_test");
+    test_mkdir("/tmp/psprecomp_hle_test/ms");
+    psp_io_set_root("/tmp/psprecomp_hle_test");
+    write_guest_str(0x08800600u, "ms0:/async_test.bin");
+    int32_t wfd = (int32_t)call(0x109F50BCu, 0x08800600u, 0x0602u, 0777, 0);
+    CHECK(wfd >= 3, "sceIoOpen create test file");
+    if (wfd >= 3) {
+        write_guest_str(0x08800640u, "HELLO_PSP");
+        CHECK(call(0x42EC03ACu, (uint32_t)wfd, 0x08800640u, 9, 0) == 9, "sceIoWrite test file");
+        CHECK(call(0x810C4BC3u, (uint32_t)wfd, 0, 0, 0) == 0, "sceIoClose test file");
+
+        int32_t afd = (int32_t)call(0x89AA9906u, 0x08800600u, 0x0001u, 0, 0); /* sceIoOpenAsync */
+        CHECK(afd >= 3, "sceIoOpenAsync");
+        if (afd >= 3) {
+            CHECK(call(0x3251EA56u, (uint32_t)afd, 0x08800680u, 0, 0) == 0, "PollAsync open");
+            CHECK((int32_t)psp_read32(0x08800680u) == afd, "PollAsync open res");
+            psp_cpu.r[4] = (uint32_t)afd;
+            psp_cpu.r[5] = 0;
+            psp_cpu.r[6] = 6;
+            psp_cpu.r[7] = 0;
+            psp_cpu.r[8] = 0;
+            psp_hle_call(0x71B19E77u); /* sceIoLseekAsync */
+            CHECK(psp_cpu.r[2] == 0, "sceIoLseekAsync");
+            CHECK(call(0xE23EEC33u, (uint32_t)afd, 0x08800680u, 0, 0) == 0, "WaitAsync seek");
+            CHECK(psp_read32(0x08800680u) == 6, "WaitAsync seek res");
+            CHECK(call(0xA0B5A7C2u, (uint32_t)afd, 0x08800690u, 3, 0) == 0, "sceIoReadAsync");
+            CHECK(call(0x35DBD746u, (uint32_t)afd, 0x08800680u, 0, 0) == 0, "WaitAsyncCB read");
+            CHECK(psp_read32(0x08800680u) == 3, "WaitAsyncCB read count");
+            CHECK(psp_read8(0x08800690u) == 'P' && psp_read8(0x08800691u) == 'S' &&
+                  psp_read8(0x08800692u) == 'P', "ReadAsync payload");
+            CHECK(call(0xFF5940B6u, (uint32_t)afd, 0, 0, 0) == 0, "sceIoCloseAsync");
+            CHECK(call(0x3251EA56u, (uint32_t)afd, 0x08800680u, 0, 0) == 0, "PollAsync close");
+        }
+        remove("/tmp/psprecomp_hle_test/ms/async_test.bin");
+    }
+    test_rmdir("/tmp/psprecomp_hle_test/ms");
+    test_rmdir("/tmp/psprecomp_hle_test");
+    CHECK(call(0x54F5FB11u, 0x08800480u, 0, 0, 0) == 0, "sceIoDevctl");
+    CHECK(call(0x55F4717Du, 0x08800480u, 0, 0, 0) == 0, "sceIoChdir");
+    CHECK(call(0xAB96437Fu, 0x08800480u, 0, 0, 0) == 0, "sceIoSync");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1001,6 +1146,7 @@ int main(void) {
     test_unimplemented_logging();
     test_sub_interrupts();
     test_callbacks();
+    test_extra_hle();
 
     psp_mem_free();
 

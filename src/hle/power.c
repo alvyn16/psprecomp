@@ -98,10 +98,12 @@ static void hle_PowerUnregisterCallback(void) {
  * scePowerSetClockFrequency350; the name does not SHA-1 to the NID, so it is
  * registered unnamed like the other observed firmware calls. */
 static void hle_SetClockFrequency(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_GetCpuClockFrequencyInt(void) { psp_ret(222u); }
 
 void psp_power_register(void) {
-    psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback",   hle_PowerRegisterCallback);
-    psp_hle_register(0xDFA8BAF8, "scePower", "scePowerUnregisterCallback", hle_PowerUnregisterCallback);
+    psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback",        hle_PowerRegisterCallback);
+    psp_hle_register(0xDFA8BAF8, "scePower", "scePowerUnregisterCallback",      hle_PowerUnregisterCallback);
+    psp_hle_register(0xFDB5BFE9, "scePower", "scePowerGetCpuClockFrequencyInt", hle_GetCpuClockFrequencyInt);
     psp_hle_register_unnamed(0xEBD177D6, "scePower", hle_SetClockFrequency);
 }
 

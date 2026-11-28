@@ -93,7 +93,7 @@ enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
 
 /* What a parked thread is waiting for. A wake is targeted: signalling a
  * semaphore should not wake a thread waiting on a thread to exit. */
-enum { W_NONE = 0, W_SLEEP, W_DELAY, W_SEMA, W_FLAG, W_THREAD_END, W_VPL };
+enum { W_NONE = 0, W_SLEEP, W_DELAY, W_SEMA, W_FLAG, W_THREAD_END, W_VPL, W_MUTEX };
 
 static const char *wait_name(int w) {
     switch (w) {
@@ -103,6 +103,7 @@ static const char *wait_name(int w) {
     case W_FLAG:       return "event flag";
     case W_THREAD_END: return "thread end";
     case W_VPL:        return "vpl";
+    case W_MUTEX:      return "mutex";
     default:           return "-";
     }
 }
@@ -213,6 +214,26 @@ typedef struct {
     uint32_t vpl, addr, size;
     int      used;
 } psp_vpl_block;
+
+#define MAX_MUTEXES              128
+#define MUTEX_UID_BASE           0x00070000u
+#define PSP_MUTEX_ATTR_RECURSIVE 0x0200u
+#define SCE_KERNEL_ERROR_MUTEX_NOT_FOUND 0x800201C3u
+#define SCE_KERNEL_ERROR_MUTEX_LOCKED    0x800201C4u
+#define SCE_KERNEL_ERROR_MUTEX_RECURSIVE 0x800201C5u
+#define SCE_KERNEL_ERROR_MUTEX_UNLOCKED  0x800201C6u
+
+typedef struct {
+    int      used;
+    uint32_t uid;
+    uint32_t attr;
+    uint32_t owner_thid;
+    int32_t  count;
+    char     name[32];
+} psp_mutex;
+
+static psp_mutex g_mutex[MAX_MUTEXES];
+static uint32_t  g_next_mutex_uid = MUTEX_UID_BASE;
 
 static psp_thread   g_thread[MAX_THREADS];
 static psp_sema     g_sema[MAX_SEMAS];
@@ -545,6 +566,8 @@ void psp_threadman_reset(void) {
     g_cb_delivering = 0;
     memset(g_vpl, 0, sizeof g_vpl);
     memset(g_vplblk, 0, sizeof g_vplblk);
+    memset(g_mutex, 0, sizeof g_mutex);
+    g_next_mutex_uid = MUTEX_UID_BASE;
     g_next_uid = UID_BASE;
     g_switches = 0;
     g_parks = 0;
@@ -1187,6 +1210,122 @@ static void hle_GetSystemTimeWide(void) {
     psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
 }
 
+static void hle_GetSystemTimeLow(void) {
+    psp_ret((uint32_t)now_us());
+}
+
+static void hle_ReferSystemStatus(void) {
+    uint32_t addr = psp_arg(0);
+    if (!addr || !psp_mem_ptr(addr, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    uint32_t size = psp_read32(addr);
+    if (size < 4 || size > 64 || !psp_mem_ptr(addr, size)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+        return;
+    }
+    for (uint32_t off = 4; off < size; off++) psp_write8(addr + off, 0);
+    if (size >= 12) {
+        psp_write32(addr + 8, (uint32_t)g_vtime_us);
+        if (size >= 16) psp_write32(addr + 12, (uint32_t)(g_vtime_us >> 32));
+    }
+    if (size >= 24) psp_write32(addr + 20, (uint32_t)g_switches);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_TerminateDeleteThread(void) {
+    hle_TerminateThread();
+    if (psp_cpu.r[PSP_REG_V0] == SCE_KERNEL_ERROR_OK) hle_DeleteThread();
+}
+
+static psp_mutex *find_mutex(uint32_t uid) {
+    for (int i = 0; i < MAX_MUTEXES; i++)
+        if (g_mutex[i].used && g_mutex[i].uid == uid) return &g_mutex[i];
+    return NULL;
+}
+
+static void hle_CreateMutex(void) {
+    uint32_t name_ptr = psp_arg(0);
+    uint32_t attr = psp_arg(1);
+    int32_t  init_count = (int32_t)psp_arg(2);
+    if (init_count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    psp_mutex *m = NULL;
+    for (int i = 0; i < MAX_MUTEXES; i++) if (!g_mutex[i].used) { m = &g_mutex[i]; break; }
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    memset(m, 0, sizeof *m);
+    m->used = 1;
+    m->uid = g_next_mutex_uid++;
+    m->attr = attr;
+    if (init_count > 0) {
+        m->owner_thid = g_current ? g_current->uid : (UID_BASE - 1);
+        m->count = init_count;
+    }
+    if (name_ptr) psp_str(name_ptr, m->name, sizeof m->name);
+    psp_ret(m->uid);
+}
+
+static void hle_DeleteMutex(void) {
+    psp_mutex *m = find_mutex(psp_arg(0));
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_MUTEX_NOT_FOUND); return; }
+    m->used = 0;
+    wake_waiters(W_MUTEX);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static uint32_t try_lock_mutex_impl(psp_mutex *m, uint32_t self, int32_t count) {
+    if (m->count == 0) { m->owner_thid = self; m->count = count; return SCE_KERNEL_ERROR_OK; }
+    if (m->owner_thid == self) {
+        if (m->attr & PSP_MUTEX_ATTR_RECURSIVE) { m->count += count; return SCE_KERNEL_ERROR_OK; }
+        return SCE_KERNEL_ERROR_MUTEX_RECURSIVE;
+    }
+    return SCE_KERNEL_ERROR_MUTEX_LOCKED;
+}
+
+struct mutex_ctx { psp_mutex *m; uint32_t self; int32_t count; };
+static int mutex_ready(void *p) {
+    struct mutex_ctx *c = (struct mutex_ctx *)p;
+    return !c->m->used || c->m->count == 0;
+}
+
+static void hle_TryLockMutex(void) {
+    psp_mutex *m = find_mutex(psp_arg(0));
+    int32_t count = (int32_t)psp_arg(1);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_MUTEX_NOT_FOUND); return; }
+    if (count <= 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    uint32_t self = g_current ? g_current->uid : (UID_BASE - 1);
+    psp_ret(try_lock_mutex_impl(m, self, count));
+}
+
+static void hle_LockMutex(void) {
+    uint32_t uid = psp_arg(0);
+    int32_t  count = (int32_t)psp_arg(1);
+    uint32_t timeout_ptr = psp_arg(2);
+    psp_mutex *m = find_mutex(uid);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_MUTEX_NOT_FOUND); return; }
+    if (count <= 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    uint32_t self = g_current ? g_current->uid : (UID_BASE - 1);
+    uint32_t rc = try_lock_mutex_impl(m, self, count);
+    if (rc != SCE_KERNEL_ERROR_MUTEX_LOCKED) { psp_ret(rc); return; }
+
+    uint64_t timeout = timeout_ptr ? psp_read32(timeout_ptr) : 0;
+    struct mutex_ctx c = { m, self, count };
+    rc = wait_loop(mutex_ready, &c, timeout, W_MUTEX, "sceKernelLockMutex", m->name);
+    if (rc != SCE_KERNEL_ERROR_OK) { psp_ret(rc); return; }
+    if (!m->used) { psp_ret(SCE_KERNEL_ERROR_MUTEX_NOT_FOUND); return; }
+    psp_ret(try_lock_mutex_impl(m, self, count));
+}
+
+static void hle_UnlockMutex(void) {
+    psp_mutex *m = find_mutex(psp_arg(0));
+    int32_t count = (int32_t)psp_arg(1);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_MUTEX_NOT_FOUND); return; }
+    if (count <= 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    uint32_t self = g_current ? g_current->uid : (UID_BASE - 1);
+    if (m->count == 0 || m->owner_thid != self) { psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCKED); return; }
+    if (count > m->count) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
+    m->count -= count;
+    if (m->count == 0) { m->owner_thid = 0; wake_waiters(W_MUTEX); }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 /* ---- semaphores ---------------------------------------------------------- */
 
 static psp_sema *find_sema(uint32_t id) {
@@ -1658,6 +1797,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x809CE29B, "ThreadManForUser", "sceKernelExitDeleteThread",        hle_ExitDeleteThread);
     psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
     psp_hle_register(0x9FA03CD3, "ThreadManForUser", "sceKernelDeleteThread",            hle_DeleteThread);
+    psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
     psp_hle_register(0x9ACE131E, "ThreadManForUser", "sceKernelSleepThread",             hle_SleepThread);
@@ -1677,13 +1817,22 @@ void psp_threadman_register(void) {
 
     psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
+    psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",        hle_GetSystemTimeLow);
+    psp_hle_register(0x627E6F3A, "ThreadManForUser", "sceKernelReferSystemStatus",       hle_ReferSystemStatus);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);
     psp_hle_register(0x3F53E640, "ThreadManForUser", "sceKernelSignalSema",              hle_SignalSema);
     psp_hle_register(0x4E3A1105, "ThreadManForUser", "sceKernelWaitSema",                hle_WaitSema);
+    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSema);
     psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
     psp_hle_register(0x8FFDF9A2, "ThreadManForUser", "sceKernelCancelSema",              hle_CancelSema);
+
+    psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",             hle_CreateMutex);
+    psp_hle_register(0xF8170FBE, "ThreadManForUser", "sceKernelDeleteMutex",             hle_DeleteMutex);
+    psp_hle_register(0xB011B11F, "ThreadManForUser", "sceKernelLockMutex",               hle_LockMutex);
+    psp_hle_register(0x0DDCD2C9, "ThreadManForUser", "sceKernelTryLockMutex",            hle_TryLockMutex);
+    psp_hle_register(0x6B30100F, "ThreadManForUser", "sceKernelUnlockMutex",             hle_UnlockMutex);
 
     psp_hle_register(0x55C20A00, "ThreadManForUser", "sceKernelCreateEventFlag",         hle_CreateEventFlag);
     psp_hle_register(0xEF9E4C70, "ThreadManForUser", "sceKernelDeleteEventFlag",         hle_DeleteEventFlag);

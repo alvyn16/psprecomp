@@ -115,9 +115,13 @@ static void hle_WaitVblank(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void hle_HoldMode(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
+    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
+    psp_hle_register(0x7ED59BC4, "sceDisplay", "sceDisplaySetHoldMode",       hle_HoldMode);
 }
