@@ -163,6 +163,7 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+const char *psp_io_get_root(void);
 uint64_t psp_io_bytes_read(void);
 
 /* A disc image to back the UMD's raw-sector pseudo-files

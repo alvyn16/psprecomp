@@ -17,8 +17,12 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <direct.h>
+#  define misc_mkdir(p) _mkdir(p)
 #else
 #  include <stdatomic.h>
+#  include <sys/stat.h>
+#  define misc_mkdir(p) mkdir(p, 0755)
 #endif
 
 /* ---- Kernel_Library ------------------------------------------------------
@@ -497,10 +501,336 @@ static void hle_UtilityGetSystemParamString(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- sceUtility dialog helpers (Savedata + MsgDialog) -------------------- */
+
+#define PSP_UTILITY_DIALOG_NONE     0
+#define PSP_UTILITY_DIALOG_INIT     1
+#define PSP_UTILITY_DIALOG_VISIBLE  2
+#define PSP_UTILITY_DIALOG_QUIT     3
+#define PSP_UTILITY_DIALOG_FINISHED 4
+
+#define SCE_UTILITY_ERROR_BUSY             0x80110007u
+#define SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA 0x80110307u
+
+static int g_savedata_status;
+static int g_msgdialog_status;
+
+static void read_guest_cstr(uint32_t addr, char *out, size_t cap) {
+    if (!cap) return;
+    if (!addr) { out[0] = '\0'; return; }
+    size_t i = 0;
+    for (; i + 1 < cap; i++) {
+        if (!psp_mem_ptr(addr + (uint32_t)i, 1)) break;
+        char c = (char)psp_read8(addr + (uint32_t)i);
+        out[i] = c;
+        if (!c) return;
+    }
+    out[i] = '\0';
+}
+
+static void sanitize_component(char *s) {
+    for (char *p = s; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') *p = '_';
+    }
+    if (!strcmp(s, ".") || !strcmp(s, "..")) s[0] = '_';
+}
+
+static void ensure_dir_tree(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            char saved = *p;
+            *p = '\0';
+            misc_mkdir(tmp);
+            *p = saved;
+        }
+    }
+    misc_mkdir(tmp);
+}
+
+static int savedata_path(const char *game, const char *save, const char *file,
+                         char *dir_out, size_t dir_cap,
+                         char *file_out, size_t file_cap) {
+    char g[32], s[32], f[32];
+    snprintf(g, sizeof g, "%s", game[0] ? game : "SAVE");
+    snprintf(s, sizeof s, "%s", (save[0] && strcmp(save, "<>") != 0) ? save : "0000");
+    snprintf(f, sizeof f, "%s", file[0] ? file : "DATA.BIN");
+    sanitize_component(g);
+    sanitize_component(s);
+    sanitize_component(f);
+    int n = snprintf(dir_out, dir_cap, "%s/ms/PSP/SAVEDATA/%s%s",
+                     psp_io_get_root(), g, s);
+    if (n < 0 || (size_t)n >= dir_cap) return -1;
+    if (file_out && file_cap) {
+        int m = snprintf(file_out, file_cap, "%s/%s", dir_out, f);
+        if (m < 0 || (size_t)m >= file_cap) return -1;
+    }
+    return 0;
+}
+
+static int file_exists(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    fclose(fp);
+    return 1;
+}
+
+static uint32_t savedata_load_slot(uint32_t param, const char *game, const char *save,
+                                   const char *file) {
+    char dir[1024], path[1088];
+    if (savedata_path(game, save, file, dir, sizeof dir, path, sizeof path) != 0)
+        return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA;
+
+    uint32_t buf = psp_read32(param + 0x74u);
+    uint32_t buf_sz = psp_read32(param + 0x78u);
+    size_t got = 0;
+    if (buf && buf_sz) {
+        uint8_t *tmp = (uint8_t *)malloc(buf_sz);
+        if (tmp) {
+            got = fread(tmp, 1, buf_sz, fp);
+            if (got && psp_mem_write_block(buf, tmp, (uint32_t)got) != 0) {
+                for (size_t i = 0; i < got; i++) psp_write8(buf + (uint32_t)i, tmp[i]);
+            }
+            free(tmp);
+        }
+    } else {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        if (sz > 0) got = (size_t)sz;
+    }
+    fclose(fp);
+    psp_write32(param + 0x7Cu, (uint32_t)got);
+    return SCE_KERNEL_ERROR_OK;
+}
+
+static uint32_t savedata_save_slot(uint32_t param, const char *game, const char *save,
+                                   const char *file) {
+    char dir[1024], path[1088];
+    if (savedata_path(game, save, file, dir, sizeof dir, path, sizeof path) != 0)
+        return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+    ensure_dir_tree(dir);
+
+    uint32_t buf = psp_read32(param + 0x74u);
+    uint32_t sz  = psp_read32(param + 0x7Cu);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return 0x80110381u;
+    if (buf && sz) {
+        uint8_t *tmp = (uint8_t *)malloc(sz);
+        if (tmp) {
+            for (uint32_t i = 0; i < sz; i++) tmp[i] = psp_read8(buf + i);
+            fwrite(tmp, 1, sz, fp);
+            free(tmp);
+        }
+    }
+    fclose(fp);
+    return SCE_KERNEL_ERROR_OK;
+}
+
+static uint32_t savedata_pick_list_slot(uint32_t list_ptr, const char *game,
+                                        const char *file, int want_existing,
+                                        char *chosen, size_t chosen_cap) {
+    if (!list_ptr || !psp_mem_ptr(list_ptr, 20)) return 0;
+    for (int i = 0; i < 256; i++) {
+        char slot[20];
+        read_guest_cstr(list_ptr + (uint32_t)(i * 20), slot, sizeof slot);
+        if (!slot[0]) break;
+        char dir[1024], path[1088];
+        if (savedata_path(game, slot, file, dir, sizeof dir, path, sizeof path) == 0) {
+            if (file_exists(path) == want_existing) {
+                snprintf(chosen, chosen_cap, "%s", slot);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void savedata_write_name(uint32_t param, const char *save) {
+    for (size_t i = 0; i < 20; i++) {
+        uint8_t c = (i < strlen(save)) ? (uint8_t)save[i] : 0;
+        psp_write8(param + 0x4Cu + (uint32_t)i, c);
+    }
+}
+
+static void hle_UtilitySavedataInitStart(void) {
+    uint32_t param = psp_arg(0);
+    if (!param || !psp_mem_ptr(param, 0x80)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+        return;
+    }
+    if (g_savedata_status != PSP_UTILITY_DIALOG_NONE &&
+        g_savedata_status != PSP_UTILITY_DIALOG_FINISHED) {
+        psp_ret(SCE_UTILITY_ERROR_BUSY);
+        return;
+    }
+
+    uint32_t mode = psp_read32(param + 0x30u);
+    char game[16], save[24], file[16];
+    read_guest_cstr(param + 0x3Cu, game, sizeof game);
+    read_guest_cstr(param + 0x4Cu, save, sizeof save);
+    read_guest_cstr(param + 0x64u, file, sizeof file);
+    uint32_t list_ptr = psp_read32(param + 0x60u);
+
+    uint32_t res = SCE_KERNEL_ERROR_OK;
+    switch (mode) {
+    case 0: /* AUTOLOAD */
+    case 2: /* LOAD */
+    case 15: /* READDATASECURE */
+    case 16: /* READDATA */
+        if ((!save[0] || strcmp(save, "<>") == 0) &&
+            savedata_pick_list_slot(list_ptr, game, file, 1, save, sizeof save)) {
+            savedata_write_name(param, save);
+        }
+        res = savedata_load_slot(param, game, save, file);
+        break;
+    case 4: /* LISTLOAD */
+        if (savedata_pick_list_slot(list_ptr, game, file, 1, save, sizeof save)) {
+            savedata_write_name(param, save);
+            res = savedata_load_slot(param, game, save, file);
+        } else {
+            res = SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA;
+        }
+        break;
+    case 1: /* AUTOSAVE */
+    case 3: /* SAVE */
+    case 13: /* MAKEDATASECURE */
+    case 14: /* MAKEDATA */
+    case 17: /* WRITEDATASECURE */
+    case 18: /* WRITEDATA */
+        if (!save[0] || strcmp(save, "<>") == 0) {
+            if (!savedata_pick_list_slot(list_ptr, game, file, 0, save, sizeof save))
+                snprintf(save, sizeof save, "0000");
+            savedata_write_name(param, save);
+        }
+        res = savedata_save_slot(param, game, save, file);
+        break;
+    case 5: /* LISTSAVE */
+        if (!savedata_pick_list_slot(list_ptr, game, file, 0, save, sizeof save)) {
+            if (!savedata_pick_list_slot(list_ptr, game, file, 1, save, sizeof save))
+                snprintf(save, sizeof save, "0000");
+        }
+        savedata_write_name(param, save);
+        res = savedata_save_slot(param, game, save, file);
+        break;
+    case 6: /* LISTDELETE */
+    case 7: /* DELETE */
+    case 9: /* AUTODELETE */
+    case 10: /* SINGLEDELETE */
+    case 19: /* ERASESECURE */
+    case 20: /* ERASE */
+    case 21: /* DELETEDATA */ {
+        if (mode == 6)
+            savedata_pick_list_slot(list_ptr, game, file, 1, save, sizeof save);
+        char dir[1024], path[1088];
+        if (savedata_path(game, save, file, dir, sizeof dir, path, sizeof path) == 0 &&
+            remove(path) == 0) {
+            res = SCE_KERNEL_ERROR_OK;
+        } else {
+            res = SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA;
+        }
+        break;
+    }
+    case 8: /* SIZES */
+    case 22: /* GETSIZE */ {
+        uint32_t ms_free = psp_read32(param + 0x5D0u);
+        if (ms_free && psp_mem_ptr(ms_free, 16)) {
+            psp_write32(ms_free + 0, 32768u);
+            psp_write32(ms_free + 4, 4096u);
+            psp_write32(ms_free + 8, 131072u);
+        }
+        uint32_t size_info = psp_read32(param + 0x5FCu);
+        if (size_info && psp_mem_ptr(size_info, 64)) {
+            psp_write32(size_info + 36, 4096u);
+            psp_write32(size_info + 40, 131072u);
+        }
+        res = SCE_KERNEL_ERROR_OK;
+        break;
+    }
+    default:
+        res = SCE_KERNEL_ERROR_OK;
+        break;
+    }
+
+    psp_write32(param + 0x1Cu, res);
+    g_savedata_status = PSP_UTILITY_DIALOG_INIT;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static int utility_poll_status(int *status) {
+    int cur = *status;
+    if (cur == PSP_UTILITY_DIALOG_INIT) *status = PSP_UTILITY_DIALOG_VISIBLE;
+    else if (cur == PSP_UTILITY_DIALOG_FINISHED) *status = PSP_UTILITY_DIALOG_NONE;
+    return cur;
+}
+
+static void hle_UtilitySavedataGetStatus(void) {
+    psp_ret((uint32_t)utility_poll_status(&g_savedata_status));
+}
+
+static void hle_UtilitySavedataUpdate(void) {
+    if (g_savedata_status == PSP_UTILITY_DIALOG_VISIBLE)
+        g_savedata_status = PSP_UTILITY_DIALOG_QUIT;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilitySavedataShutdownStart(void) {
+    if (g_savedata_status != PSP_UTILITY_DIALOG_NONE)
+        g_savedata_status = PSP_UTILITY_DIALOG_FINISHED;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityMsgDialogInitStart(void) {
+    uint32_t param = psp_arg(0);
+    if (!param || !psp_mem_ptr(param, 48)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+        return;
+    }
+    if (g_msgdialog_status != PSP_UTILITY_DIALOG_NONE &&
+        g_msgdialog_status != PSP_UTILITY_DIALOG_FINISHED) {
+        psp_ret(SCE_UTILITY_ERROR_BUSY);
+        return;
+    }
+    uint32_t sz = psp_read32(param);
+    psp_write32(param + 0x1Cu, SCE_KERNEL_ERROR_OK);
+    if (sz >= 0x244u && psp_mem_ptr(param, 0x244u)) {
+        uint32_t opts = psp_read32(param + 0x23Cu);
+        psp_write32(param + 0x240u, (opts & 0x10u) ? 1u : 3u); /* YES or BACK */
+    }
+    g_msgdialog_status = PSP_UTILITY_DIALOG_INIT;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityMsgDialogGetStatus(void) {
+    psp_ret((uint32_t)utility_poll_status(&g_msgdialog_status));
+}
+
+static void hle_UtilityMsgDialogUpdate(void) {
+    if (g_msgdialog_status == PSP_UTILITY_DIALOG_VISIBLE)
+        g_msgdialog_status = PSP_UTILITY_DIALOG_QUIT;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityMsgDialogShutdownStart(void) {
+    if (g_msgdialog_status != PSP_UTILITY_DIALOG_NONE)
+        g_msgdialog_status = PSP_UTILITY_DIALOG_FINISHED;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UtilityMsgDialogAbort(void) {
+    if (g_msgdialog_status != PSP_UTILITY_DIALOG_NONE)
+        g_msgdialog_status = PSP_UTILITY_DIALOG_FINISHED;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_misc_reset(void) {
     g_vmem_locked = 0;
     g_umd_cbid = 0;
     g_rtc_start_ns = 0;
+    g_savedata_status = PSP_UTILITY_DIALOG_NONE;
+    g_msgdialog_status = PSP_UTILITY_DIALOG_NONE;
     /* The interrupt mask is per thread and lives in the scheduler; a reset
      * here cannot reach another thread's bracket, and should not. */
     g_exit_requested = 0;
@@ -564,6 +894,15 @@ void psp_misc_register(void) {
     psp_hle_register(0x34B78343, "sceUtility", "sceUtilityGetSystemParamString", hle_UtilityGetSystemParamString);
     psp_hle_register(0x2A2B3DE0, "sceUtility", "sceUtilityLoadModule",           hle_ok);
     psp_hle_register(0xE49BFE92, "sceUtility", "sceUtilityUnloadModule",         hle_ok);
+    psp_hle_register(0x50C4CD57, "sceUtility", "sceUtilitySavedataInitStart",    hle_UtilitySavedataInitStart);
+    psp_hle_register(0x8874DBE0, "sceUtility", "sceUtilitySavedataGetStatus",    hle_UtilitySavedataGetStatus);
+    psp_hle_register(0xD4B95FFB, "sceUtility", "sceUtilitySavedataUpdate",       hle_UtilitySavedataUpdate);
+    psp_hle_register(0x9790B33C, "sceUtility", "sceUtilitySavedataShutdownStart", hle_UtilitySavedataShutdownStart);
+    psp_hle_register(0x2AD8E239, "sceUtility", "sceUtilityMsgDialogInitStart",   hle_UtilityMsgDialogInitStart);
+    psp_hle_register(0x9A1C91D7, "sceUtility", "sceUtilityMsgDialogGetStatus",   hle_UtilityMsgDialogGetStatus);
+    psp_hle_register(0x95FC253B, "sceUtility", "sceUtilityMsgDialogUpdate",      hle_UtilityMsgDialogUpdate);
+    psp_hle_register(0x67AF3428, "sceUtility", "sceUtilityMsgDialogShutdownStart", hle_UtilityMsgDialogShutdownStart);
+    psp_hle_register(0x4928BD96, "sceUtility", "sceUtilityMsgDialogAbort",       hle_UtilityMsgDialogAbort);
 
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);

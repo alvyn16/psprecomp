@@ -1119,6 +1119,68 @@ static void test_extra_hle(void) {
     CHECK(call(0x54F5FB11u, 0x08800480u, 0, 0, 0) == 0, "sceIoDevctl");
     CHECK(call(0x55F4717Du, 0x08800480u, 0, 0, 0) == 0, "sceIoChdir");
     CHECK(call(0xAB96437Fu, 0x08800480u, 0, 0, 0) == 0, "sceIoSync");
+
+    /* Savedata + MsgDialog utility state machines */
+    test_mkdir("/tmp/psprecomp_hle_test");
+    psp_io_set_root("/tmp/psprecomp_hle_test");
+    const uint32_t sd = 0x08820000u, sbuf = 0x08821000u;
+    for (uint32_t i = 0; i < 0x600u; i += 4) psp_write32(sd + i, 0);
+    psp_write32(sd + 0x00u, 0x600u);
+    psp_write32(sd + 0x30u, 1u); /* AUTOSAVE */
+    write_guest_str(sd + 0x3Cu, "ULES01388");
+    write_guest_str(sd + 0x4Cu, "0001");
+    write_guest_str(sd + 0x64u, "DATA.BIN");
+    psp_write32(sbuf, 0x12345678u);
+    psp_write32(sd + 0x74u, sbuf);
+    psp_write32(sd + 0x78u, 16u);
+    psp_write32(sd + 0x7Cu, 4u);
+    CHECK(call(0x50C4CD57u, sd, 0, 0, 0) == 0, "SavedataInitStart save");
+    CHECK(psp_read32(sd + 0x1Cu) == 0, "Savedata save result ok");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 1, "Savedata INIT");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 2, "Savedata VISIBLE");
+    CHECK(call(0xD4B95FFBu, 1, 0, 0, 0) == 0, "SavedataUpdate");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 3, "Savedata QUIT");
+    CHECK(call(0x9790B33Cu, 0, 0, 0, 0) == 0, "SavedataShutdownStart");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 4, "Savedata FINISHED");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 0, "Savedata NONE");
+
+    psp_write32(sbuf, 0);
+    psp_write32(sd + 0x30u, 0u); /* AUTOLOAD */
+    psp_write32(sd + 0x7Cu, 0u);
+    CHECK(call(0x50C4CD57u, sd, 0, 0, 0) == 0, "SavedataInitStart load");
+    CHECK(psp_read32(sd + 0x1Cu) == 0 && psp_read32(sd + 0x7Cu) == 4 &&
+          psp_read32(sbuf) == 0x12345678u, "Savedata autoload roundtrip");
+    CHECK(call(0x8874DBE0u, 0, 0, 0, 0) == 1 && call(0x8874DBE0u, 0, 0, 0, 0) == 2 &&
+          call(0xD4B95FFBu, 1, 0, 0, 0) == 0 && call(0x9790B33Cu, 0, 0, 0, 0) == 0 &&
+          call(0x8874DBE0u, 0, 0, 0, 0) == 4 && call(0x8874DBE0u, 0, 0, 0, 0) == 0,
+          "Savedata second cycle");
+
+    psp_write32(sd + 0x30u, 7u); /* DELETE */
+    CHECK(call(0x50C4CD57u, sd, 0, 0, 0) == 0 && psp_read32(sd + 0x1Cu) == 0, "Savedata delete");
+    CHECK(call(0x9790B33Cu, 0, 0, 0, 0) == 0 && call(0x8874DBE0u, 0, 0, 0, 0) == 4 &&
+          call(0x8874DBE0u, 0, 0, 0, 0) == 0, "Savedata cleanup");
+
+    psp_write32(sd + 0x30u, 0u); /* AUTOLOAD missing */
+    CHECK(call(0x50C4CD57u, sd, 0, 0, 0) == 0 && psp_read32(sd + 0x1Cu) == 0x80110307u,
+          "Savedata missing returns LOAD_NO_DATA");
+    CHECK(call(0x9790B33Cu, 0, 0, 0, 0) == 0 && call(0x8874DBE0u, 0, 0, 0, 0) == 4 &&
+          call(0x8874DBE0u, 0, 0, 0, 0) == 0, "Savedata missing cleanup");
+    test_rmdir("/tmp/psprecomp_hle_test/ms/PSP/SAVEDATA/ULES013880001");
+    test_rmdir("/tmp/psprecomp_hle_test/ms/PSP/SAVEDATA");
+    test_rmdir("/tmp/psprecomp_hle_test/ms/PSP");
+    test_rmdir("/tmp/psprecomp_hle_test/ms");
+    test_rmdir("/tmp/psprecomp_hle_test");
+
+    const uint32_t md = 0x08822000u;
+    for (uint32_t i = 0; i < 0x260u; i += 4) psp_write32(md + i, 0);
+    psp_write32(md + 0x00u, 0x244u);
+    psp_write32(md + 0x23Cu, 0x10u);
+    CHECK(call(0x2AD8E239u, md, 0, 0, 0) == 0, "MsgDialogInitStart");
+    CHECK(psp_read32(md + 0x240u) == 1u, "MsgDialog YES button");
+    CHECK(call(0x9A1C91D7u, 0, 0, 0, 0) == 1 && call(0x9A1C91D7u, 0, 0, 0, 0) == 2 &&
+          call(0x95FC253Bu, 1, 0, 0, 0) == 0 && call(0x9A1C91D7u, 0, 0, 0, 0) == 3 &&
+          call(0x67AF3428u, 0, 0, 0, 0) == 0 && call(0x9A1C91D7u, 0, 0, 0, 0) == 4 &&
+          call(0x9A1C91D7u, 0, 0, 0, 0) == 0, "MsgDialog lifecycle");
 }
 
 int main(void) {

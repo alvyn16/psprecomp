@@ -93,6 +93,10 @@ void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
 }
 
+const char *psp_io_get_root(void) {
+    return g_root[0] ? g_root : ".";
+}
+
 void psp_io_reset(void) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
