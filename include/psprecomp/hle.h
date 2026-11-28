@@ -188,7 +188,12 @@ uint64_t psp_audio_blocks(void);
  * Pass NULL to detach. The callback may run on the guest thread. */
 typedef void (*psp_audio_sink_fn)(const int16_t *stereo, uint32_t frames,
                                   uint32_t rate, void *user);
+typedef void (*psp_audio_channel_sink_fn)(int source, const int16_t *stereo,
+                                          uint32_t frames, uint32_t rate, void *user);
 void psp_audio_sink_set(psp_audio_sink_fn fn, void *user);
+void psp_audio_channel_sink_set(psp_audio_channel_sink_fn fn, void *user);
+int  psp_audio_output_active(void);
+void psp_audio_submit(int source, const int16_t *stereo, uint32_t frames, uint32_t rate);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

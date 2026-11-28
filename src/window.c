@@ -219,25 +219,49 @@ static SDL_GameController *g_pad;
 static SDL_Thread *g_thread;
 static int g_focused;
 static SDL_JoystickID g_pad_instance = -1;
+#define AUDIO_RING_FRAMES 16384u
+#define AUDIO_SOURCES     16u
+
 static SDL_mutex *g_audio_lock;
 static SDL_AudioDeviceID g_audio_dev;
-static int16_t g_audio_ring[8192 * 2];
-static size_t g_audio_head, g_audio_tail;   /* indices in frames */
+static int32_t  g_audio_mix[AUDIO_RING_FRAMES * 2u];
+static uint64_t g_audio_src_pos[AUDIO_SOURCES];
+static uint64_t g_audio_tail, g_audio_max_head;
 
-/* The SAS mixer calls this with the same stereo grain it writes to guest
- * memory. Buffer it for SDL's audio thread; on overrun the oldest frames are
- * dropped rather than blocking the guest. */
-static void audio_sink(const int16_t *stereo, uint32_t frames, uint32_t rate, void *user) {
+/* Mix each guest audio stream (hardware channels 0..7, Output2 stream 8, or
+ * raw SAS fallback 9) by its own write cursor into a shared accumulation ring
+ * so concurrent streams (e.g. FMV audio + FMOD) mix without fighting for one FIFO. */
+static void audio_ch_sink(int source, const int16_t *stereo, uint32_t frames,
+                          uint32_t rate, void *user) {
     (void)rate; (void)user;
-    if (!g_audio_lock || !g_audio_dev) return;
+    if (!g_audio_lock || !g_audio_dev || !frames) return;
+    unsigned src = (unsigned)source < AUDIO_SOURCES ? (unsigned)source : 0u;
     SDL_LockMutex(g_audio_lock);
-    for (uint32_t i = 0; i < frames; i++) {
-        if ((g_audio_head + 1) % 8192 == g_audio_tail) g_audio_tail = (g_audio_tail + 1) % 8192;
-        g_audio_ring[g_audio_head * 2]     = stereo[i * 2];
-        g_audio_ring[g_audio_head * 2 + 1] = stereo[i * 2 + 1];
-        g_audio_head = (g_audio_head + 1) % 8192;
+    if (g_audio_src_pos[src] < g_audio_tail) g_audio_src_pos[src] = g_audio_tail;
+    uint32_t off = 0;
+    if (frames > AUDIO_RING_FRAMES) {
+        off = frames - (uint32_t)AUDIO_RING_FRAMES;
+        frames = (uint32_t)AUDIO_RING_FRAMES;
     }
+    while (g_audio_src_pos[src] + frames - g_audio_tail > AUDIO_RING_FRAMES) {
+        size_t idx = (size_t)(g_audio_tail & (AUDIO_RING_FRAMES - 1u)) * 2u;
+        g_audio_mix[idx] = g_audio_mix[idx + 1] = 0;
+        g_audio_tail++;
+    }
+    for (uint32_t i = 0; i < frames; i++) {
+        size_t idx = (size_t)((g_audio_src_pos[src] + i) & (AUDIO_RING_FRAMES - 1u)) * 2u;
+        g_audio_mix[idx]     += stereo[(off + i) * 2u];
+        g_audio_mix[idx + 1] += stereo[(off + i) * 2u + 1u];
+    }
+    g_audio_src_pos[src] += frames;
+    if (g_audio_src_pos[src] > g_audio_max_head) g_audio_max_head = g_audio_src_pos[src];
     SDL_UnlockMutex(g_audio_lock);
+}
+
+static int16_t clamp_pcm(int32_t v) {
+    if (v >  32767) return  32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
 }
 
 static void audio_callback(void *user, Uint8 *stream, int len) {
@@ -247,10 +271,12 @@ static void audio_callback(void *user, Uint8 *stream, int len) {
     if (!g_audio_lock) { memset(stream, 0, (size_t)len); return; }
     SDL_LockMutex(g_audio_lock);
     for (size_t i = 0; i < want; i++) {
-        if (g_audio_tail == g_audio_head) { out[i * 2] = out[i * 2 + 1] = 0; continue; }
-        out[i * 2]     = g_audio_ring[g_audio_tail * 2];
-        out[i * 2 + 1] = g_audio_ring[g_audio_tail * 2 + 1];
-        g_audio_tail = (g_audio_tail + 1) % 8192;
+        if (g_audio_tail >= g_audio_max_head) { out[i * 2] = out[i * 2 + 1] = 0; continue; }
+        size_t idx = (size_t)(g_audio_tail & (AUDIO_RING_FRAMES - 1u)) * 2u;
+        out[i * 2]     = clamp_pcm(g_audio_mix[idx]);
+        out[i * 2 + 1] = clamp_pcm(g_audio_mix[idx + 1]);
+        g_audio_mix[idx] = g_audio_mix[idx + 1] = 0;
+        g_audio_tail++;
     }
     SDL_UnlockMutex(g_audio_lock);
 }
@@ -412,6 +438,7 @@ static int SDLCALL window_main(void *arg) {
 }
 
 static void audio_shutdown(void) {
+    psp_audio_channel_sink_set(NULL, NULL);
     psp_audio_sink_set(NULL, NULL);
     if (g_audio_dev) {
         SDL_PauseAudioDevice(g_audio_dev, 1);
@@ -448,7 +475,9 @@ int psp_window_start(const char *title, int scale) {
 
     /* SAS keeps mixing into guest memory regardless; a host audio device just
      * makes the same frames audible. No device is not a fatal error. */
-    g_audio_head = g_audio_tail = 0;
+    memset(g_audio_mix, 0, sizeof g_audio_mix);
+    memset(g_audio_src_pos, 0, sizeof g_audio_src_pos);
+    g_audio_tail = g_audio_max_head = 0;
     g_audio_lock = SDL_CreateMutex();
     if (g_audio_lock) {
         SDL_AudioSpec want;
@@ -460,7 +489,7 @@ int psp_window_start(const char *title, int scale) {
         want.callback = audio_callback;
         g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
         if (g_audio_dev) {
-            psp_audio_sink_set(audio_sink, NULL);
+            psp_audio_channel_sink_set(audio_ch_sink, NULL);
             SDL_PauseAudioDevice(g_audio_dev, 0);
         } else {
             fprintf(stderr, "psprecomp: no audio device; sound stays mixed in memory\n");

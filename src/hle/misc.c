@@ -250,11 +250,63 @@ static void hle_ReadBufferPositive(void) {
 
 #define AUDIO_CHANNELS 8
 
-typedef struct { int reserved; uint32_t samples; uint32_t format; } audio_ch;
+typedef struct { int reserved; uint32_t samples; uint32_t format; uint32_t lvol; uint32_t rvol; } audio_ch;
 static audio_ch g_audio[AUDIO_CHANNELS];
 static uint64_t g_audio_blocks;
+static int g_audio_output_claimed;
+static psp_audio_sink_fn g_sink;
+static void *g_sink_user;
+static psp_audio_channel_sink_fn g_ch_sink;
+static void *g_ch_sink_user;
 
 uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
+void psp_audio_sink_set(psp_audio_sink_fn fn, void *user) { g_sink = fn; g_sink_user = user; }
+void psp_audio_channel_sink_set(psp_audio_channel_sink_fn fn, void *user) {
+    g_ch_sink = fn;
+    g_ch_sink_user = user;
+}
+int psp_audio_output_active(void) { return g_audio_output_claimed; }
+
+void psp_audio_submit(int source, const int16_t *stereo, uint32_t frames, uint32_t rate) {
+    if (g_ch_sink) g_ch_sink(source, stereo, frames, rate, g_ch_sink_user);
+    else if (g_sink) g_sink(stereo, frames, rate, g_sink_user);
+}
+
+static void submit_guest_pcm(int source, uint32_t buf, uint32_t samples,
+                             uint32_t lvol, uint32_t rvol, int mono) {
+    if (!buf || !samples || (!g_ch_sink && !g_sink)) return;
+    const uint32_t bytes = samples * (mono ? 2u : 4u);
+    const uint8_t *raw = (const uint8_t *)psp_mem_ptr(buf, bytes);
+    if (!raw) return;
+
+    int16_t tmp[512 * 2];
+    uint32_t done = 0;
+    while (done < samples) {
+        uint32_t chunk = samples - done;
+        if (chunk > 512u) chunk = 512u;
+        for (uint32_t i = 0; i < chunk; i++) {
+            int32_t l, r;
+            if (mono) {
+                int16_t s;
+                memcpy(&s, raw + (done + i) * 2u, 2);
+                l = ((int32_t)s * (int32_t)lvol) >> 15;
+                r = ((int32_t)s * (int32_t)rvol) >> 15;
+            } else {
+                int16_t sl, sr;
+                memcpy(&sl, raw + (done + i) * 4u, 2);
+                memcpy(&sr, raw + (done + i) * 4u + 2u, 2);
+                l = ((int32_t)sl * (int32_t)lvol) >> 15;
+                r = ((int32_t)sr * (int32_t)rvol) >> 15;
+            }
+            if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+            if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+            tmp[i * 2]     = (int16_t)l;
+            tmp[i * 2 + 1] = (int16_t)r;
+        }
+        psp_audio_submit(source, tmp, chunk, 44100u);
+        done += chunk;
+    }
+}
 
 static void hle_ChReserve(void) {
     if (getenv("PSPRECOMP_TRACE_SAS"))
@@ -270,6 +322,9 @@ static void hle_ChReserve(void) {
     g_audio[ch].reserved = 1;
     g_audio[ch].samples = psp_arg(1);
     g_audio[ch].format  = psp_arg(2);
+    g_audio[ch].lvol    = 0x8000u;
+    g_audio[ch].rvol    = 0x8000u;
+    g_audio_output_claimed = 1;
     psp_ret((uint32_t)ch);
 }
 
@@ -280,11 +335,20 @@ static void hle_ChRelease(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Nothing consumes the samples; the block count is what tells you audio is
- * flowing. */
-static void hle_Output(void) {
+static uint32_t output_channel_pcm(uint32_t ch, uint32_t lvol, uint32_t rvol, uint32_t buf) {
     g_audio_blocks++;
-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
+    if (ch >= AUDIO_CHANNELS) return 0;
+    g_audio_output_claimed = 1;
+    uint32_t lv = (int32_t)lvol >= 0 ? lvol : g_audio[ch].lvol;
+    uint32_t rv = (int32_t)rvol >= 0 ? rvol : g_audio[ch].rvol;
+    g_audio[ch].lvol = lv;
+    g_audio[ch].rvol = rv;
+    submit_guest_pcm((int)ch, buf, g_audio[ch].samples, lv, rv, g_audio[ch].format == 0x10);
+    return g_audio[ch].samples;
+}
+
+static void hle_OutputPanned(void) {
+    psp_ret(output_channel_pcm(psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3)));
 }
 
 /* The blocking forms hold the caller while the hardware drains a buffer, and
@@ -309,13 +373,7 @@ static uint64_t host_now_us(void) {
 static uint64_t g_audio_due_us[AUDIO_CHANNELS];
 #endif
 
-static void hle_OutputBlocking(void) {
-    uint32_t ch = psp_arg(0);
-    uint32_t samples = ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
-    static int traced;
-    if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
-        fprintf(stderr, "audio: OutputBlocking ch %u samples %u buf 0x%08X\n", ch, samples, psp_arg(2));
-    hle_Output();
+static void wait_channel_pacing(uint32_t ch, uint32_t samples) {
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
     if (ch < AUDIO_CHANNELS) {
@@ -325,8 +383,30 @@ static void hle_OutputBlocking(void) {
         while (host_now_us() + play_us < g_audio_due_us[ch]) psp_threadman_yield();
     }
 #else
+    (void)ch;
     psp_threadman_delay(play_us);
 #endif
+}
+
+static void hle_OutputBlocking(void) {
+    uint32_t ch = psp_arg(0);
+    uint32_t vol = psp_arg(1);
+    uint32_t buf = psp_arg(2);
+    uint32_t samples = output_channel_pcm(ch, vol, vol, buf);
+    static int traced;
+    if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
+        fprintf(stderr, "audio: OutputBlocking ch %u samples %u buf 0x%08X\n", ch, samples, buf);
+    wait_channel_pacing(ch, samples);
+    psp_ret(samples);
+}
+
+static void hle_OutputPannedBlocking(void) {
+    uint32_t ch = psp_arg(0);
+    uint32_t samples = output_channel_pcm(ch, psp_arg(1), psp_arg(2), psp_arg(3));
+    static int traced;
+    if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
+        fprintf(stderr, "audio: OutputPannedBlocking ch %u samples %u buf 0x%08X\n", ch, samples, psp_arg(3));
+    wait_channel_pacing(ch, samples);
     psp_ret(samples);
 }
 
@@ -342,13 +422,25 @@ static uint64_t g_output2_due_us;
 
 static void hle_Output2Reserve(void) {
     g_output2_samples = psp_arg(0);
+    g_audio_output_claimed = 1;
+    if (getenv("PSPRECOMP_TRACE_SAS"))
+        fprintf(stderr, "audio: Output2Reserve samples %u\n", g_output2_samples);
     psp_ret(0);                       /* the single output's id on success */
 }
 
 static void hle_Output2OutputBlocking(void) {
-    /* (volume, samples) -- the return value is the sample count played. */
+    /* (volume, buf) -- the return value is the sample count played. */
+    uint32_t vol = psp_arg(0);
+    uint32_t buf = psp_arg(1);
     uint32_t samples = g_output2_samples ? g_output2_samples : 256u;
     g_audio_blocks++;
+    g_audio_output_claimed = 1;
+    static int traced;
+    if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
+        fprintf(stderr, "audio: Output2OutputBlocking vol 0x%X samples %u buf 0x%08X\n",
+                vol, samples, buf);
+    uint32_t v = (int32_t)vol >= 0 ? vol : 0x8000u;
+    submit_guest_pcm(8, buf, samples, v, v, 0);
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
     uint64_t now = host_now_us();
@@ -844,7 +936,10 @@ void psp_misc_reset(void) {
     memset(g_audio, 0, sizeof g_audio);
 #if PSPRECOMP_REAL_THREADS
     memset(g_audio_due_us, 0, sizeof g_audio_due_us);
+    g_output2_due_us = 0;
 #endif
+    g_output2_samples = 0;
+    g_audio_output_claimed = 0;
     g_audio_blocks = 0;
 }
 
@@ -929,8 +1024,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
     psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputBlocking);
-    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_Output);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPannedBlocking);
+    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPanned);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);

@@ -90,14 +90,6 @@ void psp_sas_init(void) { psp_sas_reset(); }
 uint64_t psp_sas_frames(void)   { return g_frames_rendered; }
 uint64_t psp_sas_nonzero(void)  { return g_samples_nonzero; }
 
-static psp_audio_sink_fn g_sink;
-static void *g_sink_user;
-
-void psp_audio_sink_set(psp_audio_sink_fn fn, void *user) {
-    g_sink = fn;
-    g_sink_user = user;
-}
-
 static int clamp16(int v) {
     if (v >  32767) return  32767;
     if (v < -32768) return -32768;
@@ -370,7 +362,7 @@ static void mix_to_guest(uint32_t out_addr, int add) {
         psp_write16(out_addr + i * 4 + 2, (uint16_t)(int16_t)sr);
         if (sl || sr) g_samples_nonzero++;
     }
-    if (g_sink) g_sink(host, n, g_sample_rate, g_sink_user);
+    if (!psp_audio_output_active()) psp_audio_submit(9, host, n, g_sample_rate);
     g_frames_rendered++;
     if (sas_trace() && (g_frames_rendered <= 20 || g_frames_rendered % 64 == 0)) {
         int playing = 0;
