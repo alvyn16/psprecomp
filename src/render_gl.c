@@ -873,6 +873,14 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
         }
     }
     if (!decoded) {
+        if (g_prof_gl > 0) {
+            static int miss_log;
+            if (miss_log < 12) {
+                miss_log++;
+                fprintf(stderr, "prof_tex_slow: fmt=%d w=%d h=%d bw=%d swz=%d clut=%d\n",
+                        st->tex_fmt, w, h, st->tex_bw, st->tex_swizzle, st->clut != NULL);
+            }
+        }
         psp_draw_state tmp = *st;
         tmp.tex_clamp_u = 1;
         tmp.tex_clamp_v = 1;
@@ -976,55 +984,22 @@ static void sync_scale_if_needed(void) {
 }
 
 static void capture_fbo_to_front(gl_fbo *f, int sync_now) {
+    (void)sync_now;
     if (!f || !f->has_draws || !g_front_lock || !g_front_px) return;
     const int w = BASE_W * f->scale;
     const int h = BASE_H * f->scale;
     if (w > BASE_W * MAX_SCALE || h > BASE_H * MAX_SCALE) return;
-    const size_t bytes = (size_t)w * (size_t)h * 4u;
 
     uint64_t rt0 = g_prof_gl > 0 ? prof_us() : 0;
     g_gl.BindFramebuffer(GL_FRAMEBUFFER, f->fbo);
     g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
-
-    if (sync_now || !g_pbo[0] || !g_pbo_primed || g_pbo_w != w || g_pbo_h != h) {
-        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        SDL_LockMutex(g_front_lock);
-        g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
-        g_front_w = w;
-        g_front_h = h;
-        g_front_valid = 1;
-        SDL_UnlockMutex(g_front_lock);
-        psp_render_bump_front_gen();
-
-        if (!sync_now && g_pbo[0]) {
-            for (int i = 0; i < 2; i++) {
-                g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[i]);
-                g_gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
-            }
-            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[0]);
-            g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            g_pbo_w = w;
-            g_pbo_h = h;
-            g_pbo_idx = 1;
-            g_pbo_primed = 1;
-        }
-    } else {
-        const int read_idx = g_pbo_idx ^ 1;
-        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[read_idx]);
-        SDL_LockMutex(g_front_lock);
-        g_gl.GetBufferSubData(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)bytes, g_front_px);
-        g_front_w = w;
-        g_front_h = h;
-        g_front_valid = 1;
-        SDL_UnlockMutex(g_front_lock);
-        psp_render_bump_front_gen();
-
-        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[g_pbo_idx]);
-        g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        g_pbo_idx ^= 1;
-    }
+    SDL_LockMutex(g_front_lock);
+    g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
+    g_front_w = w;
+    g_front_h = h;
+    g_front_valid = 1;
+    SDL_UnlockMutex(g_front_lock);
+    psp_render_bump_front_gen();
     if (g_prof_gl > 0) g_prof_gl_read_us += prof_us() - rt0;
 }
 
