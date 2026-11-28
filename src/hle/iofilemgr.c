@@ -391,9 +391,14 @@ static void hle_Lseek(void) {
         at = (w == SEEK_SET) ? base + (int64_t)off
            : (w == SEEK_CUR) ? here + (int64_t)off
                              : end + (int64_t)off;
-        if (fseeko(h->f, (off_t)at, SEEK_SET) != 0) { psp_ret(0xFFFFFFFFu); return; }
+        if (at < base || fseeko(h->f, (off_t)at, SEEK_SET) != 0) {
+            psp_cpu.r[PSP_REG_V0] = 0xFFFFFFFFu;
+            psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
+            return;
+        }
     } else if (fseek(h->f, (long)(int64_t)off, w) != 0) {
-        psp_ret(0xFFFFFFFFu);
+        psp_cpu.r[PSP_REG_V0] = 0xFFFFFFFFu;
+        psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
         return;
     }
 
@@ -402,6 +407,9 @@ static void hle_Lseek(void) {
         psp_cpu.r[PSP_REG_V0] = 0xFFFFFFFFu;
         psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
         return;
+    }
+    if (h->pseudo) {
+        h->limit = ((uint64_t)pos < h->window) ? (h->window - (uint64_t)pos) : 0;
     }
     uint64_t upos = (uint64_t)pos;
     psp_cpu.r[PSP_REG_V0] = (uint32_t)upos;

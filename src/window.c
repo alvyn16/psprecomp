@@ -387,6 +387,9 @@ static int SDLCALL window_main(void *arg) {
             }
         }
         if (g_closed) break;
+        /* Sync focus from SDL window flags directly so concurrent UI event
+         * polling cannot leave g_focused stale when clicking into the game window. */
+        g_focused = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
         uint8_t ax = 128, ay = 128;
         psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
         render(r, tex);

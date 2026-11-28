@@ -61,7 +61,7 @@ int main(void) {
     CHECK(iso != NULL, "create a synthetic disc image");
     if (iso) {
         fseek(iso, 2048, SEEK_SET);            /* LBN 1 */
-        fwrite("LBN-OK", 1, 6, iso);
+        fwrite("LBN-OK0123456789", 1, 16, iso);
         fclose(iso);
         psp_io_set_iso(iso_path);
         const char lbn[] = "disc0:/sce_lbn0x1_size0x10";
@@ -77,6 +77,28 @@ int main(void) {
             CHECK(psp_cpu.r[PSP_REG_V0] == 6, "the LBN window reads its bytes");
             CHECK(psp_read8(dst) == 'L' && psp_read32(dst) == 0x2D4E424Cu,
                   "the bytes come from the right sector");
+            /* Reading to the end of the LBN window and seeking back must
+             * restore the remaining-byte cap (looping Bink movies rely on this). */
+            psp_cpu.r[PSP_REG_A0] = (uint32_t)fd;
+            psp_cpu.r[PSP_REG_A1] = dst;
+            psp_cpu.r[PSP_REG_A2] = 32;
+            psp_hle_call(0x6A638D83u);         /* sceIoRead remaining 10 bytes */
+            CHECK(psp_cpu.r[PSP_REG_V0] == 10, "LBN window clamps at size (16 - 6 = 10)");
+            psp_cpu.r[PSP_REG_A0] = (uint32_t)fd;
+            psp_cpu.r[PSP_REG_A1] = 0;
+            psp_cpu.r[PSP_REG_A2] = 0;
+            psp_cpu.r[PSP_REG_A3] = 0;
+            psp_cpu.r[PSP_REG_T0] = 0;         /* SEEK_SET */
+            psp_hle_call(0x27EB27B8u);         /* sceIoLseek back to start */
+            CHECK(psp_cpu.r[PSP_REG_V0] == 0 && psp_cpu.r[PSP_REG_V1] == 0,
+                  "LBN lseek back to 0 succeeds");
+            psp_write32(dst, 0);
+            psp_cpu.r[PSP_REG_A0] = (uint32_t)fd;
+            psp_cpu.r[PSP_REG_A1] = dst;
+            psp_cpu.r[PSP_REG_A2] = 6;
+            psp_hle_call(0x6A638D83u);         /* sceIoRead after rewind */
+            CHECK(psp_cpu.r[PSP_REG_V0] == 6 && psp_read32(dst) == 0x2D4E424Cu,
+                  "LBN read succeeds after rewind to 0");
             close_guest(fd);
         }
         psp_io_set_iso(NULL);
