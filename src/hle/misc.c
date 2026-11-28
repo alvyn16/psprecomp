@@ -540,6 +540,18 @@ static void hle_RtcGetCurrentTick(void) {
     uint32_t tick_ptr = psp_arg(0);
     if (!tick_ptr) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
     uint64_t now = rtc_now_ns();
+    static uint64_t s_last_ns = 0;
+    static uint32_t s_spin_hits = 0;
+    if (now >= s_last_ns && (now - s_last_ns) < 4000ull) {
+        if (++s_spin_hits >= 64u) {
+            s_spin_hits = 0;
+            psp_threadman_delay(200);
+            now = rtc_now_ns();
+        }
+    } else {
+        s_spin_hits = 0;
+    }
+    s_last_ns = now;
     if (!g_rtc_start_ns) g_rtc_start_ns = now;
     uint64_t us = (now - g_rtc_start_ns) / 1000ull;
     psp_write32(tick_ptr, (uint32_t)us);

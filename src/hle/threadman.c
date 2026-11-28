@@ -439,7 +439,7 @@ static int park_us(uint64_t timeout_us) {
     int woken = 0;
     if (t) {
         const uint64_t cap =
-            (t->wait_kind == W_DELAY && timeout_us > TICK_US) ? 1500ull :
+            (t->wait_kind == W_DELAY && timeout_us >= TICK_US) ? 4000ull :
             ((t->wait_kind != W_DELAY && timeout_us >= 5000ull) ? timeout_us : REAL_TICK_US);
         uint64_t real = timeout_us < cap ? timeout_us : cap;
         uint64_t t0 = g_prof_tm ? enter_us : 0;
@@ -893,7 +893,9 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
         }
         uint64_t step = TICK_US;
         if (deadline) {
-            if (deadline - g_vtime_us < step) step = deadline - g_vtime_us;
+            uint64_t rem = deadline - g_vtime_us;
+            if (kind == W_DELAY && rem >= 2000ull) step = rem < 4000ull ? rem : 4000ull;
+            else if (rem < step) step = rem;
         } else if (kind == W_MUTEX || kind == W_SEMA || kind == W_FLAG ||
                    kind == W_VPL || kind == W_THREAD_END) {
 #if PSPRECOMP_REAL_THREADS

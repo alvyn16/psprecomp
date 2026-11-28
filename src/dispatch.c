@@ -21,9 +21,24 @@ typedef struct {
 static slot   *g_table;
 static uint32_t g_cap;      /* always a power of two */
 static uint32_t g_count;
+static uint64_t g_table_gen = 1;
 static uint64_t g_misses;
 static psp_miss_fn_t g_miss;
 static psp_miss_ctx_fn_t g_miss_ctx;
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define DISP_TLS __thread
+#else
+#  define DISP_TLS
+#endif
+
+typedef struct {
+    uint32_t addr;
+    psp_fn_t fn;
+    uint64_t gen;
+} disp_l1_entry;
+
+static DISP_TLS disp_l1_entry g_disp_l1[256];
 
 void psp_set_miss_context(psp_miss_ctx_fn_t fn) { g_miss_ctx = fn; }
 void psp_miss_context(void) { if (g_miss_ctx) g_miss_ctx(); }
@@ -58,13 +73,14 @@ void psp_register(uint32_t addr, psp_fn_t fn) {
     uint32_t m = g_cap - 1;
     uint32_t j = hash_addr(addr) & m;
     while (g_table[j].used) {
-        if (g_table[j].addr == addr) { g_table[j].fn = fn; return; }  /* replace */
+        if (g_table[j].addr == addr) { g_table[j].fn = fn; g_table_gen++; return; }  /* replace */
         j = (j + 1) & m;
     }
     g_table[j].addr = addr;
     g_table[j].fn = fn;
     g_table[j].used = 1;
     g_count++;
+    g_table_gen++;
 }
 
 /* Register an interior label -- a block in the middle of a function that some
@@ -85,6 +101,7 @@ void psp_register_label(uint32_t addr, psp_fn_t fn) {
     g_table[j].fn = fn;
     g_table[j].used = 1;
     g_count++;
+    g_table_gen++;
 }
 
 psp_fn_t psp_lookup(uint32_t addr) {
@@ -245,7 +262,7 @@ CALL_FRAME_NOINLINE void psp_call_guest_addr(uint32_t addr, uint32_t return_site
     if (psp_cpu.unwind == return_site) psp_cpu.unwind = 0;
 }
 
-int psp_ra_is_jump(uint32_t ra) {
+int psp_ra_is_jump_slow(uint32_t ra) {
     const psp_frame *f = psp_cpu.frame;
     if (!f || !f->ret || ra == f->ret) return 0;
     for (const psp_frame *g = f->prev; g && g->ret; g = g->prev)
@@ -258,7 +275,22 @@ void psp_dispatch(uint32_t addr) {
         g_budget = 0;                 /* fire once */
         if (g_over) g_over();
     }
-    psp_fn_t fn = psp_lookup(addr);
+    disp_l1_entry *e = &g_disp_l1[(addr >> 2) & 255u];
+    psp_fn_t fn = (e->addr == addr && e->gen == g_table_gen) ? e->fn : NULL;
+    if (!fn && g_table) {
+        const uint32_t m = g_cap - 1;
+        uint32_t j = hash_addr(addr) & m;
+        while (g_table[j].used) {
+            if (g_table[j].addr == addr) {
+                fn = g_table[j].fn;
+                e->addr = addr;
+                e->fn = fn;
+                e->gen = g_table_gen;
+                break;
+            }
+            j = (j + 1) & m;
+        }
+    }
     if (fn) {
         /* Log the first few *successful* indirect calls. Every session so far
          * has examined only the failures; a working virtual call sitting next
@@ -289,6 +321,7 @@ void psp_dispatch_reset(void) {
     free(g_table);
     g_table = NULL;
     g_cap = g_count = 0;
+    g_table_gen++;
     g_misses = 0;
     g_miss = NULL;
 }

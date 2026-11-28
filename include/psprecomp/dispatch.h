@@ -15,6 +15,7 @@
 #define PSPRECOMP_DISPATCH_H
 
 #include <stdint.h>
+#include "psprecomp/cpu.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,7 +61,16 @@ void psp_call_guest_addr(uint32_t addr, uint32_t return_site);
  *    returns until the one that owns `ra` resumes;
  *  - a jump inside the current call, when `ra` matches no call -- $ra used as a
  *    continuation: returns 1, and the caller dispatches to `ra`. */
-int psp_ra_is_jump(uint32_t ra);
+int psp_ra_is_jump_slow(uint32_t ra);
+static inline
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+int psp_ra_is_jump(uint32_t ra) {
+    const psp_frame *f = psp_cpu.frame;
+    if (!f || !f->ret || ra == f->ret) return 0;
+    return psp_ra_is_jump_slow(ra);
+}
 
 /* Called when psp_dispatch hits an unregistered address. The default prints
  * the address and aborts; a host can override it to log and continue, which is

@@ -706,11 +706,13 @@ static void draw_prim(uint32_t type, uint32_t count) {
     const int isz = ISZ[VT_INDEX(g_ge.vtype)];
     if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
 
+    if (!VT_THROUGH(g_ge.vtype) && g_xf.wvp_dirty) update_wvp();
+
     static psp_vertex v[65536];
-    struct { uint32_t idx; psp_vertex v; } vcache[64];
+    static struct { uint32_t idx; psp_vertex v; } vcache[256];
     const int use_cache = isz && count > 12;
     if (use_cache)
-        for (int i = 0; i < 64; i++) vcache[i].idx = 0xFFFFFFFFu;
+        for (int i = 0; i < 256; i++) vcache[i].idx = 0xFFFFFFFFu;
     uint32_t n = 0;
     for (; n < count; n++) {
         uint32_t idx = n;
@@ -718,7 +720,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
         else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
         else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
         if (use_cache && idx != 0xFFFFFFFFu) {
-            const uint32_t slot = idx & 63u;
+            const uint32_t slot = idx & 255u;
             if (vcache[slot].idx == idx) { v[n] = vcache[slot].v; continue; }
             if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
                              w_off, tex_off, col_off, nrm_off, pos_off, &v[n])) break;
@@ -747,26 +749,38 @@ static void draw_prim(uint32_t type, uint32_t count) {
         type == PSP_PRIM_TRIANGLE_FAN)
         for (uint32_t k = 0; k < n; k++) if (v[k].behind) { need_clip = 1; break; }
     if (need_clip) {
+        enum { CLIP_BATCH_CAP = 65536 * 2 };
+        static psp_vertex clip_buf[CLIP_BATCH_CAP];
         static psp_vertex out[4];
-        if (type == PSP_PRIM_TRIANGLES) {
-            for (uint32_t i = 0; i + 2 < n; i += 3) {
-                psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
-                const int m = clip_near(tri, out);
-                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
-            }
-        } else if (type == PSP_PRIM_TRIANGLE_FAN) {
-            for (uint32_t i = 1; i + 1 < n; i++) {
-                psp_vertex tri[3] = { v[0], v[i], v[i + 1] };
-                const int m = clip_near(tri, out);
-                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
-            }
-        } else {
-            for (uint32_t i = 0; i + 2 < n; i++) {
-                psp_vertex tri[3] = { v[i], v[i + 1], v[i + 2] };
-                const int m = clip_near(tri, out);
-                if (m >= 3) psp_render_current()->draw(PSP_PRIM_TRIANGLE_FAN, out, m, &g_ds);
+        int cn = 0;
+        const uint32_t step = (type == PSP_PRIM_TRIANGLES) ? 3u : 1u;
+        const uint32_t start = (type == PSP_PRIM_TRIANGLE_FAN) ? 1u : 0u;
+        const uint32_t end_off = (type == PSP_PRIM_TRIANGLE_FAN) ? 1u : 2u;
+        for (uint32_t i = start; i + end_off < n; i += step) {
+            psp_vertex tri[3] = {
+                type == PSP_PRIM_TRIANGLE_FAN ? v[0] : v[i],
+                type == PSP_PRIM_TRIANGLE_FAN ? v[i] : v[i + 1],
+                type == PSP_PRIM_TRIANGLE_FAN ? v[i + 1] : v[i + 2]
+            };
+            const int m = clip_near(tri, out);
+            if (m >= 3) {
+                if (cn + 6 > CLIP_BATCH_CAP) {
+                    psp_render_current()->draw(PSP_PRIM_TRIANGLES, clip_buf, cn, &g_ds);
+                    cn = 0;
+                }
+                /* Emit fan out[0..m-1] as triangles preserving provoking vertex. */
+                clip_buf[cn++] = out[0];
+                clip_buf[cn++] = out[1];
+                clip_buf[cn++] = out[2];
+                if (m == 4) {
+                    clip_buf[cn++] = out[0];
+                    clip_buf[cn++] = out[2];
+                    clip_buf[cn++] = out[3];
+                }
             }
         }
+        if (cn > 0)
+            psp_render_current()->draw(PSP_PRIM_TRIANGLES, clip_buf, cn, &g_ds);
     } else {
         psp_render_current()->draw((int)type, v, (int)n, &g_ds);
     }

@@ -39,7 +39,9 @@
 #define BASE_H 272
 #define MAX_SCALE 4
 #define MAX_FBOS 12
-#define TEX_CACHE_SLOTS 128
+#define TEX_CACHE_SETS 64
+#define TEX_CACHE_WAYS 4
+#define TEX_CACHE_SLOTS (TEX_CACHE_SETS * TEX_CACHE_WAYS)
 
 typedef struct {
     float x, y;
@@ -65,6 +67,9 @@ typedef struct {
     int      fmt;
     GLuint   tex;
     uint64_t last_use;
+    GLint    last_fil;
+    int      last_cu;
+    int      last_cv;
 } gl_tex_entry;
 
 /* ---- dynamic GL 1.1 + 3.3 proc table ------------------------------------- */
@@ -144,6 +149,8 @@ typedef struct {
     PFNGLBUFFERDATAPROC              BufferData;
     PFNGLBUFFERSUBDATAPROC           BufferSubData;
     PFNGLGETBUFFERSUBDATAPROC        GetBufferSubData;
+    PFNGLMAPBUFFERRANGEPROC          MapBufferRange;
+    PFNGLUNMAPBUFFERPROC             UnmapBuffer;
     PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray;
     PFNGLVERTEXATTRIBPOINTERPROC     VertexAttribPointer;
     PFNGLCREATESHADERPROC            CreateShader;
@@ -243,6 +250,7 @@ static int        g_presented_this_list = 0;
 
 static int      g_prof_gl = -1;
 static uint64_t g_prof_gl_draws = 0;
+static uint64_t g_prof_gl_batches = 0;
 static uint64_t g_prof_gl_tex_hits = 0;
 static uint64_t g_prof_gl_tex_misses = 0;
 static uint64_t g_prof_gl_tex_us = 0;
@@ -250,6 +258,52 @@ static uint64_t g_prof_gl_draw_us = 0;
 static uint64_t g_prof_gl_read_us = 0;
 static uint64_t g_prof_gl_ctx_us = 0;
 static uint64_t prof_us(void) { return SDL_GetPerformanceCounter() * 1000000ull / SDL_GetPerformanceFrequency(); }
+
+/* Shadowed OpenGL pipeline state to skip redundant driver calls per draw. */
+typedef struct {
+    int       valid;
+    GLuint    fbo;
+    int       vp_w, vp_h;
+    int       scissor_on;
+    int       sx, sy, sw, sh;
+    GLboolean wr, wg, wb, wa;
+    int       cull_on;
+    GLenum    front_face;
+    int       depth_on;
+    GLenum    depth_func;
+    GLboolean depth_mask;
+    int       stencil_on;
+    GLuint    stencil_wmask;
+    GLenum    stencil_func;
+    GLint     stencil_ref;
+    GLuint    stencil_rmask;
+    GLenum    stencil_sfail, stencil_szfail, stencil_szpass;
+    int       blend_on;
+    GLenum    blend_src, blend_dst, blend_op;
+    uint32_t  blend_col;
+    int       have_blend_col;
+    GLuint    prog;
+    GLuint    tex0;
+    int       vao_bound;
+    int       u_clear_mode, u_gouraud, u_tex_enable, u_tex_set;
+    int       u_tw, u_th, u_tex_func, u_tex_alpha, u_tex_double;
+    uint32_t  u_tex_env;
+    int       u_atest, u_atest_func, u_atest_ref, u_atest_mask;
+} gl_state_shadow;
+
+static gl_state_shadow g_sc;
+
+/* Pending batched draw (consecutive identical-state SPRITES or TRIANGLES). */
+static int            g_batch_active = 0;
+static int            g_batch_prim = 0;
+static int            g_batch_count = 0;
+static gl_fbo        *g_batch_fb = NULL;
+static psp_draw_state g_batch_st;
+static uint64_t       g_batch_tex_hash = 0;
+static GLuint         g_batch_tid = 0;
+static int            g_batch_tw = 1, g_batch_th = 1;
+static int            g_batch_sx0 = 0, g_batch_sy0 = 0, g_batch_sx1 = 0, g_batch_sy1 = 0;
+static int            g_batch_aref = 0;
 
 static void (*gl_load_fn(const char *name))(void) {
     void *p = NULL;
@@ -316,6 +370,8 @@ static int load_gl_procs(void) {
     LOAD_GL(BufferData,              PFNGLBUFFERDATAPROC,              "glBufferData");
     LOAD_GL(BufferSubData,           PFNGLBUFFERSUBDATAPROC,           "glBufferSubData");
     LOAD_GL(GetBufferSubData,        PFNGLGETBUFFERSUBDATAPROC,        "glGetBufferSubData");
+    g_gl.MapBufferRange = (PFNGLMAPBUFFERRANGEPROC)gl_load_fn("glMapBufferRange");
+    g_gl.UnmapBuffer    = (PFNGLUNMAPBUFFERPROC)gl_load_fn("glUnmapBuffer");
     LOAD_GL(EnableVertexAttribArray, PFNGLENABLEVERTEXATTRIBARRAYPROC, "glEnableVertexAttribArray");
     LOAD_GL(VertexAttribPointer,     PFNGLVERTEXATTRIBPOINTERPROC,     "glVertexAttribPointer");
     LOAD_GL(CreateShader,            PFNGLCREATESHADERPROC,            "glCreateShader");
@@ -516,6 +572,27 @@ static void release_context_current(void) {
     g_ctx_tid = 0;
 }
 
+static void gl_flush_batch(void);
+
+static void gl_invalidate_state(void) {
+    g_sc.valid = 0;
+}
+
+static void gl_bind_fbo(GLuint fbo) {
+    if (!g_sc.valid || g_sc.fbo != fbo) {
+        g_gl.BindFramebuffer(GL_FRAMEBUFFER, fbo);
+        if (g_sc.valid) g_sc.fbo = fbo;
+    }
+}
+
+static void gl_bind_tex0(GLuint tex) {
+    if (!g_sc.valid || g_sc.tex0 != tex) {
+        g_gl.ActiveTexture(GL_TEXTURE0);
+        g_gl.BindTexture(GL_TEXTURE_2D, tex);
+        if (g_sc.valid) g_sc.tex0 = tex;
+    }
+}
+
 static void drop_all_fbos(void) {
     for (int i = 0; i < MAX_FBOS; i++) {
         if (g_fbos[i].fbo)       g_gl.DeleteFramebuffers(1, &g_fbos[i].fbo);
@@ -523,6 +600,7 @@ static void drop_all_fbos(void) {
         if (g_fbos[i].ds_rbo)    g_gl.DeleteRenderbuffers(1, &g_fbos[i].ds_rbo);
         memset(&g_fbos[i], 0, sizeof g_fbos[i]);
     }
+    gl_invalidate_state();
 }
 
 static void drop_all_textures(void) {
@@ -530,6 +608,7 @@ static void drop_all_textures(void) {
         if (g_tex_cache[i].tex) g_gl.DeleteTextures(1, &g_tex_cache[i].tex);
         memset(&g_tex_cache[i], 0, sizeof g_tex_cache[i]);
     }
+    gl_invalidate_state();
 }
 
 /* Normalize VRAM mirror aliases so FBP and sceDisplaySetFrameBuf match cleanly. */
@@ -563,6 +642,7 @@ static gl_fbo *get_or_create_fbo(uint32_t addr, int stride, int fmt) {
         if (!g_fbos[i].fbo) { slot = i; break; }
     }
     if (slot < 0) {
+        if (g_batch_count > 0) gl_flush_batch();
         /* Evict first non-displayed FBO. */
         uint32_t disp = norm_vram_addr(psp_display_framebuffer());
         slot = 0;
@@ -578,6 +658,7 @@ static gl_fbo *get_or_create_fbo(uint32_t addr, int stride, int fmt) {
     const int sw = BASE_W * g_scale;
     const int sh = BASE_H * g_scale;
 
+    gl_invalidate_state();
     g_gl.GenFramebuffers(1, &f->fbo);
     g_gl.BindFramebuffer(GL_FRAMEBUFFER, f->fbo);
 
@@ -646,7 +727,7 @@ static uint64_t hash_texture(const psp_draw_state *st) {
     const uint8_t *ptr = psp_mem_ptr(st->tex_addr, 4);
     if (ptr) {
         const size_t n32 = byte_len / 4u;
-        const size_t step = n32 > 256u ? n32 / 256u : 1u;
+        const size_t step = n32 > 64u ? n32 / 64u : 1u;
         for (size_t i = 0; i < n32; i += step) {
             uint32_t w;
             memcpy(&w, ptr + i * 4u, 4);
@@ -669,7 +750,24 @@ static uint64_t hash_texture(const psp_draw_state *st) {
     return h;
 }
 
-static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
+static void sync_tex_params(gl_tex_entry *e, GLint fil, int cu, int cv) {
+    gl_bind_tex0(e->tex);
+    if (e->last_fil != fil) {
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fil);
+        e->last_fil = fil;
+    }
+    if (e->last_cu != cu) {
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, cu ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+        e->last_cu = cu;
+    }
+    if (e->last_cv != cv) {
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, cv ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+        e->last_cv = cv;
+    }
+}
+
+static GLuint get_texture_hashed(const psp_draw_state *st, int *out_w, int *out_h, uint64_t hash) {
     int w = st->tex_w > 0 ? st->tex_w : 1;
     int h = st->tex_h > 0 ? st->tex_h : 1;
     if (w > 1024) w = 1024;
@@ -688,7 +786,7 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
             const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
             *out_w = BASE_W;
             *out_h = BASE_H;
-            g_gl.BindTexture(GL_TEXTURE_2D, rt->color_tex);
+            gl_bind_tex0(rt->color_tex);
             g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
             g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fil);
             g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -697,24 +795,20 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
         }
     }
 
-    const uint64_t hash = hash_texture(st);
-    int empty = -1, lru = 0;
+    const int base = (int)(hash & (uint64_t)(TEX_CACHE_SETS - 1)) * TEX_CACHE_WAYS;
+    int empty = -1, lru = base;
     uint64_t best_tick = UINT64_MAX;
+    const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
+    const int cu = st->tex_clamp_u ? 1 : 0;
+    const int cv = st->tex_clamp_v ? 1 : 0;
 
-    for (int i = 0; i < TEX_CACHE_SLOTS; i++) {
+    for (int i = base; i < base + TEX_CACHE_WAYS; i++) {
         if (g_tex_cache[i].tex) {
             if (g_tex_cache[i].hash == hash && g_tex_cache[i].w == w &&
                 g_tex_cache[i].h == h && g_tex_cache[i].fmt == st->tex_fmt) {
                 g_tex_cache[i].last_use = g_tex_use_tick++;
                 if (g_prof_gl > 0) g_prof_gl_tex_hits++;
-                const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
-                g_gl.BindTexture(GL_TEXTURE_2D, g_tex_cache[i].tex);
-                g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
-                g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fil);
-                g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-                g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                sync_tex_params(&g_tex_cache[i], fil, cu, cv);
                 return g_tex_cache[i].tex;
             }
             if (g_tex_cache[i].last_use < best_tick) {
@@ -730,24 +824,36 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
     if (g_prof_gl > 0) g_prof_gl_tex_misses++;
     uint64_t t0 = g_prof_gl > 0 ? prof_us() : 0;
     gl_tex_entry *e = &g_tex_cache[slot];
-    if (!e->tex) g_gl.GenTextures(1, &e->tex);
+    if (!e->tex) {
+        g_gl.GenTextures(1, &e->tex);
+        e->last_fil = 0;
+        e->last_cu = -1;
+        e->last_cv = -1;
+    }
 
     uint32_t *rgba = g_tex_scratch;
     int decoded = 0;
     const int fmt = st->tex_fmt;
     const int bw = st->tex_bw > 0 ? st->tex_bw : w;
-    if (fmt >= 0 && fmt <= PSP_TPSM_T8 && bw >= w) {
+    const int cw = bw < w ? bw : w;
+    if (fmt >= 0 && fmt <= PSP_TPSM_T8) {
         const uint32_t rowb = (uint32_t)bw * (uint32_t)GL_TEX_BPP[fmt] / 8u;
         const size_t total_bytes = (size_t)rowb * (size_t)h;
         const uint8_t *src = total_bytes ? (const uint8_t *)psp_mem_ptr(st->tex_addr, (uint32_t)total_bytes) : NULL;
-        if (src && (!st->tex_swizzle || ((rowb & 15u) == 0u && rowb >= 16u && (h & 7) == 0))) {
+        if (src && (!st->tex_swizzle || (bw >= w && (rowb & 15u) == 0u && rowb >= 16u && (h & 7) == 0))) {
             if (fmt == PSP_TPSM_8888) {
                 if (!st->tex_swizzle) {
                     if (bw == w) {
                         memcpy(rgba, src, (size_t)w * (size_t)h * 4u);
                     } else {
-                        for (int y = 0; y < h; y++)
-                            memcpy(rgba + (size_t)y * (size_t)w, src + (size_t)y * rowb, (size_t)w * 4u);
+                        for (int y = 0; y < h; y++) {
+                            uint32_t *drow = rgba + (size_t)y * (size_t)w;
+                            memcpy(drow, src + (size_t)y * rowb, (size_t)cw * 4u);
+                            if (cw < w) {
+                                const uint32_t pad = drow[cw - 1];
+                                for (int x = cw; x < w; x++) drow[x] = pad;
+                            }
+                        }
                     }
                     decoded = 1;
                 } else {
@@ -772,26 +878,30 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
                     const uint16_t *srow = (const uint16_t *)(src + (size_t)y * rowb);
                     uint32_t *drow = rgba + (size_t)y * (size_t)w;
                     if (fmt == PSP_TPSM_565) {
-                        for (int x = 0; x < w; x++) {
+                        for (int x = 0; x < cw; x++) {
                             uint32_t p = srow[x];
                             uint32_t r = p & 0x1Fu, g = (p >> 5) & 0x3Fu, b = (p >> 11) & 0x1Fu;
                             drow[x] = 0xFF000000u | ((r << 3) | (r >> 2)) |
                                       (((g << 2) | (g >> 4)) << 8) | (((b << 3) | (b >> 2)) << 16);
                         }
                     } else if (fmt == PSP_TPSM_5551) {
-                        for (int x = 0; x < w; x++) {
+                        for (int x = 0; x < cw; x++) {
                             uint32_t p = srow[x];
                             uint32_t r = p & 0x1Fu, g = (p >> 5) & 0x1Fu, b = (p >> 10) & 0x1Fu;
                             drow[x] = ((p & 0x8000u) ? 0xFF000000u : 0u) | ((r << 3) | (r >> 2)) |
                                       (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16);
                         }
                     } else {
-                        for (int x = 0; x < w; x++) {
+                        for (int x = 0; x < cw; x++) {
                             uint32_t p = srow[x];
                             uint32_t r = p & 0xFu, g = (p >> 4) & 0xFu, b = (p >> 8) & 0xFu, a = (p >> 12) & 0xFu;
                             drow[x] = ((r << 4) | r) | (((g << 4) | g) << 8) |
                                       (((b << 4) | b) << 16) | (((a << 4) | a) << 24);
                         }
+                    }
+                    if (cw < w) {
+                        const uint32_t pad = drow[cw - 1];
+                        for (int x = cw; x < w; x++) drow[x] = pad;
                     }
                 }
                 decoded = 1;
@@ -817,7 +927,11 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
                         for (int y = 0; y < h; y++) {
                             const uint8_t *srow = src + (size_t)y * rowb;
                             uint32_t *drow = rgba + (size_t)y * (size_t)w;
-                            for (int x = 0; x < w; x++) drow[x] = pal[srow[x]];
+                            for (int x = 0; x < cw; x++) drow[x] = pal[srow[x]];
+                            if (cw < w) {
+                                const uint32_t pad = drow[cw - 1];
+                                for (int x = cw; x < w; x++) drow[x] = pad;
+                            }
                         }
                         decoded = 1;
                     } else if ((w & 15) == 0) {
@@ -837,14 +951,18 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
                         decoded = 1;
                     }
                 } else { /* PSP_TPSM_T4 */
-                    if (!st->tex_swizzle && (w & 1) == 0) {
+                    if (!st->tex_swizzle && (cw & 1) == 0) {
                         for (int y = 0; y < h; y++) {
                             const uint8_t *srow = src + (size_t)y * rowb;
                             uint32_t *drow = rgba + (size_t)y * (size_t)w;
-                            for (int x = 0; x < w; x += 2) {
+                            for (int x = 0; x < cw; x += 2) {
                                 uint8_t b = srow[x >> 1];
                                 drow[x] = pal[b & 0xFu];
                                 drow[x + 1] = pal[b >> 4];
+                            }
+                            if (cw < w) {
+                                const uint32_t pad = drow[cw - 1];
+                                for (int x = cw; x < w; x++) drow[x] = pad;
                             }
                         }
                         decoded = 1;
@@ -871,6 +989,101 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
                 }
             }
         }
+    } else if (fmt >= PSP_TPSM_DXT1 && fmt <= PSP_TPSM_DXT5 &&
+               (w & 3) == 0 && (h & 3) == 0 && bw >= 4 && (bw & 3) == 0 && (cw & 3) == 0) {
+        const size_t blk_sz = (fmt == PSP_TPSM_DXT1) ? 8u : 16u;
+        const uint32_t bpr = (uint32_t)bw >> 2;
+        const size_t total_bytes = (size_t)(h >> 2) * (size_t)bpr * blk_sz;
+        const uint8_t *src = total_bytes ? (const uint8_t *)psp_mem_ptr(st->tex_addr, (uint32_t)total_bytes) : NULL;
+        if (src) {
+            const uint32_t bx_lim = (uint32_t)cw >> 2;
+            for (int by = 0; by < h; by += 4) {
+                const uint8_t *brow = src + (size_t)(by >> 2) * (size_t)bpr * blk_sz;
+                for (uint32_t bx = 0; bx < bx_lim; bx++) {
+                    const uint8_t *blk = brow + (size_t)bx * blk_sz;
+                    uint32_t idx_bits;
+                    uint16_t c0, c1;
+                    memcpy(&idx_bits, blk, 4);
+                    memcpy(&c0, blk + 4, 2);
+                    memcpy(&c1, blk + 6, 2);
+                    const uint32_t a = psp_color_expand(c0, 0);
+                    const uint32_t b = psp_color_expand(c1, 0);
+                    const uint32_t ra = a & 0xFFu, ga = (a >> 8) & 0xFFu, ba = (a >> 16) & 0xFFu;
+                    const uint32_t rb = b & 0xFFu, gb = (b >> 8) & 0xFFu, bb = (b >> 16) & 0xFFu;
+                    uint32_t lut[4];
+                    lut[0] = a;
+                    lut[1] = b;
+                    if (c0 > c1 || fmt != PSP_TPSM_DXT1) {
+                        lut[2] = 0xFF000000u | ((2u * ra + rb) / 3u) |
+                                 (((2u * ga + gb) / 3u) << 8) | (((2u * ba + bb) / 3u) << 16);
+                        lut[3] = 0xFF000000u | ((ra + 2u * rb) / 3u) |
+                                 (((ga + 2u * gb) / 3u) << 8) | (((ba + 2u * bb) / 3u) << 16);
+                    } else {
+                        lut[2] = 0xFF000000u | ((ra + rb) / 2u) |
+                                 (((ga + gb) / 2u) << 8) | (((ba + bb) / 2u) << 16);
+                        lut[3] = 0u;
+                    }
+                    if (fmt == PSP_TPSM_DXT1) {
+                        for (int ry = 0; ry < 4; ry++) {
+                            uint32_t *db = rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 4u);
+                            const uint32_t s = (uint32_t)ry * 8u;
+                            db[0] = lut[(idx_bits >> (s + 0u)) & 3u];
+                            db[1] = lut[(idx_bits >> (s + 2u)) & 3u];
+                            db[2] = lut[(idx_bits >> (s + 4u)) & 3u];
+                            db[3] = lut[(idx_bits >> (s + 6u)) & 3u];
+                        }
+                    } else if (fmt == PSP_TPSM_DXT3) {
+                        for (int ry = 0; ry < 4; ry++) {
+                            uint16_t arow;
+                            memcpy(&arow, blk + 8 + ry * 2, 2);
+                            uint32_t *db = rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 4u);
+                            const uint32_t s = (uint32_t)ry * 8u;
+                            for (int rx = 0; rx < 4; rx++) {
+                                const uint32_t rgb = lut[(idx_bits >> (s + (uint32_t)rx * 2u)) & 3u] & 0x00FFFFFFu;
+                                const uint32_t al = ((arow >> (rx * 4)) & 0xFu) * 17u;
+                                db[rx] = rgb | (al << 24);
+                            }
+                        }
+                    } else { /* PSP_TPSM_DXT5 */
+                        uint16_t blo;
+                        uint32_t bhi;
+                        memcpy(&blo, blk + 12, 2);
+                        memcpy(&bhi, blk + 8, 4);
+                        const uint64_t abits = (uint64_t)blo | ((uint64_t)bhi << 16);
+                        const int a0 = blk[14], a1 = blk[15];
+                        uint32_t alut[8];
+                        alut[0] = (uint32_t)a0 << 24;
+                        alut[1] = (uint32_t)a1 << 24;
+                        if (a0 > a1) {
+                            for (int k = 2; k < 8; k++)
+                                alut[k] = (uint32_t)(((8 - k) * a0 + (k - 1) * a1) / 7) << 24;
+                        } else {
+                            for (int k = 2; k < 6; k++)
+                                alut[k] = (uint32_t)(((6 - k) * a0 + (k - 1) * a1) / 5) << 24;
+                            alut[6] = 0u;
+                            alut[7] = 0xFF000000u;
+                        }
+                        for (int ry = 0; ry < 4; ry++) {
+                            uint32_t *db = rgba + (size_t)(by + ry) * (size_t)w + (size_t)(bx * 4u);
+                            const uint32_t s = (uint32_t)ry * 8u;
+                            const uint32_t as = (uint32_t)ry * 12u;
+                            for (int rx = 0; rx < 4; rx++) {
+                                const uint32_t rgb = lut[(idx_bits >> (s + (uint32_t)rx * 2u)) & 3u] & 0x00FFFFFFu;
+                                db[rx] = rgb | alut[(abits >> (as + (uint32_t)rx * 3u)) & 7u];
+                            }
+                        }
+                    }
+                }
+                if (cw < w) {
+                    for (int ry = 0; ry < 4; ry++) {
+                        uint32_t *drow = rgba + (size_t)(by + ry) * (size_t)w;
+                        const uint32_t pad = drow[cw - 1];
+                        for (int x = cw; x < w; x++) drow[x] = pad;
+                    }
+                }
+            }
+            decoded = 1;
+        }
     }
     if (!decoded) {
         if (g_prof_gl > 0) {
@@ -892,14 +1105,7 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
         }
     }
 
-    g_gl.BindTexture(GL_TEXTURE_2D, e->tex);
-    const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fil);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                    st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                    st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    sync_tex_params(e, fil, cu, cv);
     if (e->w == w && e->h == h) {
         g_gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     } else {
@@ -977,6 +1183,7 @@ static GLenum gl_blend_eq(int op) {
 static void sync_scale_if_needed(void) {
     const int req = psp_render_get_scale();
     if (req != g_scale && req >= 1 && req <= MAX_SCALE) {
+        if (g_batch_count > 0) gl_flush_batch();
         drop_all_fbos();
         g_scale = req;
         g_pbo_primed = 0;
@@ -984,15 +1191,70 @@ static void sync_scale_if_needed(void) {
 }
 
 static void capture_fbo_to_front(gl_fbo *f, int sync_now) {
-    (void)sync_now;
     if (!f || !f->has_draws || !g_front_lock || !g_front_px) return;
+    if (g_batch_count > 0) gl_flush_batch();
     const int w = BASE_W * f->scale;
     const int h = BASE_H * f->scale;
     if (w > BASE_W * MAX_SCALE || h > BASE_H * MAX_SCALE) return;
 
     uint64_t rt0 = g_prof_gl > 0 ? prof_us() : 0;
-    g_gl.BindFramebuffer(GL_FRAMEBUFFER, f->fbo);
+    gl_bind_fbo(f->fbo);
     g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    const size_t bytes = (size_t)w * (size_t)h * 4u;
+    if (!sync_now && g_gl.MapBufferRange && g_gl.UnmapBuffer) {
+        if (!g_pbo[0] || !g_pbo[1]) {
+            g_gl.GenBuffers(2, g_pbo);
+            g_pbo_w = g_pbo_h = 0;
+        }
+        if (g_pbo_w != w || g_pbo_h != h) {
+            for (int i = 0; i < 2; i++) {
+                g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[i]);
+                g_gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
+            }
+            g_pbo_w = w;
+            g_pbo_h = h;
+            g_pbo_idx = 0;
+            g_pbo_primed = 0;
+        }
+        const int cur = g_pbo_idx;
+        const int prev = cur ^ 1;
+        /* Queue async GPU->PBO readback for the current frame. */
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[cur]);
+        g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+        if (g_pbo_primed) {
+            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, g_pbo[prev]);
+            const void *mapped = g_gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+            if (mapped) {
+                SDL_LockMutex(g_front_lock);
+                memcpy(g_front_px, mapped, bytes);
+                g_front_w = w;
+                g_front_h = h;
+                g_front_valid = 1;
+                SDL_UnlockMutex(g_front_lock);
+                g_gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                psp_render_bump_front_gen();
+            }
+        } else {
+            /* First frame on this scale: also copy immediately so window is never blank. */
+            g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            SDL_LockMutex(g_front_lock);
+            g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
+            g_front_w = w;
+            g_front_h = h;
+            g_front_valid = 1;
+            SDL_UnlockMutex(g_front_lock);
+            psp_render_bump_front_gen();
+        }
+        g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        g_pbo_idx = prev;
+        g_pbo_primed = 1;
+        if (g_prof_gl > 0) g_prof_gl_read_us += prof_us() - rt0;
+        return;
+    }
+
+    g_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     SDL_LockMutex(g_front_lock);
     g_gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_front_px);
     g_front_w = w;
@@ -1158,6 +1420,8 @@ static int gl_init(int width, int height) {
 
     g_front_valid = 0;
     g_presented_this_list = 0;
+    g_batch_count = 0;
+    gl_invalidate_state();
     if (g_prof_gl < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_gl = (p && p[0] == '1') ? 1 : 0; }
     /* Release context from the init thread so guest pthread(s) can bind it cleanly. */
     release_context_current();
@@ -1169,8 +1433,9 @@ static int gl_init(int width, int height) {
 
 static void gl_shutdown(void) {
     if (g_prof_gl > 0) {
-        fprintf(stderr, "prof_gl(exit): draws=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
+        fprintf(stderr, "prof_gl(exit): draws=%llu batches=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
                 (unsigned long long)g_prof_gl_draws,
+                (unsigned long long)g_prof_gl_batches,
                 (unsigned long long)g_prof_gl_tex_hits,
                 (unsigned long long)g_prof_gl_tex_misses,
                 (double)g_prof_gl_tex_us / 1000.0,
@@ -1180,6 +1445,7 @@ static void gl_shutdown(void) {
     }
     psp_render_set_front_reader(NULL);
     if (g_ready && ensure_context_current() == 0) {
+        if (g_batch_count > 0) gl_flush_batch();
         drop_all_fbos();
         drop_all_textures();
         if (g_pbo[0] || g_pbo[1]) { g_gl.DeleteBuffers(2, g_pbo); g_pbo[0] = g_pbo[1] = 0; }
@@ -1187,6 +1453,8 @@ static void gl_shutdown(void) {
         if (g_vao)  { g_gl.DeleteVertexArrays(1, &g_vao); g_vao = 0; }
         if (g_prog) { g_gl.DeleteProgram(g_prog); g_prog = 0; }
     }
+    g_batch_count = 0;
+    gl_invalidate_state();
     g_vbo_cap = 0;
     g_vbo_used = 0;
     g_pbo_primed = 0;
@@ -1219,7 +1487,12 @@ static void gl_shutdown(void) {
 }
 
 static void gl_set_target(uint32_t addr, uint32_t stride, int fmt) {
-    g_cur_fb_addr = norm_vram_addr(addr);
+    const uint32_t naddr = norm_vram_addr(addr);
+    if (g_batch_count > 0 &&
+        (naddr != g_cur_fb_addr || stride != g_cur_fb_stride || fmt != g_cur_fb_fmt)) {
+        if (ensure_context_current() == 0) gl_flush_batch();
+    }
+    g_cur_fb_addr = naddr;
     g_cur_fb_stride = stride;
     g_cur_fb_fmt = fmt;
 }
@@ -1247,81 +1520,77 @@ static void pack_vert(gl_vert *dst, const psp_vertex *src) {
     dst->v = src->v;
 }
 
-static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
-    if (!g_ready) {
-        if (gl_init(BASE_W, BASE_H) != 0) return;
-    }
-    if (!v || count <= 0 || !st) return;
-    uint64_t dt0 = g_prof_gl > 0 ? prof_us() : 0;
-    uint64_t ct0 = dt0;
-    if (ensure_context_current() != 0) return;
-    if (g_prof_gl > 0) { g_prof_gl_ctx_us += prof_us() - ct0; g_prof_gl_draws++; }
+static int draw_state_batch_eq(const psp_draw_state *a, const psp_draw_state *b) {
+    return a->gouraud == b->gouraud &&
+           a->tex_enable == b->tex_enable &&
+           (!a->tex_enable || (
+               a->tex_addr == b->tex_addr &&
+               a->tex_bw == b->tex_bw &&
+               a->tex_w == b->tex_w &&
+               a->tex_h == b->tex_h &&
+               a->tex_fmt == b->tex_fmt &&
+               a->tex_swizzle == b->tex_swizzle &&
+               a->tex_clamp_u == b->tex_clamp_u &&
+               a->tex_clamp_v == b->tex_clamp_v &&
+               a->tex_func == b->tex_func &&
+               a->tex_alpha == b->tex_alpha &&
+               a->tex_double == b->tex_double &&
+               a->tex_env == b->tex_env &&
+               a->clut == b->clut &&
+               a->clut_fmt == b->clut_fmt &&
+               a->clut_shift == b->clut_shift &&
+               a->clut_mask == b->clut_mask &&
+               a->clut_start == b->clut_start)) &&
+           a->blend == b->blend &&
+           (!a->blend || (
+               a->blend_src == b->blend_src &&
+               a->blend_dst == b->blend_dst &&
+               a->blend_op == b->blend_op &&
+               a->blend_sfix == b->blend_sfix &&
+               a->blend_dfix == b->blend_dfix)) &&
+           a->atest == b->atest &&
+           (!a->atest || (
+               a->atest_func == b->atest_func &&
+               a->atest_ref == b->atest_ref &&
+               a->atest_mask == b->atest_mask)) &&
+           a->ztest == b->ztest &&
+           (!a->ztest || (a->zfunc == b->zfunc && a->zwrite == b->zwrite)) &&
+           a->cull == b->cull &&
+           (!a->cull || a->cull_ccw == b->cull_ccw) &&
+           a->stest == b->stest &&
+           (!a->stest || (
+               a->sfunc == b->sfunc && a->sref == b->sref && a->smask == b->smask &&
+               a->sfail == b->sfail && a->szfail == b->szfail && a->szpass == b->szpass)) &&
+           a->mask_rgb == b->mask_rgb &&
+           a->mask_a == b->mask_a;
+}
 
-    gl_fbo *fb = get_or_create_fbo(g_cur_fb_addr, (int)g_cur_fb_stride, g_cur_fb_fmt);
-    if (!fb) return;
-
+static void gl_commit_draw(int prim, int is_2d_prim, GLenum gl_prim, int emit_n,
+                           gl_fbo *fb, int sx0, int sy0, int sx1, int sy1,
+                           const psp_draw_state *st, GLuint tid, int tw, int th, int aref) {
     const int S = fb->scale;
-    g_gl.BindFramebuffer(GL_FRAMEBUFFER, fb->fbo);
-    g_gl.Viewport(0, 0, BASE_W * S, BASE_H * S);
+    const int inv = !g_sc.valid;
+    gl_bind_fbo(fb->fbo);
+    const int vpw = BASE_W * S, vph = BASE_H * S;
+    if (inv || g_sc.vp_w != vpw || g_sc.vp_h != vph) {
+        g_gl.Viewport(0, 0, vpw, vph);
+        g_sc.vp_w = vpw;
+        g_sc.vp_h = vph;
+    }
 
-    /* Scissor: PSP uses inclusive coordinates [sc_x0..sc_x1], [sc_y0..sc_y1]. */
-    int sx0 = st->sc_x0 < 0 ? 0 : st->sc_x0;
-    int sy0 = st->sc_y0 < 0 ? 0 : st->sc_y0;
-    int sx1 = st->sc_x1 >= BASE_W ? BASE_W - 1 : st->sc_x1;
-    int sy1 = st->sc_y1 >= BASE_H ? BASE_H - 1 : st->sc_y1;
-    if (sx0 > sx1 || sy0 > sy1) return;
-    g_gl.Enable(GL_SCISSOR_TEST);
-    g_gl.Scissor(sx0 * S, sy0 * S, (sx1 - sx0 + 1) * S, (sy1 - sy0 + 1) * S);
-
-    /* Expand sprites into triangle pairs; preserve last-vertex provoking order. */
-    GLenum gl_prim = GL_TRIANGLES;
-    int emit_n = count;
-    int is_sprite = (prim == PSP_PRIM_SPRITES);
-    int is_2d_prim = is_sprite || prim == PSP_PRIM_POINTS ||
-                     prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP;
-
-    if (is_sprite) {
-        const int pairs = count / 2;
-        if (pairs <= 0) return;
-        emit_n = pairs * 6;
-        gl_vert *out = reserve_verts((size_t)emit_n);
-        if (!out) return;
-        for (int i = 0; i < pairs; i++) {
-            gl_vert a, b, ab, ba;
-            pack_vert(&a, &v[i * 2]);
-            pack_vert(&b, &v[i * 2 + 1]);
-            ab = b; ab.y = a.y; ab.v = a.v;
-            ba = a; ba.y = b.y; ba.v = b.v;
-            /* Last vertex of BOTH triangles is b so flat/clear uses v1's color & z. */
-            ba.r = b.r; ba.g = b.g; ba.b = b.b; ba.a = b.a; ba.z = b.z;
-            ab.r = b.r; ab.g = b.g; ab.b = b.b; ab.a = b.a; ab.z = b.z;
-            out[i * 6 + 0] = a;
-            out[i * 6 + 1] = ab;
-            out[i * 6 + 2] = b;
-            out[i * 6 + 3] = a;
-            out[i * 6 + 4] = ba;
-            out[i * 6 + 5] = b;
-        }
-        gl_prim = GL_TRIANGLES;
-    } else {
-        gl_vert *out = reserve_verts((size_t)count);
-        if (!out) return;
-        for (int i = 0; i < count; i++) pack_vert(&out[i], &v[i]);
-        switch (prim) {
-        case PSP_PRIM_POINTS:         gl_prim = GL_POINTS; break;
-        case PSP_PRIM_LINES:          gl_prim = GL_LINES; break;
-        case PSP_PRIM_LINE_STRIP:     gl_prim = GL_LINE_STRIP; break;
-        case PSP_PRIM_TRIANGLES:      gl_prim = GL_TRIANGLES; break;
-        case PSP_PRIM_TRIANGLE_STRIP: gl_prim = GL_TRIANGLE_STRIP; break;
-        case PSP_PRIM_TRIANGLE_FAN:   gl_prim = GL_TRIANGLE_FAN; break;
-        default:                      gl_prim = GL_TRIANGLES; break;
-        }
+    if (inv || !g_sc.scissor_on) {
+        g_gl.Enable(GL_SCISSOR_TEST);
+        g_sc.scissor_on = 1;
+    }
+    const int scx = sx0 * S, scy = sy0 * S, scw = (sx1 - sx0 + 1) * S, sch = (sy1 - sy0 + 1) * S;
+    if (inv || g_sc.sx != scx || g_sc.sy != scy || g_sc.sw != scw || g_sc.sh != sch) {
+        g_gl.Scissor(scx, scy, scw, sch);
+        g_sc.sx = scx; g_sc.sy = scy; g_sc.sw = scw; g_sc.sh = sch;
     }
 
     if (prim == PSP_PRIM_POINTS) g_gl.PointSize((float)S);
     else if (prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP) g_gl.LineWidth((float)S);
 
-    /* Color / Alpha write masks (bit 1 = keep dst / mask off write). */
     const GLboolean wr = st->clear ? (st->clear_color ? GL_TRUE : GL_FALSE)
                                    : ((st->mask_rgb & 0x0000FFu) != 0x0000FFu);
     const GLboolean wg = st->clear ? (st->clear_color ? GL_TRUE : GL_FALSE)
@@ -1330,105 +1599,172 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
                                    : ((st->mask_rgb & 0xFF0000u) != 0xFF0000u);
     const GLboolean wa = st->clear ? (st->clear_alpha ? GL_TRUE : GL_FALSE)
                                    : ((st->mask_a & 0xFFu) != 0xFFu);
-    g_gl.ColorMask(wr, wg, wb, wa);
-
-    /* Backface culling (+y down in our unflipped NDC reverses screen winding). */
-    if (!st->clear && !is_2d_prim && st->cull) {
-        g_gl.Enable(GL_CULL_FACE);
-        g_gl.CullFace(GL_BACK);
-        g_gl.FrontFace(st->cull_ccw ? GL_CW : GL_CCW);
-    } else {
-        g_gl.Disable(GL_CULL_FACE);
+    if (inv || g_sc.wr != wr || g_sc.wg != wg || g_sc.wb != wb || g_sc.wa != wa) {
+        g_gl.ColorMask(wr, wg, wb, wa);
+        g_sc.wr = wr; g_sc.wg = wg; g_sc.wb = wb; g_sc.wa = wa;
     }
 
-    /* Depth test & mask. */
-    if (st->clear) {
-        if (st->clear_depth) {
-            g_gl.Enable(GL_DEPTH_TEST);
-            g_gl.DepthFunc(GL_ALWAYS);
-            g_gl.DepthMask(GL_TRUE);
-        } else {
-            g_gl.Disable(GL_DEPTH_TEST);
-            g_gl.DepthMask(GL_FALSE);
+    const int cull_on = (!st->clear && !is_2d_prim && st->cull) ? 1 : 0;
+    if (inv || g_sc.cull_on != cull_on) {
+        if (cull_on) { g_gl.Enable(GL_CULL_FACE); g_gl.CullFace(GL_BACK); }
+        else g_gl.Disable(GL_CULL_FACE);
+        g_sc.cull_on = cull_on;
+    }
+    if (cull_on) {
+        const GLenum ff = st->cull_ccw ? GL_CW : GL_CCW;
+        if (inv || g_sc.front_face != ff) {
+            g_gl.FrontFace(ff);
+            g_sc.front_face = ff;
         }
+    }
+
+    int d_on = 0;
+    GLenum d_func = GL_ALWAYS;
+    GLboolean d_mask = GL_FALSE;
+    if (st->clear) {
+        d_on = st->clear_depth ? 1 : 0;
+        d_func = GL_ALWAYS;
+        d_mask = st->clear_depth ? GL_TRUE : GL_FALSE;
     } else if (st->ztest) {
-        g_gl.Enable(GL_DEPTH_TEST);
-        g_gl.DepthFunc(gl_cmp_func(st->zfunc));
-        g_gl.DepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
-    } else {
-        g_gl.Disable(GL_DEPTH_TEST);
-        g_gl.DepthMask(GL_FALSE);
+        d_on = 1;
+        d_func = gl_cmp_func(st->zfunc);
+        d_mask = st->zwrite ? GL_TRUE : GL_FALSE;
+    }
+    if (inv || g_sc.depth_on != d_on) {
+        if (d_on) g_gl.Enable(GL_DEPTH_TEST);
+        else g_gl.Disable(GL_DEPTH_TEST);
+        g_sc.depth_on = d_on;
+    }
+    if (d_on && (inv || g_sc.depth_func != d_func)) {
+        g_gl.DepthFunc(d_func);
+        g_sc.depth_func = d_func;
+    }
+    if (inv || g_sc.depth_mask != d_mask) {
+        g_gl.DepthMask(d_mask);
+        g_sc.depth_mask = d_mask;
     }
 
-    /* Stencil buffer mirrors PSP alpha-stencil for clear_alpha & STE primitives. */
     if (st->clear && st->clear_alpha) {
-        const int aref = (int)((v[count - 1].rgba >> 24) & 0xFFu);
-        g_gl.Enable(GL_STENCIL_TEST);
-        g_gl.StencilMask(0xFFu);
-        g_gl.StencilFunc(GL_ALWAYS, aref, 0xFFu);
-        g_gl.StencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
+        if (inv || !g_sc.stencil_on) { g_gl.Enable(GL_STENCIL_TEST); g_sc.stencil_on = 1; }
+        if (inv || g_sc.stencil_wmask != 0xFFu) { g_gl.StencilMask(0xFFu); g_sc.stencil_wmask = 0xFFu; }
+        if (inv || g_sc.stencil_func != GL_ALWAYS || g_sc.stencil_ref != aref || g_sc.stencil_rmask != 0xFFu) {
+            g_gl.StencilFunc(GL_ALWAYS, aref, 0xFFu);
+            g_sc.stencil_func = GL_ALWAYS; g_sc.stencil_ref = aref; g_sc.stencil_rmask = 0xFFu;
+        }
+        if (inv || g_sc.stencil_sfail != GL_REPLACE || g_sc.stencil_szfail != GL_REPLACE || g_sc.stencil_szpass != GL_REPLACE) {
+            g_gl.StencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
+            g_sc.stencil_sfail = GL_REPLACE; g_sc.stencil_szfail = GL_REPLACE; g_sc.stencil_szpass = GL_REPLACE;
+        }
     } else if (!st->clear && st->stest) {
-        g_gl.Enable(GL_STENCIL_TEST);
-        g_gl.StencilMask((st->mask_a & 0xFFu) != 0xFFu ? (~st->mask_a & 0xFFu) : 0xFFu);
-        g_gl.StencilFunc(gl_cmp_func(st->sfunc), st->sref & 0xFF, (GLuint)(st->smask & 0xFF));
-        g_gl.StencilOp(gl_stencil_op(st->sfail), gl_stencil_op(st->szfail), gl_stencil_op(st->szpass));
+        const GLuint swm = (st->mask_a & 0xFFu) != 0xFFu ? (~st->mask_a & 0xFFu) : 0xFFu;
+        const GLenum sf = gl_cmp_func(st->sfunc);
+        const GLint sr = st->sref & 0xFF;
+        const GLuint sm = (GLuint)(st->smask & 0xFF);
+        const GLenum sop1 = gl_stencil_op(st->sfail);
+        const GLenum sop2 = gl_stencil_op(st->szfail);
+        const GLenum sop3 = gl_stencil_op(st->szpass);
+        if (inv || !g_sc.stencil_on) { g_gl.Enable(GL_STENCIL_TEST); g_sc.stencil_on = 1; }
+        if (inv || g_sc.stencil_wmask != swm) { g_gl.StencilMask(swm); g_sc.stencil_wmask = swm; }
+        if (inv || g_sc.stencil_func != sf || g_sc.stencil_ref != sr || g_sc.stencil_rmask != sm) {
+            g_gl.StencilFunc(sf, sr, sm);
+            g_sc.stencil_func = sf; g_sc.stencil_ref = sr; g_sc.stencil_rmask = sm;
+        }
+        if (inv || g_sc.stencil_sfail != sop1 || g_sc.stencil_szfail != sop2 || g_sc.stencil_szpass != sop3) {
+            g_gl.StencilOp(sop1, sop2, sop3);
+            g_sc.stencil_sfail = sop1; g_sc.stencil_szfail = sop2; g_sc.stencil_szpass = sop3;
+        }
     } else {
-        g_gl.Disable(GL_STENCIL_TEST);
-        g_gl.StencilMask(0xFFu);
+        if (inv || g_sc.stencil_on) { g_gl.Disable(GL_STENCIL_TEST); g_sc.stencil_on = 0; }
+        if (inv || g_sc.stencil_wmask != 0xFFu) { g_gl.StencilMask(0xFFu); g_sc.stencil_wmask = 0xFFu; }
     }
 
-    /* Blending (RGB channels blended per ALPHA/SFIX/DFIX; alpha untouched). */
-    if (!st->clear && st->blend) {
-        g_gl.Enable(GL_BLEND);
+    const int blend_on = (!st->clear && st->blend) ? 1 : 0;
+    if (inv || g_sc.blend_on != blend_on) {
+        if (blend_on) g_gl.Enable(GL_BLEND);
+        else g_gl.Disable(GL_BLEND);
+        g_sc.blend_on = blend_on;
+    }
+    if (blend_on) {
         const GLenum src_rgb = gl_blend_factor(st->blend_src, 1, st->blend_sfix);
         const GLenum dst_rgb = gl_blend_factor(st->blend_dst, 0, st->blend_dfix);
+        const GLenum beq = gl_blend_eq(st->blend_op);
         if (src_rgb == GL_CONSTANT_COLOR || src_rgb == GL_ONE_MINUS_CONSTANT_COLOR) {
-            g_gl.BlendColor((float)(st->blend_sfix & 0xFFu) / 255.0f,
-                            (float)((st->blend_sfix >> 8) & 0xFFu) / 255.0f,
-                            (float)((st->blend_sfix >> 16) & 0xFFu) / 255.0f, 1.0f);
+            if (inv || !g_sc.have_blend_col || g_sc.blend_col != st->blend_sfix) {
+                g_gl.BlendColor((float)(st->blend_sfix & 0xFFu) / 255.0f,
+                                (float)((st->blend_sfix >> 8) & 0xFFu) / 255.0f,
+                                (float)((st->blend_sfix >> 16) & 0xFFu) / 255.0f, 1.0f);
+                g_sc.blend_col = st->blend_sfix;
+                g_sc.have_blend_col = 1;
+            }
         } else if (dst_rgb == GL_CONSTANT_COLOR || dst_rgb == GL_ONE_MINUS_CONSTANT_COLOR) {
-            g_gl.BlendColor((float)(st->blend_dfix & 0xFFu) / 255.0f,
-                            (float)((st->blend_dfix >> 8) & 0xFFu) / 255.0f,
-                            (float)((st->blend_dfix >> 16) & 0xFFu) / 255.0f, 1.0f);
+            if (inv || !g_sc.have_blend_col || g_sc.blend_col != st->blend_dfix) {
+                g_gl.BlendColor((float)(st->blend_dfix & 0xFFu) / 255.0f,
+                                (float)((st->blend_dfix >> 8) & 0xFFu) / 255.0f,
+                                (float)((st->blend_dfix >> 16) & 0xFFu) / 255.0f, 1.0f);
+                g_sc.blend_col = st->blend_dfix;
+                g_sc.have_blend_col = 1;
+            }
         }
-        g_gl.BlendEquationSeparate(gl_blend_eq(st->blend_op), GL_FUNC_ADD);
-        g_gl.BlendFuncSeparate(src_rgb, dst_rgb, GL_ONE, GL_ZERO);
-    } else {
-        g_gl.Disable(GL_BLEND);
+        if (inv || g_sc.blend_op != beq) {
+            g_gl.BlendEquationSeparate(beq, GL_FUNC_ADD);
+            g_sc.blend_op = beq;
+        }
+        if (inv || g_sc.blend_src != src_rgb || g_sc.blend_dst != dst_rgb) {
+            g_gl.BlendFuncSeparate(src_rgb, dst_rgb, GL_ONE, GL_ZERO);
+            g_sc.blend_src = src_rgb; g_sc.blend_dst = dst_rgb;
+        }
     }
 
-    /* Shader & uniforms. */
-    g_gl.UseProgram(g_prog);
-    g_gl.Uniform1i(u_clear_mode, st->clear ? 1 : 0);
-    g_gl.Uniform1i(u_gouraud, st->gouraud ? 1 : 0);
+    if (inv || g_sc.prog != g_prog) {
+        g_gl.UseProgram(g_prog);
+        g_sc.prog = g_prog;
+    }
+    const int cm = st->clear ? 1 : 0;
+    const int gr = st->gouraud ? 1 : 0;
+    if (inv || g_sc.u_clear_mode != cm) { g_gl.Uniform1i(u_clear_mode, cm); g_sc.u_clear_mode = cm; }
+    if (inv || g_sc.u_gouraud != gr)    { g_gl.Uniform1i(u_gouraud, gr);    g_sc.u_gouraud = gr; }
 
     if (!st->clear && st->tex_enable) {
-        int tw = 1, th = 1;
-        g_gl.ActiveTexture(GL_TEXTURE0);
-        GLuint tid = get_texture(st, &tw, &th);
-        g_gl.Uniform1i(u_tex_enable, tid ? 1 : 0);
-        g_gl.Uniform1i(u_tex, 0);
-        g_gl.Uniform2f(u_tex_size, (float)tw, (float)th);
-        g_gl.Uniform1i(u_tex_func, st->tex_func);
-        g_gl.Uniform1i(u_tex_alpha, st->tex_alpha ? 1 : 0);
-        g_gl.Uniform1f(u_tex_double, st->tex_double ? 2.0f : 1.0f);
-        g_gl.Uniform4f(u_tex_env,
-                       (float)(st->tex_env & 0xFFu) / 255.0f,
-                       (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
-                       (float)((st->tex_env >> 16) & 0xFFu) / 255.0f,
-                       (float)((st->tex_env >> 24) & 0xFFu) / 255.0f);
+        if (tid) gl_bind_tex0(tid);
+        const int te = tid ? 1 : 0;
+        const int ta = st->tex_alpha ? 1 : 0;
+        const int td = st->tex_double ? 1 : 0;
+        if (inv || g_sc.u_tex_enable != te) { g_gl.Uniform1i(u_tex_enable, te); g_sc.u_tex_enable = te; }
+        if (inv || !g_sc.u_tex_set)         { g_gl.Uniform1i(u_tex, 0);         g_sc.u_tex_set = 1; }
+        if (inv || g_sc.u_tw != tw || g_sc.u_th != th) {
+            g_gl.Uniform2f(u_tex_size, (float)tw, (float)th);
+            g_sc.u_tw = tw; g_sc.u_th = th;
+        }
+        if (inv || g_sc.u_tex_func != st->tex_func) { g_gl.Uniform1i(u_tex_func, st->tex_func); g_sc.u_tex_func = st->tex_func; }
+        if (inv || g_sc.u_tex_alpha != ta)          { g_gl.Uniform1i(u_tex_alpha, ta);          g_sc.u_tex_alpha = ta; }
+        if (inv || g_sc.u_tex_double != td)         { g_gl.Uniform1f(u_tex_double, td ? 2.0f : 1.0f); g_sc.u_tex_double = td; }
+        if (inv || g_sc.u_tex_env != st->tex_env) {
+            g_gl.Uniform4f(u_tex_env,
+                           (float)(st->tex_env & 0xFFu) / 255.0f,
+                           (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
+                           (float)((st->tex_env >> 16) & 0xFFu) / 255.0f,
+                           (float)((st->tex_env >> 24) & 0xFFu) / 255.0f);
+            g_sc.u_tex_env = st->tex_env;
+        }
     } else {
-        g_gl.Uniform1i(u_tex_enable, 0);
+        if (inv || g_sc.u_tex_enable != 0) { g_gl.Uniform1i(u_tex_enable, 0); g_sc.u_tex_enable = 0; }
     }
 
-    g_gl.Uniform1i(u_atest, (!st->clear && st->atest) ? 1 : 0);
-    g_gl.Uniform1i(u_atest_func, st->atest_func);
-    g_gl.Uniform1i(u_atest_ref, st->atest_ref);
-    g_gl.Uniform1i(u_atest_mask, st->atest_mask);
+    const int ae = (!st->clear && st->atest) ? 1 : 0;
+    if (inv || g_sc.u_atest != ae) { g_gl.Uniform1i(u_atest, ae); g_sc.u_atest = ae; }
+    if (ae || inv) {
+        if (inv || g_sc.u_atest_func != st->atest_func) { g_gl.Uniform1i(u_atest_func, st->atest_func); g_sc.u_atest_func = st->atest_func; }
+        if (inv || g_sc.u_atest_ref != st->atest_ref)   { g_gl.Uniform1i(u_atest_ref, st->atest_ref);   g_sc.u_atest_ref = st->atest_ref; }
+        if (inv || g_sc.u_atest_mask != st->atest_mask) { g_gl.Uniform1i(u_atest_mask, st->atest_mask); g_sc.u_atest_mask = st->atest_mask; }
+    }
 
-    /* Upload vertices & draw using ring buffer (orphan only on wrap/resize). */
-    g_gl.BindVertexArray(g_vao);
-    g_gl.BindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    if (inv || !g_sc.vao_bound) {
+        g_gl.BindVertexArray(g_vao);
+        g_gl.BindBuffer(GL_ARRAY_BUFFER, g_vbo);
+        g_sc.vao_bound = 1;
+    }
+    g_sc.valid = 1;
+
     const size_t bytes = (size_t)emit_n * sizeof(gl_vert);
     if (bytes > g_vbo_cap) {
         size_t cap = g_vbo_cap ? g_vbo_cap : 1024u * 1024u;
@@ -1447,6 +1783,159 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
 
     fb->has_draws = 1;
     psp_render_add_pixels((uint64_t)emit_n * (uint64_t)S * (uint64_t)S);
+    if (g_prof_gl > 0) g_prof_gl_batches++;
+}
+
+static void gl_flush_batch(void) {
+    if (!g_batch_active || g_batch_count <= 0) {
+        g_batch_active = 0;
+        g_batch_count = 0;
+        return;
+    }
+    const int n = g_batch_count;
+    const int is_sprite = (g_batch_prim == PSP_PRIM_SPRITES);
+    g_batch_active = 0;
+    g_batch_count = 0;
+    gl_commit_draw(g_batch_prim, is_sprite, GL_TRIANGLES, n,
+                   g_batch_fb, g_batch_sx0, g_batch_sy0, g_batch_sx1, g_batch_sy1,
+                   &g_batch_st, g_batch_tid, g_batch_tw, g_batch_th, g_batch_aref);
+}
+
+static GLenum pack_verts(gl_vert *out, int prim, const psp_vertex *v, int count) {
+    if (prim == PSP_PRIM_SPRITES) {
+        const int pairs = count / 2;
+        for (int i = 0; i < pairs; i++) {
+            gl_vert a, b, ab, ba;
+            pack_vert(&a, &v[i * 2]);
+            pack_vert(&b, &v[i * 2 + 1]);
+            ab = b; ab.y = a.y; ab.v = a.v;
+            ba = a; ba.y = b.y; ba.v = b.v;
+            /* Last vertex of BOTH triangles is b so flat/clear uses v1's color & z. */
+            ba.r = b.r; ba.g = b.g; ba.b = b.b; ba.a = b.a; ba.z = b.z;
+            ab.r = b.r; ab.g = b.g; ab.b = b.b; ab.a = b.a; ab.z = b.z;
+            out[i * 6 + 0] = a;
+            out[i * 6 + 1] = ab;
+            out[i * 6 + 2] = b;
+            out[i * 6 + 3] = a;
+            out[i * 6 + 4] = ba;
+            out[i * 6 + 5] = b;
+        }
+        return GL_TRIANGLES;
+    }
+    for (int i = 0; i < count; i++) pack_vert(&out[i], &v[i]);
+    switch (prim) {
+    case PSP_PRIM_POINTS:         return GL_POINTS;
+    case PSP_PRIM_LINES:          return GL_LINES;
+    case PSP_PRIM_LINE_STRIP:     return GL_LINE_STRIP;
+    case PSP_PRIM_TRIANGLES:      return GL_TRIANGLES;
+    case PSP_PRIM_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
+    case PSP_PRIM_TRIANGLE_FAN:   return GL_TRIANGLE_FAN;
+    default:                      return GL_TRIANGLES;
+    }
+}
+
+static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    if (!g_ready) {
+        if (gl_init(BASE_W, BASE_H) != 0) return;
+    }
+    if (!v || count <= 0 || !st) return;
+    uint64_t dt0 = g_prof_gl > 0 ? prof_us() : 0;
+    uint64_t ct0 = dt0;
+    if (ensure_context_current() != 0) return;
+    if (g_prof_gl > 0) { g_prof_gl_ctx_us += prof_us() - ct0; g_prof_gl_draws++; }
+
+    /* Flush any pending batch before sampling its FBO as a texture. */
+    if (!st->clear && st->tex_enable && g_batch_count > 0 &&
+        norm_vram_addr(st->tex_addr) == g_batch_fb->addr) {
+        gl_flush_batch();
+    }
+
+    gl_fbo *fb = get_or_create_fbo(g_cur_fb_addr, (int)g_cur_fb_stride, g_cur_fb_fmt);
+    if (!fb) {
+        if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+        return;
+    }
+
+    /* Scissor: PSP uses inclusive coordinates [sc_x0..sc_x1], [sc_y0..sc_y1]. */
+    int sx0 = st->sc_x0 < 0 ? 0 : st->sc_x0;
+    int sy0 = st->sc_y0 < 0 ? 0 : st->sc_y0;
+    int sx1 = st->sc_x1 >= BASE_W ? BASE_W - 1 : st->sc_x1;
+    int sy1 = st->sc_y1 >= BASE_H ? BASE_H - 1 : st->sc_y1;
+    if (sx0 > sx1 || sy0 > sy1) {
+        if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+        return;
+    }
+
+    int emit_n = count;
+    const int is_sprite = (prim == PSP_PRIM_SPRITES);
+    if (is_sprite) {
+        const int pairs = count / 2;
+        if (pairs <= 0) {
+            if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+            return;
+        }
+        emit_n = pairs * 6;
+    }
+
+    const int can_batch = (!st->clear && (prim == PSP_PRIM_SPRITES || prim == PSP_PRIM_TRIANGLES));
+    const uint64_t tex_hash = (!st->clear && st->tex_enable) ? hash_texture(st) : 0;
+
+    if (can_batch && g_batch_active &&
+        g_batch_prim == prim && g_batch_fb == fb &&
+        g_batch_sx0 == sx0 && g_batch_sy0 == sy0 &&
+        g_batch_sx1 == sx1 && g_batch_sy1 == sy1 &&
+        g_batch_tex_hash == tex_hash &&
+        draw_state_batch_eq(&g_batch_st, st) &&
+        g_batch_count + emit_n <= 65536) {
+        gl_vert *buf = reserve_verts((size_t)(g_batch_count + emit_n));
+        if (!buf) {
+            gl_flush_batch();
+            if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+            return;
+        }
+        pack_verts(buf + g_batch_count, prim, v, count);
+        g_batch_count += emit_n;
+        if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+        return;
+    }
+
+    if (g_batch_count > 0) gl_flush_batch();
+
+    GLuint tid = 0;
+    int tw = 1, th = 1;
+    if (!st->clear && st->tex_enable) {
+        tid = get_texture_hashed(st, &tw, &th, tex_hash);
+    }
+
+    gl_vert *out = reserve_verts((size_t)emit_n);
+    if (!out) {
+        if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+        return;
+    }
+
+    const GLenum gl_prim = pack_verts(out, prim, v, count);
+    const int is_2d_prim = is_sprite || prim == PSP_PRIM_POINTS ||
+                           prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP;
+
+    if (can_batch && emit_n <= 65536) {
+        g_batch_active = 1;
+        g_batch_prim = prim;
+        g_batch_count = emit_n;
+        g_batch_fb = fb;
+        g_batch_st = *st;
+        g_batch_tex_hash = tex_hash;
+        g_batch_tid = tid;
+        g_batch_tw = tw;
+        g_batch_th = th;
+        g_batch_sx0 = sx0; g_batch_sy0 = sy0; g_batch_sx1 = sx1; g_batch_sy1 = sy1;
+        g_batch_aref = 0;
+        if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
+        return;
+    }
+
+    const int aref = (int)((v[count - 1].rgba >> 24) & 0xFFu);
+    gl_commit_draw(prim, is_2d_prim, gl_prim, emit_n,
+                   fb, sx0, sy0, sx1, sy1, st, tid, tw, th, aref);
     if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
 }
 
@@ -1455,6 +1944,7 @@ static void gl_finish(void) {
     uint64_t ct0 = g_prof_gl > 0 ? prof_us() : 0;
     if (ensure_context_current() == 0) {
         if (g_prof_gl > 0) g_prof_gl_ctx_us += prof_us() - ct0;
+        if (g_batch_count > 0) gl_flush_batch();
         /* For single-buffered games or tests that never call sceDisplaySetFrameBuf
          * every frame, copy once at GE_FINISH if we drew directly to front FB. */
         if (!g_presented_this_list) {
@@ -1469,11 +1959,17 @@ static void gl_finish(void) {
         release_context_current();
         if (g_prof_gl > 0) g_prof_gl_ctx_us += prof_us() - rt0;
         if (g_prof_gl > 0) {
-            static uint64_t fin_n;
+            static uint64_t fin_n, fin_t0;
+            if (!fin_t0) fin_t0 = prof_us();
             if ((++fin_n % 100u) == 0u) {
-                fprintf(stderr, "prof_gl(@%llu): draws=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
+                uint64_t tnow = prof_us();
+                double win_ms = (double)(tnow - fin_t0) / 1000.0;
+                fin_t0 = tnow;
+                fprintf(stderr, "prof_gl(@%llu fps=%.1f): draws=%llu batches=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
                         (unsigned long long)fin_n,
+                        win_ms > 0.0 ? (100000.0 / win_ms) : 0.0,
                         (unsigned long long)g_prof_gl_draws,
+                        (unsigned long long)g_prof_gl_batches,
                         (unsigned long long)g_prof_gl_tex_hits,
                         (unsigned long long)g_prof_gl_tex_misses,
                         (double)g_prof_gl_tex_us / 1000.0,
@@ -1488,6 +1984,7 @@ static void gl_finish(void) {
 static void gl_present(void) {
     if (!g_ready) return;
     if (ensure_context_current() == 0) {
+        if (g_batch_count > 0) gl_flush_batch();
         gl_fbo *front = find_fbo(psp_display_framebuffer());
         if (front && front->has_draws) {
             capture_fbo_to_front(front, 0);

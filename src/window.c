@@ -447,9 +447,13 @@ static int SDLCALL window_main(void *arg) {
     SDL_SemPost((SDL_sem *)arg);              /* the window exists, or failed */
 
     Uint32 next = SDL_GetTicks();
+    uint64_t presented_gen = UINT64_MAX;
+    Uint32 last_present_ms = next - 16u;
     while (!g_closed && r && tex) {
         SDL_Event e;
+        int had_event = 0;
         while (SDL_PollEvent(&e)) {
+            had_event = 1;
 #ifdef PSPRECOMP_IMGUI_UI
             psp_overlay_handle_event(&e);
 #endif
@@ -507,18 +511,28 @@ static int SDLCALL window_main(void *arg) {
 #ifdef PSPRECOMP_IMGUI_UI
         uint32_t kbd = psp_overlay_want_keyboard() ? 0u : keyboard();
         psp_ctrl_set(kbd | pad(&ax, &ay), ax, ay);
-        render(r, &tex, &tex_w, &tex_h, cur_filter, ov.aspect_mode);
 #else
         psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
-        render(r, &tex, &tex_w, &tex_h, 0, 0);
 #endif
-        if (vsync) {
-            next = SDL_GetTicks();            /* SDL_RenderPresent paced us */
+        const uint64_t fgen = psp_render_front_gen();
+        const Uint32 now_ms = SDL_GetTicks();
+        if (had_event || fgen != presented_gen || (Uint32)(now_ms - last_present_ms) >= 16u) {
+#ifdef PSPRECOMP_IMGUI_UI
+            render(r, &tex, &tex_w, &tex_h, cur_filter, ov.aspect_mode);
+#else
+            render(r, &tex, &tex_w, &tex_h, 0, 0);
+#endif
+            presented_gen = fgen;
+            last_present_ms = SDL_GetTicks();
+            if (vsync) {
+                next = last_present_ms;            /* SDL_RenderPresent paced us */
+            } else {
+                next += 16;
+                if ((int)(next - last_present_ms) > 0) SDL_Delay(next - last_present_ms);
+                else next = last_present_ms;
+            }
         } else {
-            next += 16;
-            const Uint32 now = SDL_GetTicks();
-            if ((int)(next - now) > 0) SDL_Delay(next - now);
-            else next = now;
+            SDL_Delay(2);
         }
     }
 #ifdef PSPRECOMP_IMGUI_UI
