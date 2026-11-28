@@ -1495,7 +1495,7 @@ static void gl_finish(void) {
         if (g_prof_gl > 0) g_prof_gl_ctx_us += prof_us() - rt0;
         if (g_prof_gl > 0) {
             static uint64_t fin_n;
-            if ((++fin_n % 250u) == 0u) {
+            if ((++fin_n % 100u) == 0u) {
                 fprintf(stderr, "prof_gl(@%llu): draws=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
                         (unsigned long long)fin_n,
                         (unsigned long long)g_prof_gl_draws,
