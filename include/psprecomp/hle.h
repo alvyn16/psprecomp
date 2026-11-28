@@ -218,6 +218,7 @@ void psp_threadman_yield(void);
  * that block on hardware for a known time, such as blocking audio output. */
 void psp_threadman_delay(uint64_t us);
 void psp_threadman_frame_wait(void);
+void psp_threadman_idle_wait_ms(uint32_t ms);
 
 /* Interrupt masking is per thread, and the cookie is the previous state --
  * which is why resuming a nested suspend does not enable interrupts. */

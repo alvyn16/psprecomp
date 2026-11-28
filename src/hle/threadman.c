@@ -84,7 +84,7 @@
 /* Virtual microseconds in one scheduler tick, and the most real time a park
  * will ever spend (see the clock note above). */
 #define TICK_US      1000ull
-#define REAL_TICK_US 80ull
+#define REAL_TICK_US 50ull
 #define FRAME_US     16667ull      /* 59.94 Hz, the vblank a frame wait means */
 
 #define HOST_STACK_BYTES (16u * 1024u * 1024u)
@@ -270,9 +270,11 @@ static HOST_TLS psp_thread *g_tls_me;
  * guest thread exists.
  */
 #if PSPRECOMP_REAL_THREADS
-static host_mutex g_baton_m  = HOST_MUTEX_INIT;
-static host_cond  g_baton_cv = HOST_COND_INIT;
+static host_mutex g_baton_m     = HOST_MUTEX_INIT;
+static host_cond  g_baton_cv    = HOST_COND_INIT;
+static host_cond  g_handover_cv = HOST_COND_INIT;
 static int             g_baton_owned;
+static int             g_handover_waiters;
 
 /* Host threads sitting in baton_acquire, i.e. wanting the CPU right now. A
  * parker reads it to decide whether it may take the CPU back (see the handover
@@ -343,7 +345,7 @@ static void baton_acquire(void) {
     g_switches++;
     /* Whoever is holding a park open for a handover has just got what it was
      * waiting for. */
-    host_cond_broadcast(&g_baton_cv);
+    if (g_handover_waiters > 0) host_cond_broadcast(&g_handover_cv);
     TRACE_SCHED("acquired\n");
     host_mutex_unlock(&g_baton_m);
 }
@@ -353,7 +355,8 @@ static void baton_release(void) {
     if (--g_tls_depth) return;
     host_mutex_lock(&g_baton_m);
     g_baton_owned = 0;
-    host_cond_broadcast(&g_baton_cv);
+    host_cond_signal(&g_baton_cv);
+    if (g_handover_waiters > 0) host_cond_broadcast(&g_handover_cv);
     TRACE_SCHED("release\n");
     host_mutex_unlock(&g_baton_m);
 }
@@ -392,9 +395,8 @@ static int cpu_wanted_locked(void) {
 #define HANDOVER_CAP_US 20000    /* 20 ms of host time */
 static int handover_wait_locked(void) {
     uint64_t dl = host_deadline_us() + HANDOVER_CAP_US;
-
     while (!g_baton_owned && cpu_wanted_locked()) {
-        if (host_cond_until(&g_baton_cv, &g_baton_m, dl)) {
+        if (host_cond_until(&g_handover_cv, &g_baton_m, dl)) {
             return 1;
         }
     }
@@ -425,7 +427,8 @@ static int park_us(uint64_t timeout_us) {
         host_mutex_lock(&g_baton_m);
         takes0 = g_baton_takes;         /* to see, below, whether anyone ran */
         g_baton_owned = 0;
-        host_cond_broadcast(&g_baton_cv);
+        host_cond_signal(&g_baton_cv);
+        if (g_handover_waiters > 0) host_cond_broadcast(&g_handover_cv);
         host_mutex_unlock(&g_baton_m);
         g_tls_depth = 0;
     }
@@ -435,7 +438,8 @@ static int park_us(uint64_t timeout_us) {
     if (g_prof_tm && t && t->prof_last_us) t->prof_active_us += enter_us - t->prof_last_us;
     int woken = 0;
     if (t) {
-        uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+        const uint64_t cap = (t->wait_kind == W_DELAY && timeout_us > TICK_US) ? 500ull : REAL_TICK_US;
+        uint64_t real = timeout_us < cap ? timeout_us : cap;
         uint64_t t0 = g_prof_tm ? enter_us : 0;
         host_mutex_lock(&t->wlock);
         if (!t->woken) {
@@ -466,14 +470,16 @@ static int park_us(uint64_t timeout_us) {
          * -- see handover_wait_locked(). */
         int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
         int expired = 0;
+        g_handover_waiters++;
         for (;;) {
-            while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
+            while (g_baton_owned) host_cond_wait(&g_handover_cv, &g_baton_m);
             if (!cpu_wanted_locked()) break;
             handed = 1;
             if (handover_wait_locked()) { expired = 1; break; }
         }
         uint64_t h1 = g_prof_tm ? host_deadline_us() : 0;
-        while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
+        while (g_baton_owned) host_cond_wait(&g_handover_cv, &g_baton_m);
+        g_handover_waiters--;
         if (g_prof_tm) {
             uint64_t h2 = host_deadline_us();
             g_prof_handover_us += h1 - h0;
@@ -667,6 +673,31 @@ void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
 void psp_threadman_frame_wait(void) {
     deliver_tick();
     park_for(W_DELAY, FRAME_US);
+}
+
+void psp_threadman_idle_wait_ms(uint32_t ms) {
+#if PSPRECOMP_REAL_THREADS
+    int depth = g_tls_depth;
+    if (depth > 0) {
+        g_tls_depth = 1;
+        baton_release();
+    }
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)((ms % 1000u) * 1000000ul);
+    nanosleep(&ts, NULL);
+#endif
+    if (depth > 0) {
+        baton_acquire();
+        g_tls_depth = depth;
+    }
+#else
+    (void)ms;
+    psp_threadman_frame_wait();
+#endif
 }
 
 uint64_t psp_threadman_switches(void) { return g_switches; }
@@ -1124,12 +1155,7 @@ static void hle_DeleteThread(void) {
  * interrupt per tick. A bounded park is what DelayThread is; a sleep is the
  * same shape with a wakeup as its exit. */
 static void park_ticks(uint64_t us, int kind) {
-    uint64_t left = us ? us : TICK_US;
-    while (left) {
-        uint64_t step = left < TICK_US ? left : TICK_US;
-        park_for(kind, step);
-        left -= step;
-    }
+    park_for(kind, us ? us : TICK_US);
 }
 
 /* One wait, one delivery -- the same contract as every other wait point here,
