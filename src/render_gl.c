@@ -463,6 +463,7 @@ static int build_program(void) {
 static int ensure_context_current(void) {
     SDL_threadID tid = SDL_ThreadID();
     if (tid == g_ctx_tid) return 0;
+    if (g_ctx_tid != 0) return -1;
 #ifdef __linux__
     if (g_egl_dpy != EGL_NO_DISPLAY && g_egl_make_current) {
         if (g_egl_make_current(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx)) {
@@ -476,6 +477,19 @@ static int ensure_context_current(void) {
         return 0;
     }
     return -1;
+}
+
+static void release_context_current(void) {
+    if (g_ctx_tid == 0) return;
+#ifdef __linux__
+    if (g_egl_dpy != EGL_NO_DISPLAY && g_egl_make_current) {
+        g_egl_make_current(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+#endif
+    if (g_sdl_win && g_sdl_ctx) {
+        SDL_GL_MakeCurrent(g_sdl_win, NULL);
+    }
+    g_ctx_tid = 0;
 }
 
 static void drop_all_fbos(void) {
@@ -953,6 +967,8 @@ static int gl_init(int width, int height) {
 
     g_front_valid = 0;
     g_presented_this_list = 0;
+    /* Release context from the init thread so guest pthread(s) can bind it cleanly. */
+    release_context_current();
     psp_render_set_front_reader(gl_front_reader);
     g_ready = 1;
     fprintf(stderr, "render_gl: initialized OpenGL 3.3 Core (%dx scale)\n", g_scale);
@@ -1223,38 +1239,40 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
 
 static void gl_finish(void) {
     if (!g_ready) return;
-    if (ensure_context_current() != 0) return;
-
-    /* For single-buffered games or tests that never call sceDisplaySetFrameBuf
-     * every frame, copy once at GE_FINISH if we drew directly to front FB. */
-    if (!g_presented_this_list) {
-        gl_fbo *front = find_fbo(psp_display_framebuffer());
-        if (front && front->has_draws) {
-            capture_fbo_to_front(front);
+    if (ensure_context_current() == 0) {
+        /* For single-buffered games or tests that never call sceDisplaySetFrameBuf
+         * every frame, copy once at GE_FINISH if we drew directly to front FB. */
+        if (!g_presented_this_list) {
+            gl_fbo *front = find_fbo(psp_display_framebuffer());
+            if (front && front->has_draws) {
+                capture_fbo_to_front(front);
+            }
         }
+        g_presented_this_list = 0;
+        sync_scale_if_needed();
+        release_context_current();
     }
-    g_presented_this_list = 0;
-    sync_scale_if_needed();
 }
 
 static void gl_present(void) {
     if (!g_ready) return;
-    if (ensure_context_current() != 0) return;
-
-    gl_fbo *front = find_fbo(psp_display_framebuffer());
-    if (front && front->has_draws) {
-        capture_fbo_to_front(front);
-        front->has_draws = 0;
-    } else {
-        /* CPU wrote VRAM directly without GL draws: let window fall back cleanly. */
-        if (g_front_lock) {
-            SDL_LockMutex(g_front_lock);
-            g_front_valid = 0;
-            SDL_UnlockMutex(g_front_lock);
+    if (ensure_context_current() == 0) {
+        gl_fbo *front = find_fbo(psp_display_framebuffer());
+        if (front && front->has_draws) {
+            capture_fbo_to_front(front);
+            front->has_draws = 0;
+        } else {
+            /* CPU wrote VRAM directly without GL draws: let window fall back cleanly. */
+            if (g_front_lock) {
+                SDL_LockMutex(g_front_lock);
+                g_front_valid = 0;
+                SDL_UnlockMutex(g_front_lock);
+            }
         }
+        g_presented_this_list = 1;
+        sync_scale_if_needed();
+        release_context_current();
     }
-    g_presented_this_list = 1;
-    sync_scale_if_needed();
 }
 
 const psp_render_backend psp_render_gl = {

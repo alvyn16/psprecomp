@@ -990,11 +990,36 @@ static void test_hires_scale_and_gl_fallback(void) {
     /* "gl" backend is registered; under SDL_VIDEODRIVER=dummy init() returns -1
      * and psp_render_apply_pending falls back cleanly to software. */
     CHECK(strcmp(psp_render_gl.name, "gl") == 0, "psp_render_gl named gl");
+    psp_render_set_scale(2);
     psp_render_request_backend("gl");
     psp_render_apply_pending();
     CHECK(psp_render_current() == &psp_render_gl ||
           psp_render_current() == &psp_render_software,
           "pending gl switch either initializes GL or falls back to software");
+    if (psp_render_current() == &psp_render_gl) {
+        psp_ge_reset();
+        clear_fb();
+        begin_list();
+        vertex(0, 0, 0, 0xFF112233u);
+        vertex(1, 32, 32, 0xFF112233u);
+        cmd(0x04, (6u << 16) | 2u);
+        end_list();
+        CHECK(psp_render_pixels() > 0, "gl draw updates pixel counter");
+        uint32_t *front2x = (uint32_t *)malloc(960u * 544u * 4u);
+        CHECK(front2x != NULL, "alloc 2x front buffer");
+        if (front2x) {
+            int gf_rc = psp_render_copy_front(front2x, 960u * 544u, &fw, &fh);
+            CHECK(gf_rc == 0 && fw == 960 && fh == 544,
+                  "gl 2x front buffer is 960x544 (got rc=%d %dx%d)", gf_rc, fw, fh);
+            if (gf_rc == 0 && fw == 960) {
+                CHECK(front2x[10 * 960 + 10] == 0xFF112233u,
+                      "gl 2x front pixel(10,10) matches 0xFF112233: 0x%08X",
+                      front2x[10 * 960 + 10]);
+            }
+            free(front2x);
+        }
+    }
+    psp_render_set_scale(1);
     psp_render_request_backend("software");
     psp_render_apply_pending();
     CHECK(psp_render_current() == &psp_render_software,
