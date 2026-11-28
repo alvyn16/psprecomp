@@ -2,6 +2,7 @@
 
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/render.h"
 
 #include <string.h>
 
@@ -219,6 +220,7 @@ static int g_scale;
 static int g_win_w = W * 2, g_win_h = H * 2;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
+static uint32_t g_hires_px[W * 4 * H * 4];
 static SDL_GameController *g_pad;
 static SDL_Thread *g_thread;
 static int g_focused;
@@ -354,7 +356,8 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
     return b;
 }
 
-static void render(SDL_Renderer *r, SDL_Texture *tex, int aspect_mode) {
+static void render(SDL_Renderer *r, SDL_Texture **tex, int *tex_w, int *tex_h,
+                   int cur_filter, int aspect_mode) {
     int cw, ch;
     SDL_GetRendererOutputSize(r, &cw, &ch);
     int dw = cw, dh = ch;
@@ -372,11 +375,34 @@ static void render(SDL_Renderer *r, SDL_Texture *tex, int aspect_mode) {
     const SDL_Rect dst = { (cw - dw) / 2, (ch - dh) / 2, dw, dh };
     SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
     SDL_RenderClear(r);
-    if (psp_display_read(g_px) == 0) {
-        /* The front buffer is 0xAABBGGRR (little-endian bytes RR,GG,BB,AA),
-         * which is SDL_PIXELFORMAT_ABGR8888 (SDL_PIXELFORMAT_RGBA32). */
-        SDL_UpdateTexture(tex, NULL, g_px, W * 4);
-        SDL_RenderCopy(r, tex, NULL, &dst);
+
+    int fw = W, fh = H;
+    const uint32_t *src_px = NULL;
+    if (psp_render_copy_front(g_hires_px, (uint32_t)(W * 4 * H * 4), &fw, &fh) == 0 &&
+        fw >= W && fh >= H && fw <= W * 4 && fh <= H * 4) {
+        src_px = g_hires_px;
+    } else if (psp_display_read(g_px) == 0) {
+        fw = W; fh = H;
+        src_px = g_px;
+    }
+    if (src_px) {
+        if (*tex_w != fw || *tex_h != fh || !*tex) {
+            SDL_Texture *nt = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
+                                                SDL_TEXTUREACCESS_STREAMING, fw, fh);
+            if (nt) {
+                SDL_SetTextureScaleMode(nt, cur_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+                if (*tex) SDL_DestroyTexture(*tex);
+                *tex = nt;
+                *tex_w = fw;
+                *tex_h = fh;
+            }
+        }
+        if (*tex && *tex_w == fw && *tex_h == fh) {
+            /* The front buffer is 0xAABBGGRR (little-endian bytes RR,GG,BB,AA),
+             * which is SDL_PIXELFORMAT_ABGR8888 (SDL_PIXELFORMAT_RGBA32). */
+            SDL_UpdateTexture(*tex, NULL, src_px, fw * 4);
+            SDL_RenderCopy(r, *tex, NULL, &dst);
+        }
     }
 #ifdef PSPRECOMP_IMGUI_UI
     psp_overlay_render(r);
@@ -399,8 +425,9 @@ static int SDLCALL window_main(void *arg) {
     SDL_RendererInfo rinfo;
     int vsync = r && SDL_GetRendererInfo(r, &rinfo) == 0 &&
                 (rinfo.flags & SDL_RENDERER_PRESENTVSYNC);
+    int tex_w = W, tex_h = H;
     SDL_Texture *tex = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888,
-                                             SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
+                                             SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h) : NULL;
     if (tex) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
     if (!tex) g_closed = 1;
 #ifdef PSPRECOMP_IMGUI_UI
@@ -471,10 +498,10 @@ static int SDLCALL window_main(void *arg) {
 #ifdef PSPRECOMP_IMGUI_UI
         uint32_t kbd = psp_overlay_want_keyboard() ? 0u : keyboard();
         psp_ctrl_set(kbd | pad(&ax, &ay), ax, ay);
-        render(r, tex, ov.aspect_mode);
+        render(r, &tex, &tex_w, &tex_h, cur_filter, ov.aspect_mode);
 #else
         psp_ctrl_set(keyboard() | pad(&ax, &ay), ax, ay);
-        render(r, tex, 0);
+        render(r, &tex, &tex_w, &tex_h, 0, 0);
 #endif
         if (vsync) {
             next = SDL_GetTicks();            /* SDL_RenderPresent paced us */

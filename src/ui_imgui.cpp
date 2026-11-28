@@ -125,8 +125,31 @@ static void draw_menu_bar(void) {
             ImGui::EndMenu();
         }
         ImGui::Separator();
+        {
+            const char *bname = psp_render_current()->name;
+            bool is_gl = (bname && strcmp(bname, "gl") == 0);
+            if (ImGui::BeginMenu("Renderer")) {
+                if (ImGui::MenuItem("OpenGL (GPU Hi-Res)", NULL, is_gl))
+                    psp_render_request_backend("gl");
+                if (ImGui::MenuItem("Software (CPU 1x)", NULL, !is_gl))
+                    psp_render_request_backend("software");
+                ImGui::EndMenu();
+            }
+            const int cur_sc = psp_render_get_scale();
+            if (ImGui::BeginMenu("Internal Resolution")) {
+                const char *labels[4] = { "1x (480x272 PSP)", "2x (960x544)",
+                                          "3x (1440x816)", "4x (1920x1088)" };
+                for (int s = 1; s <= 4; s++) {
+                    if (ImGui::MenuItem(labels[s - 1], NULL, cur_sc == s))
+                        psp_render_set_scale(s);
+                }
+                ImGui::EndMenu();
+            }
+        }
+        bool tf = psp_render_get_tex_filter() != 0;
+        if (ImGui::MenuItem("Smooth 3D Textures", NULL, &tf)) psp_render_set_tex_filter(tf ? 1 : 0);
         bool lin = g_ov->linear_filter != 0;
-        if (ImGui::MenuItem("Linear Filtering", NULL, &lin)) g_ov->linear_filter = lin ? 1 : 0;
+        if (ImGui::MenuItem("Linear Screen Filtering", NULL, &lin)) g_ov->linear_filter = lin ? 1 : 0;
         if (ImGui::BeginMenu("Aspect Mode")) {
             const char *modes[3] = { "Fit 16:9", "Integer Scale", "Stretch" };
             for (int i = 0; i < 3; i++)
@@ -222,8 +245,24 @@ static void draw_extra_windows(void) {
                 if (ImGui::Checkbox("VSync (Host Present)", &vs)) g_ov->vsync = vs ? 1 : 0;
             }
             if (ImGui::CollapsingHeader("Graphics", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const char *bname = psp_render_current()->name;
+                int backend_idx = (bname && strcmp(bname, "gl") == 0) ? 0 : 1;
+                const char *backends[2] = { "OpenGL (GPU Hi-Res)", "Software (CPU 1x)" };
+                if (ImGui::Combo("Renderer", &backend_idx, backends, 2)) {
+                    psp_render_request_backend(backend_idx == 0 ? "gl" : "software");
+                }
+                int scale_idx = psp_render_get_scale() - 1;
+                if (scale_idx < 0) scale_idx = 0;
+                if (scale_idx > 3) scale_idx = 3;
+                const char *scales[4] = { "1x (480x272 PSP)", "2x (960x544)",
+                                          "3x (1440x816)", "4x (1920x1088)" };
+                if (ImGui::Combo("Internal Resolution", &scale_idx, scales, 4)) {
+                    psp_render_set_scale(scale_idx + 1);
+                }
+                bool tf = psp_render_get_tex_filter() != 0;
+                if (ImGui::Checkbox("Smooth 3D Textures", &tf)) psp_render_set_tex_filter(tf ? 1 : 0);
                 bool lin = g_ov->linear_filter != 0;
-                if (ImGui::Checkbox("Linear Texture Filter", &lin)) g_ov->linear_filter = lin ? 1 : 0;
+                if (ImGui::Checkbox("Linear Screen Filter", &lin)) g_ov->linear_filter = lin ? 1 : 0;
                 const char *modes[3] = { "Fit 16:9", "Integer Scale", "Stretch" };
                 ImGui::Combo("Aspect Mode", &g_ov->aspect_mode, modes, 3);
                 if (ImGui::Button("Toggle Fullscreen (F11)")) g_ov->fullscreen_req = 1;

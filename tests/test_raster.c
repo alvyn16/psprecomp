@@ -965,6 +965,43 @@ static void test_stencil_cull_and_mask(void) {
     CHECK(pixel(80, 80) == 0x80404040u, "unshadowed region stayed lit: 0x%08X", pixel(80, 80));
 }
 
+static void test_hires_scale_and_gl_fallback(void) {
+    /* Resolution scale and texture filter clamps. */
+    psp_render_set_scale(0);
+    CHECK(psp_render_get_scale() == 1, "scale below 1 clamps to 1");
+    psp_render_set_scale(3);
+    CHECK(psp_render_get_scale() == 3, "scale 3 preserved");
+    psp_render_set_scale(99);
+    CHECK(psp_render_get_scale() == 4, "scale above 4 clamps to 4");
+    psp_render_set_scale(1);
+
+    psp_render_set_tex_filter(5);
+    CHECK(psp_render_get_tex_filter() == 1, "tex filter non-zero normalizes to 1");
+    psp_render_set_tex_filter(0);
+    CHECK(psp_render_get_tex_filter() == 0, "tex filter 0 preserved");
+
+    /* Copy front without a hi-res reader must fail cleanly. */
+    uint32_t dummy_px[4];
+    int fw = 0, fh = 0;
+    CHECK(psp_render_copy_front(dummy_px, 4, &fw, &fh) != 0,
+          "no hi-res front reader active by default");
+
+#ifdef PSPRECOMP_SDL2_WINDOW
+    /* "gl" backend is registered; under SDL_VIDEODRIVER=dummy init() returns -1
+     * and psp_render_apply_pending falls back cleanly to software. */
+    CHECK(strcmp(psp_render_gl.name, "gl") == 0, "psp_render_gl named gl");
+    psp_render_request_backend("gl");
+    psp_render_apply_pending();
+    CHECK(psp_render_current() == &psp_render_gl ||
+          psp_render_current() == &psp_render_software,
+          "pending gl switch either initializes GL or falls back to software");
+    psp_render_request_backend("software");
+    psp_render_apply_pending();
+    CHECK(psp_render_current() == &psp_render_software,
+          "pending software switch restores software backend");
+#endif
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -994,6 +1031,7 @@ int main(void) {
     test_list_offset_origin_and_uncached_stall();
     test_skinning();
     test_stencil_cull_and_mask();
+    test_hires_scale_and_gl_fallback();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

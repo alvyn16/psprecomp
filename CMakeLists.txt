@@ -83,7 +83,7 @@ if(PSPRECOMP_SDL2_WINDOW AND NOT WIN32)
     if(TARGET PkgConfig::SDL2)
         target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2_WINDOW=1)
         target_link_libraries(psprecomp PUBLIC PkgConfig::SDL2)
-        target_sources(psprecomp PRIVATE src/render_gpu.c)
+        target_sources(psprecomp PRIVATE src/render_gpu.c src/render_gl.c)
 
         # Optional Dear ImGui backend for the save-state UI. The sources are
         # vendored (MIT) so a Linux host needs only SDL2, not a system ImGui.

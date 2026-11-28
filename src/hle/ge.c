@@ -575,6 +575,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int w_off, int tex_off,
     out->clip[3] = 1;
     if (through) {
         /* Through mode's depth is an unsigned 16-bit value. */
+        out->fx = pos[0];
+        out->fy = pos[1];
         out->x = (int)pos[0];
         out->y = (int)pos[1];
         out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
@@ -587,6 +589,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int w_off, int tex_off,
     if (g_lt.enable) out->rgba = light_vertex(pos, n, out->rgba);
     float sx, sy, sz;
     if (!transform(pos, &sx, &sy, &sz, out->clip)) { out->behind = 1; g_xf.behind++; return 1; }
+    out->fx = sx;
+    out->fy = sy;
     out->x = (int)floorf(sx);
     out->y = (int)floorf(sy);
     out->z = sz;
@@ -628,13 +632,17 @@ static psp_vertex clip_lerp(const psp_vertex *a, const psp_vertex *b, float t) {
 static void clip_project(psp_vertex *v) {
     float w = v->clip[3];
     if (w < NEAR_EPS) w = NEAR_EPS;
-    v->x = (int)floorf(v->clip[0] / w * g_xf.xscale + g_xf.xpos - g_xf.offx);
-    v->y = (int)floorf(v->clip[1] / w * g_xf.yscale + g_xf.ypos - g_xf.offy);
-    v->z = v->clip[2] / w * g_xf.zscale + g_xf.zpos;
+    float sx = v->clip[0] / w * g_xf.xscale + g_xf.xpos - g_xf.offx;
+    float sy = v->clip[1] / w * g_xf.yscale + g_xf.ypos - g_xf.offy;
     /* Edge functions are integer; keep clamped intersections from overflowing
      * them when a vertex is very close to the near plane. */
-    if (v->x < -16384) v->x = -16384; else if (v->x > 16384) v->x = 16384;
-    if (v->y < -16384) v->y = -16384; else if (v->y > 16384) v->y = 16384;
+    if (sx < -16384.0f) sx = -16384.0f; else if (sx > 16384.0f) sx = 16384.0f;
+    if (sy < -16384.0f) sy = -16384.0f; else if (sy > 16384.0f) sy = 16384.0f;
+    v->fx = sx;
+    v->fy = sy;
+    v->x = (int)floorf(sx);
+    v->y = (int)floorf(sy);
+    v->z = v->clip[2] / w * g_xf.zscale + g_xf.zpos;
     v->behind = 0;
 }
 
@@ -824,7 +832,11 @@ static void run_list(ge_queue *q) {
 
         case GE_END:
         case GE_FINISH:
-            if (cmd == GE_FINISH) g_ge.finishes++;
+            if (cmd == GE_FINISH) {
+                g_ge.finishes++;
+                psp_render_current()->finish();
+                psp_render_apply_pending();
+            }
             /* A finished list gives its slot back. Keeping it used meant the
              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
              * frames while running at full speed. */

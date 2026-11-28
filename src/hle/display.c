@@ -110,6 +110,8 @@ static void hle_SetFrameBuf(void) {
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    psp_render_current()->present();
+    psp_render_apply_pending();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

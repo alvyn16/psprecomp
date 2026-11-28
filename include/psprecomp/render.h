@@ -20,6 +20,7 @@
  * here and below are 0xAABBGGRR, the GE's own byte order. */
 typedef struct {
     int      x, y;
+    float    fx, fy;         /* subpixel screen coordinates for hi-res backends */
     float    z;              /* depth, 0..65535 */
     uint32_t rgba;
     float    u, v;
@@ -122,9 +123,22 @@ typedef struct {
     void (*present)(void);
 } psp_render_backend;
 
-/* Select a backend by name ("software", "null", ...). Returns 0 on success,
- * -1 if the name is unknown, leaving the current backend in place. */
+/* Select a backend by name ("software", "null", "gpu", "gl"). Returns 0 on
+ * success, -1 if the name is unknown, leaving the current backend in place. */
 int psp_render_select(const char *name);
+/* Thread-safe backend switch request (applied at end of frame by guest). */
+void psp_render_request_backend(const char *name);
+void psp_render_apply_pending(void);
+
+/* Internal resolution scale (1..4, applies to hi-res backends like "gl"). */
+void psp_render_set_scale(int scale);
+int  psp_render_get_scale(void);
+void psp_render_set_tex_filter(int linear);
+int  psp_render_get_tex_filter(void);
+
+/* Copy the latest hi-res host front buffer if available (returns 0 on success). */
+int psp_render_copy_front(uint32_t *dst_buf, uint32_t dst_cap_px, int *out_w, int *out_h);
+void psp_render_set_front_reader(int (*fn)(uint32_t *dst_buf, uint32_t dst_cap_px, int *out_w, int *out_h));
 
 /* The active backend. Never NULL -- defaults to software. */
 const psp_render_backend *psp_render_current(void);
@@ -148,6 +162,8 @@ uint32_t psp_color_pack(uint32_t c, int fmt);
 /* SDL2-accelerated backend; only available when the toolkit was built with
  * SDL2. Sprites go through the GPU, other primitives use the software path. */
 extern const psp_render_backend psp_render_gpu;
+/* OpenGL 3.3 Core full 2D+3D hardware backend with 1x-4x internal resolution. */
+extern const psp_render_backend psp_render_gl;
 #endif
 
 /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.

@@ -738,22 +738,88 @@ const psp_render_backend psp_render_null = {
     "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
 };
 
-/* ---- selection ----------------------------------------------------------- */
+/* ---- selection & hi-res coordination ------------------------------------- */
+
+static const psp_render_backend *const g_all_backends[] = {
+    &psp_render_software,
+    &psp_render_null
+#ifdef PSPRECOMP_SDL2_WINDOW
+    , &psp_render_gpu
+    , &psp_render_gl
+#endif
+};
 
 static const psp_render_backend *g_backend = &psp_render_software;
+static const psp_render_backend *g_pending_backend = NULL;
+static int g_render_scale = 1;
+static int g_tex_filter = 0;
+typedef int (*psp_front_reader_fn)(uint32_t *dst_buf, uint32_t dst_cap_px,
+                                   int *out_w, int *out_h);
+static psp_front_reader_fn g_front_reader = NULL;
+
+static const psp_render_backend *find_backend(const char *name) {
+    if (!name) return NULL;
+    for (size_t i = 0; i < sizeof g_all_backends / sizeof g_all_backends[0]; i++) {
+        if (strcmp(g_all_backends[i]->name, name) == 0) {
+            return g_all_backends[i];
+        }
+    }
+    return NULL;
+}
 
 const psp_render_backend *psp_render_current(void) { return g_backend; }
 
 int psp_render_select(const char *name) {
-    static const psp_render_backend *const all[] = {
-        &psp_render_software, &psp_render_null
-#ifdef PSPRECOMP_SDL2_WINDOW
-        , &psp_render_gpu
-#endif
-    };
-    if (!name) return -1;
-    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
-        if (strcmp(all[i]->name, name) == 0) { g_backend = all[i]; return 0; }
+    const psp_render_backend *b = find_backend(name);
+    if (!b) return -1;               /* unknown: keep the current backend */
+    g_backend = b;
+    return 0;
+}
+
+void psp_render_request_backend(const char *name) {
+    const psp_render_backend *b = find_backend(name);
+    if (!b) return;
+    __atomic_store_n(&g_pending_backend, b, __ATOMIC_RELEASE);
+}
+
+void psp_render_apply_pending(void) {
+    const psp_render_backend *b =
+        __atomic_exchange_n(&g_pending_backend, NULL, __ATOMIC_ACQ_REL);
+    if (!b || b == g_backend) return;
+    const psp_render_backend *prev = g_backend;
+    if (prev->shutdown) prev->shutdown();
+    g_backend = b;
+    if (b->init && b->init(480, 272) != 0) {
+        g_backend = &psp_render_software;
+        if (psp_render_software.init) psp_render_software.init(480, 272);
     }
-    return -1;                       /* unknown: keep the current backend */
+}
+
+void psp_render_set_scale(int scale) {
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+    __atomic_store_n(&g_render_scale, scale, __ATOMIC_RELEASE);
+}
+
+int psp_render_get_scale(void) {
+    return __atomic_load_n(&g_render_scale, __ATOMIC_ACQUIRE);
+}
+
+void psp_render_set_tex_filter(int linear) {
+    __atomic_store_n(&g_tex_filter, linear ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+int psp_render_get_tex_filter(void) {
+    return __atomic_load_n(&g_tex_filter, __ATOMIC_ACQUIRE);
+}
+
+void psp_render_set_front_reader(psp_front_reader_fn fn) {
+    __atomic_store_n(&g_front_reader, fn, __ATOMIC_RELEASE);
+}
+
+int psp_render_copy_front(uint32_t *dst_buf, uint32_t dst_cap_px,
+                          int *out_w, int *out_h) {
+    psp_front_reader_fn fn = __atomic_load_n(&g_front_reader, __ATOMIC_ACQUIRE);
+    if (!fn) return -1;
+    return fn(dst_buf, dst_cap_px, out_w, out_h);
 }
