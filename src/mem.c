@@ -112,9 +112,18 @@ void psp_mem_free(void) {
 
 int psp_mem_map_module(uint32_t base, uint32_t size) {
     free(g_module);
+    g_module = NULL;
+    g_module_base = 0;
+    g_module_size = 0;
+    const uint32_t a = base & PSP_ADDR_MASK;
+    if (size && a >= PSP_RAM_BASE &&
+        (uint64_t)a + (uint64_t)size <= (uint64_t)PSP_RAM_BASE + PSP_RAM_SIZE) {
+        refresh_fast_flags();
+        return 0;
+    }
     g_module = (uint8_t *)calloc(1, size ? size : 1);
-    if (!g_module) { g_module_size = 0; refresh_fast_flags(); return -1; }
-    g_module_base = base;
+    if (!g_module) { refresh_fast_flags(); return -1; }
+    g_module_base = a;
     g_module_size = size;
     refresh_fast_flags();
     return 0;
