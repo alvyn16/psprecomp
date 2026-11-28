@@ -15,7 +15,23 @@ uint64_t   psp_mem_bad_access;
  * path is the one place that can answer it directly. */
 static uint32_t g_wwatch;
 static int g_whits;
-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
+static uint32_t g_rwatch;
+static uint32_t g_rfns[16];
+static int g_rfn_n;
+static uint8_t *g_module;
+static uint32_t g_module_base, g_module_size;
+
+int psp_mem_fast_r;
+int psp_mem_fast_w;
+
+static void refresh_fast_flags(void) {
+    int ready = psp_mem.ram != NULL && g_module_size == 0;
+    psp_mem_fast_r = ready && g_rwatch == 0;
+    psp_mem_fast_w = ready && g_wwatch == 0;
+}
+
+int psp_mem_watching(void) { return g_rwatch != 0 || g_wwatch != 0; }
+void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; refresh_fast_flags(); }
 int psp_mem_watch_hits(void) { return g_whits; }
 
 static void note_write(uint32_t addr, uint32_t width) {
@@ -36,10 +52,7 @@ static void note_write(uint32_t addr, uint32_t width) {
  * a value is right in memory and the game still does not act on it. A field
  * read every frame would repeat one name forever, so each distinct reading
  * function is printed once. */
-static uint32_t g_rwatch;
-static uint32_t g_rfns[16];
-static int g_rfn_n;
-void psp_mem_watch_read(uint32_t addr) { g_rwatch = addr; g_rfn_n = 0; }
+void psp_mem_watch_read(uint32_t addr) { g_rwatch = addr; g_rfn_n = 0; refresh_fast_flags(); }
 
 static void note_read(uint32_t addr, uint32_t width) {
     if (!g_rwatch || addr + width <= g_rwatch || addr > g_rwatch) return;
@@ -85,6 +98,7 @@ int psp_mem_init(void) {
         return -1;
     }
     psp_mem_bad_access = 0;
+    refresh_fast_flags();
     return 0;
 }
 
@@ -93,18 +107,16 @@ void psp_mem_free(void) {
     free(psp_mem.vram);
     free(psp_mem.scratch);
     psp_mem.ram = psp_mem.vram = psp_mem.scratch = NULL;
+    refresh_fast_flags();
 }
-
-/* The loaded module image, for a PRX linked outside the RAM window. */
-static uint8_t *g_module;
-static uint32_t g_module_base, g_module_size;
 
 int psp_mem_map_module(uint32_t base, uint32_t size) {
     free(g_module);
     g_module = (uint8_t *)calloc(1, size ? size : 1);
-    if (!g_module) { g_module_size = 0; return -1; }
+    if (!g_module) { g_module_size = 0; refresh_fast_flags(); return -1; }
     g_module_base = base;
     g_module_size = size;
+    refresh_fast_flags();
     return 0;
 }
 
@@ -149,10 +161,10 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     memcpy(&v, p, sizeof v);                         \
     return v;
 
-uint8_t  psp_read8 (uint32_t addr) { READ_BODY(uint8_t)  }
-uint16_t psp_read16(uint32_t addr) { READ_BODY(uint16_t) }
-uint32_t psp_read32(uint32_t addr) { READ_BODY(uint32_t) }
-float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
+uint8_t  psp_read8_slow (uint32_t addr) { READ_BODY(uint8_t)  }
+uint16_t psp_read16_slow(uint32_t addr) { READ_BODY(uint16_t) }
+uint32_t psp_read32_slow(uint32_t addr) { READ_BODY(uint32_t) }
+float    psp_read_f32_slow(uint32_t addr) { READ_BODY(float)  }
 
 #define WRITE_BODY(TYPE)                             \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
@@ -160,10 +172,10 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
     note_write(addr, (uint32_t)sizeof(TYPE));                    \
     memcpy(p, &val, sizeof(TYPE));
 
-void psp_write8 (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
-void psp_write16(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
-void psp_write32(uint32_t addr, uint32_t val) { WRITE_BODY(uint32_t) }
-void psp_write_f32(uint32_t addr, float  val) { WRITE_BODY(float)    }
+void psp_write8_slow (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
+void psp_write16_slow(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
+void psp_write32_slow(uint32_t addr, uint32_t val) { WRITE_BODY(uint32_t) }
+void psp_write_f32_slow(uint32_t addr, float  val) { WRITE_BODY(float)    }
 
 int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
     void *p = psp_mem_ptr(addr, len);
