@@ -84,7 +84,7 @@
 /* Virtual microseconds in one scheduler tick, and the most real time a park
  * will ever spend (see the clock note above). */
 #define TICK_US      1000ull
-#define REAL_TICK_US 400ull
+#define REAL_TICK_US 80ull
 #define FRAME_US     16667ull      /* 59.94 Hz, the vblank a frame wait means */
 
 #define HOST_STACK_BYTES (16u * 1024u * 1024u)
@@ -365,7 +365,7 @@ static int cpu_wanted_locked(void) {
     /* Guest records may change while another guest owns the CPU. Do not
      * inspect them until the baton is free (all mutations then happen-before
      * this lock acquisition). */
-    if (g_baton_owned || g_baton_waiters > 0) return 1;
+    if (g_baton_waiters > 0) return 1;
     for (int i = 0; i < MAX_THREADS; i++)
         if (g_thread[i].used && g_thread[i].cpu_pending) return 1;
     return 0;
@@ -391,7 +391,7 @@ static int cpu_wanted_locked(void) {
 static int handover_wait_locked(void) {
     uint64_t dl = host_deadline_us() + HANDOVER_CAP_US;
 
-    while (cpu_wanted_locked()) {
+    while (!g_baton_owned && cpu_wanted_locked()) {
         if (host_cond_until(&g_baton_cv, &g_baton_m, dl)) {
             return 1;
         }
@@ -464,7 +464,12 @@ static int park_us(uint64_t timeout_us) {
          * -- see handover_wait_locked(). */
         int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
         int expired = 0;
-        if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
+        for (;;) {
+            while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
+            if (!cpu_wanted_locked()) break;
+            handed = 1;
+            if (handover_wait_locked()) { expired = 1; break; }
+        }
         uint64_t h1 = g_prof_tm ? host_deadline_us() : 0;
         while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
         if (g_prof_tm) {

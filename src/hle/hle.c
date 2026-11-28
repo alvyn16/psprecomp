@@ -8,11 +8,36 @@
 #include <string.h>
 
 #define HLE_MAX 512
+#define HLE_HASH_CAP 2048
 
 static psp_hle_entry g_entry[HLE_MAX];
 static psp_hle_fn    g_fn[HLE_MAX];
 static int           g_count;
 static uint64_t      g_calls[HLE_MAX];      /* per registered entry */
+static int16_t       g_nid_hash[HLE_HASH_CAP]; /* entry_index + 1, 0 = empty */
+
+static inline uint32_t hle_hash_slot(uint32_t nid) {
+    return (nid * 2654435761u) & (HLE_HASH_CAP - 1u);
+}
+
+static void hle_hash_insert(uint32_t nid, int idx) {
+    uint32_t s = hle_hash_slot(nid);
+    while (g_nid_hash[s]) {
+        if (g_entry[g_nid_hash[s] - 1].nid == nid) { g_nid_hash[s] = (int16_t)(idx + 1); return; }
+        s = (s + 1u) & (HLE_HASH_CAP - 1u);
+    }
+    g_nid_hash[s] = (int16_t)(idx + 1);
+}
+
+static int hle_find_index(uint32_t nid) {
+    uint32_t s = hle_hash_slot(nid);
+    while (g_nid_hash[s]) {
+        int idx = g_nid_hash[s] - 1;
+        if (g_entry[idx].nid == nid) return idx;
+        s = (s + 1u) & (HLE_HASH_CAP - 1u);
+    }
+    return -1;
+}
 
 /* Unimplemented NIDs, counted individually: "9 so far" says nothing about
  * whether one call is being made a billion times. */
@@ -23,15 +48,15 @@ static int g_unimpl_n;
 void psp_hle_register(uint32_t nid, const char *lib, const char *name, psp_hle_fn fn) {
     /* Re-registering replaces, so a game repo can override one function
      * without forking the table. */
-    for (int i = 0; i < g_count; i++) {
-        if (g_entry[i].nid == nid) { g_fn[i] = fn; g_entry[i].name = name; return; }
-    }
+    int existing = hle_find_index(nid);
+    if (existing >= 0) { g_fn[existing] = fn; g_entry[existing].name = name; return; }
     if (g_count >= HLE_MAX) return;
-    g_entry[g_count].nid = nid;
-    g_entry[g_count].lib = lib;
-    g_entry[g_count].name = name;
-    g_fn[g_count] = fn;
-    g_count++;
+    int idx = g_count++;
+    g_entry[idx].nid = nid;
+    g_entry[idx].lib = lib;
+    g_entry[idx].name = name;
+    g_fn[idx] = fn;
+    hle_hash_insert(nid, idx);
 }
 
 /* Register a NID whose name is genuinely unknown.
@@ -55,9 +80,8 @@ int psp_hle_is_named(int index) {
 }
 
 const char *psp_hle_name(uint32_t nid) {
-    for (int i = 0; i < g_count; i++)
-        if (g_entry[i].nid == nid) return g_entry[i].name;
-    return NULL;
+    int idx = hle_find_index(nid);
+    return idx >= 0 ? g_entry[idx].name : NULL;
 }
 
 int psp_hle_count(void) { return g_count; }
@@ -129,13 +153,12 @@ static uint64_t g_unimpl_total;
 static uint64_t g_unimpl_logged;
 
 void psp_hle_call(uint32_t nid) {
-    for (int i = 0; i < g_count; i++) {
-        if (g_entry[i].nid == nid) {
-            g_calls[i]++;
-            g_fn[i]();
-            if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
-            return;
-        }
+    int idx = hle_find_index(nid);
+    if (idx >= 0) {
+        g_calls[idx]++;
+        g_fn[idx]();
+        if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[idx].name);
+        return;
     }
     note_zero(nid, NULL);
 
