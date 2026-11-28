@@ -766,12 +766,14 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     end_op();
 }
 
-/* Transform a vector by a matrix: vd[r] = sum over c of M[c][r] * v[c].
+/* Transform a vector by a matrix: vd[r] = sum over c of M[r][c] * v[c].
  *
- * This is the column-major product a graphics pipeline wants -- the matrix
- * columns are the transformed basis vectors, so transforming (1,0,0,0) yields
- * column 0. That property is what the test pins, and it is the one that
- * distinguishes this from its transpose. */
+ * Like vmmul, vtfm takes its first operand transposed (M^T * v): a matrix M's
+ * columns are dotted by passing its transposed E-form (`vtfm3 v6, E300, v4`
+ * computes M300 * v4, just as `vmmul.q M000, E100, M200` computes M100 * M200).
+ * Verified against Dante's Inferno (ULES01388), whose camera/view matrix at
+ * 0x08928CD0, 0x08928D60 and 0x08A1DEA8 transforms vectors using M^T * v,
+ * matching Allegrex hardware and `vmmul`'s orientation. */
 void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float m[4][4];
     int d[4], t[4];
@@ -781,13 +783,14 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
     float in[4], out[4];
     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
-    /* The hardware applies S to the last matrix column and T to the vector,
-     * both only for the final output element. */
+    /* The hardware applies S to the last matrix column read (here the last row
+     * of the transposed matrix, i.e. column `size - 1` of the underlying
+     * matrix view) and T to the vector, both only for the final output element. */
     apply_st(m[size - 1], size, 0);
     apply_st(in, size, 1);
     for (int r = 0; r < size; r++) {
         float sum = 0.0f;
-        for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
+        for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
         out[r] = sum;
     }
     /* vd may be one of the sources, so write only after the whole result is

@@ -402,9 +402,8 @@ static void test_matrix_transform(void) {
     psp_vfpu_reset();
     float m[4][4];
 
-    /* Transforming a basis vector must yield the corresponding matrix column.
-     * That is the property which distinguishes this convention from its
-     * transpose -- an identity test would pass either way. */
+    /* Transforming a basis vector by E-form must yield the corresponding matrix
+     * column, matching vmmul's transposed first-operand convention (M^T * v). */
     for (int c = 0; c < 4; c++)
         for (int r = 0; r < 4; r++) m[c][r] = (float)(c * 4 + r + 1);
     set_matrix(0x08, 4, m);
@@ -414,10 +413,15 @@ static void test_matrix_transform(void) {
         psp_vfpu_regs(0x40, 4, t);
         for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = (i == basis) ? 1.0f : 0.0f;
 
-        psp_vtfm(0x44, 0x08, 0x40, 4);
+        psp_vtfm(0x44, 0x28, 0x40, 4);    /* E200 * e_basis = column `basis` of M200 */
         psp_vfpu_regs(0x44, 4, d);
         for (int r = 0; r < 4; r++)
-            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm of a basis vector is that column");
+            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "E-form vtfm of a basis vector is that column");
+
+        psp_vtfm(0x44, 0x08, 0x40, 4);    /* M200 * e_basis = M200^T * e_basis = row `basis` */
+        psp_vfpu_regs(0x44, 4, d);
+        for (int r = 0; r < 4; r++)
+            CHECK_F(psp_cpu.v[d[r]], m[r][basis], "plain vtfm of a basis vector is that row");
     }
 
     /* Multiplying by the identity must be a no-op, in both operand positions.
@@ -436,9 +440,7 @@ static void test_matrix_transform(void) {
         for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "I * M == M");
 
     /* vmmul and vtfm must agree: transforming by a product is the same as
-     * transforming twice. This is the strongest check available without an
-     * external oracle -- it pins the two against each other, though it still
-     * cannot detect a consistent transpose of both. */
+     * transforming twice, both taking their matrix operand via E-form. */
     float a[4][4], b[4][4];
     for (int c = 0; c < 4; c++)
         for (int r = 0; r < 4; r++) {
@@ -459,15 +461,15 @@ static void test_matrix_transform(void) {
 
     /* (A*B) * x */
     psp_vmmul(0x14, 0x28, 0x10, 4);       /* matrix 5 = A*B, via E-form A */
-    psp_vtfm(0x1C, 0x14, 0x18, 4);        /* matrix 7 */
+    psp_vtfm(0x1C, 0x34, 0x18, 4);        /* E500 * x */
     float combined[4];
     int d[4];
     psp_vfpu_regs(0x1C, 4, d);
     for (int i = 0; i < 4; i++) combined[i] = psp_cpu.v[d[i]];
 
     /* A * (B * x) */
-    psp_vtfm(0x00, 0x10, 0x18, 4);        /* matrix 0 */
-    psp_vtfm(0x04, 0x08, 0x00, 4);        /* matrix 1 */
+    psp_vtfm(0x00, 0x30, 0x18, 4);        /* matrix 0 = E400 * x */
+    psp_vtfm(0x04, 0x28, 0x00, 4);        /* matrix 1 = E200 * (B*x) */
     psp_vfpu_regs(0x04, 4, d);
     for (int i = 0; i < 4; i++)
         CHECK_F(psp_cpu.v[d[i]], combined[i],
