@@ -155,6 +155,7 @@ typedef struct {
     uint64_t prof_active_us;
     uint64_t prof_sleep_us;
     uint64_t prof_handover_us;
+    uint64_t prof_kind_parks[8];
 
     int terminated;               /* sceKernelTerminateThread asked for it */
     int delete_after;             /* sceKernelExitDeleteThread: free on the way out */
@@ -551,6 +552,7 @@ static void park_for(int kind, uint64_t timeout_us) {
             fprintf(stderr, "thread %u parks  : %s (virtual time %llu us)\n",
                     t->uid, wait_name(kind), (unsigned long long)g_vtime_us);
         t->last_wait_kind = (uint32_t)kind;
+        if (g_prof_tm > 0 && kind >= 0 && kind < 8) t->prof_kind_parks[kind]++;
     }
 #else
     (void)t; (void)kind;
@@ -703,10 +705,16 @@ void psp_threadman_dump(FILE *out) {
                 (unsigned long long)t->wakeups,
                 t->exited ? ", exited" : "");
         if (g_prof_tm > 0) {
-            fprintf(out, " [active=%.1fms sleep=%.1fms handover=%.1fms]",
+            fprintf(out, " [active=%.1fms sleep=%.1fms handover=%.1fms kinds:slp=%llu/dly=%llu/sem=%llu/flg=%llu/end=%llu/mtx=%llu]",
                     (double)t->prof_active_us / 1000.0,
                     (double)t->prof_sleep_us / 1000.0,
-                    (double)t->prof_handover_us / 1000.0);
+                    (double)t->prof_handover_us / 1000.0,
+                    (unsigned long long)t->prof_kind_parks[W_SLEEP],
+                    (unsigned long long)t->prof_kind_parks[W_DELAY],
+                    (unsigned long long)t->prof_kind_parks[W_SEMA],
+                    (unsigned long long)t->prof_kind_parks[W_FLAG],
+                    (unsigned long long)t->prof_kind_parks[W_THREAD_END],
+                    (unsigned long long)t->prof_kind_parks[W_MUTEX]);
         }
         fputc('\n', out);
     }
