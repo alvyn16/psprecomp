@@ -229,6 +229,16 @@ static int        g_front_h    = 0;
 static int        g_front_valid = 0;
 static int        g_presented_this_list = 0;
 
+static int      g_prof_gl = -1;
+static uint64_t g_prof_gl_draws = 0;
+static uint64_t g_prof_gl_tex_hits = 0;
+static uint64_t g_prof_gl_tex_misses = 0;
+static uint64_t g_prof_gl_tex_us = 0;
+static uint64_t g_prof_gl_draw_us = 0;
+static uint64_t g_prof_gl_read_us = 0;
+static uint64_t g_prof_gl_ctx_us = 0;
+static uint64_t prof_us(void) { return SDL_GetPerformanceCounter() * 1000000ull / SDL_GetPerformanceFrequency(); }
+
 static void (*gl_load_fn(const char *name))(void) {
     void *p = NULL;
 #ifdef __linux__
@@ -682,6 +692,7 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
             if (g_tex_cache[i].hash == hash && g_tex_cache[i].w == w &&
                 g_tex_cache[i].h == h && g_tex_cache[i].fmt == st->tex_fmt) {
                 g_tex_cache[i].last_use = g_tex_use_tick++;
+                if (g_prof_gl > 0) g_prof_gl_tex_hits++;
                 const GLint fil = psp_render_get_tex_filter() ? GL_LINEAR : GL_NEAREST;
                 g_gl.BindTexture(GL_TEXTURE_2D, g_tex_cache[i].tex);
                 g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fil);
@@ -702,6 +713,8 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
     }
 
     const int slot = (empty >= 0) ? empty : lru;
+    if (g_prof_gl > 0) g_prof_gl_tex_misses++;
+    uint64_t t0 = g_prof_gl > 0 ? prof_us() : 0;
     gl_tex_entry *e = &g_tex_cache[slot];
     if (!e->tex) g_gl.GenTextures(1, &e->tex);
 
@@ -735,6 +748,7 @@ static GLuint get_texture(const psp_draw_state *st, int *out_w, int *out_h) {
     e->h = h;
     e->fmt = st->tex_fmt;
     e->last_use = g_tex_use_tick++;
+    if (g_prof_gl > 0) g_prof_gl_tex_us += prof_us() - t0;
     return e->tex;
 }
 
@@ -811,6 +825,7 @@ static void capture_fbo_to_front(gl_fbo *f) {
     const int h = BASE_H * f->scale;
     if (w > BASE_W * MAX_SCALE || h > BASE_H * MAX_SCALE) return;
 
+    uint64_t rt0 = g_prof_gl > 0 ? prof_us() : 0;
     SDL_LockMutex(g_front_lock);
     g_gl.BindFramebuffer(GL_FRAMEBUFFER, f->fbo);
     g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -819,6 +834,7 @@ static void capture_fbo_to_front(gl_fbo *f) {
     g_front_h = h;
     g_front_valid = 1;
     SDL_UnlockMutex(g_front_lock);
+    if (g_prof_gl > 0) g_prof_gl_read_us += prof_us() - rt0;
 }
 
 static int gl_front_reader(uint32_t *dst_buf, uint32_t dst_cap_px,
@@ -969,6 +985,7 @@ static int gl_init(int width, int height) {
 
     g_front_valid = 0;
     g_presented_this_list = 0;
+    if (g_prof_gl < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_gl = (p && p[0] == '1') ? 1 : 0; }
     /* Release context from the init thread so guest pthread(s) can bind it cleanly. */
     release_context_current();
     psp_render_set_front_reader(gl_front_reader);
@@ -978,6 +995,16 @@ static int gl_init(int width, int height) {
 }
 
 static void gl_shutdown(void) {
+    if (g_prof_gl > 0) {
+        fprintf(stderr, "prof_gl(exit): draws=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
+                (unsigned long long)g_prof_gl_draws,
+                (unsigned long long)g_prof_gl_tex_hits,
+                (unsigned long long)g_prof_gl_tex_misses,
+                (double)g_prof_gl_tex_us / 1000.0,
+                (double)g_prof_gl_draw_us / 1000.0,
+                (double)g_prof_gl_read_us / 1000.0,
+                (double)g_prof_gl_ctx_us / 1000.0);
+    }
     psp_render_set_front_reader(NULL);
     if (g_ready && ensure_context_current() == 0) {
         drop_all_fbos();
@@ -1049,7 +1076,10 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         if (gl_init(BASE_W, BASE_H) != 0) return;
     }
     if (!v || count <= 0 || !st) return;
+    uint64_t dt0 = g_prof_gl > 0 ? prof_us() : 0;
+    uint64_t ct0 = dt0;
     if (ensure_context_current() != 0) return;
+    if (g_prof_gl > 0) { g_prof_gl_ctx_us += prof_us() - ct0; g_prof_gl_draws++; }
 
     gl_fbo *fb = get_or_create_fbo(g_cur_fb_addr, (int)g_cur_fb_stride, g_cur_fb_fmt);
     if (!fb) return;
@@ -1237,11 +1267,14 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
 
     fb->has_draws = 1;
     psp_render_add_pixels((uint64_t)emit_n * (uint64_t)S * (uint64_t)S);
+    if (g_prof_gl > 0) g_prof_gl_draw_us += prof_us() - dt0;
 }
 
 static void gl_finish(void) {
     if (!g_ready) return;
+    uint64_t ct0 = g_prof_gl > 0 ? prof_us() : 0;
     if (ensure_context_current() == 0) {
+        if (g_prof_gl > 0) g_prof_gl_ctx_us += prof_us() - ct0;
         /* For single-buffered games or tests that never call sceDisplaySetFrameBuf
          * every frame, copy once at GE_FINISH if we drew directly to front FB. */
         if (!g_presented_this_list) {
@@ -1252,7 +1285,23 @@ static void gl_finish(void) {
         }
         g_presented_this_list = 0;
         sync_scale_if_needed();
+        uint64_t rt0 = g_prof_gl > 0 ? prof_us() : 0;
         release_context_current();
+        if (g_prof_gl > 0) g_prof_gl_ctx_us += prof_us() - rt0;
+        if (g_prof_gl > 0) {
+            static uint64_t fin_n;
+            if ((++fin_n % 250u) == 0u) {
+                fprintf(stderr, "prof_gl(@%llu): draws=%llu tex_hits=%llu tex_misses=%llu tex_ms=%.1f draw_ms=%.1f read_ms=%.1f ctx_ms=%.1f\n",
+                        (unsigned long long)fin_n,
+                        (unsigned long long)g_prof_gl_draws,
+                        (unsigned long long)g_prof_gl_tex_hits,
+                        (unsigned long long)g_prof_gl_tex_misses,
+                        (double)g_prof_gl_tex_us / 1000.0,
+                        (double)g_prof_gl_draw_us / 1000.0,
+                        (double)g_prof_gl_read_us / 1000.0,
+                        (double)g_prof_gl_ctx_us / 1000.0);
+            }
+        }
     }
 }
 

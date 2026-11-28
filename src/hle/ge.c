@@ -31,6 +31,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static int      g_prof_ge = -1;
+static uint64_t g_prof_ge_ns = 0;
+
+static uint64_t ge_now_ns(void) {
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
 
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
  * named; everything else is counted rather than guessed at, because a
@@ -415,6 +429,8 @@ void psp_ge_dump_stats(FILE *out) {
     if (g_unsupported)
         fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                 (unsigned long long)g_unsupported);
+    if (g_prof_ge > 0)
+        fprintf(out, "prof_ge:   ge_ms=%.1f\n", (double)g_prof_ge_ns / 1000000.0);
 }
 
 uint64_t psp_ge_command_count(void) { return g_ge.commands; }
@@ -1039,7 +1055,10 @@ static void enqueue(int head) {
      * returning, which is indistinguishable from the game's point of view
      * because every way it can observe progress -- ListSync, DrawSync -- then
      * reports completion. */
+    if (g_prof_ge < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_ge = (p && p[0] == '1') ? 1 : 0; }
+    uint64_t t0 = g_prof_ge ? ge_now_ns() : 0;
     run_list(q);
+    if (g_prof_ge) g_prof_ge_ns += ge_now_ns() - t0;
     psp_ret(q->id);
 }
 
@@ -1057,7 +1076,12 @@ static void hle_ListUpdateStallAddr(void) {
         return;
     }
     q->stall = psp_arg(1) & ~3u;
-    if (!q->done) run_list(q);          /* the new stall released more commands */
+    if (!q->done) {
+        if (g_prof_ge < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_ge = (p && p[0] == '1') ? 1 : 0; }
+        uint64_t t0 = g_prof_ge ? ge_now_ns() : 0;
+        run_list(q);          /* the new stall released more commands */
+        if (g_prof_ge) g_prof_ge_ns += ge_now_ns() - t0;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

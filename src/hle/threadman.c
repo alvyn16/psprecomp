@@ -278,6 +278,10 @@ static uint64_t        g_baton_takes;      /* every acquisition, by anyone */
 #endif
 static uint64_t        g_handovers;        /* parks that handed the CPU over */
 static uint64_t        g_handovers_expired;
+static int             g_prof_tm = -1;
+static uint64_t        g_prof_sleep_us;
+static uint64_t        g_prof_handover_us;
+static uint64_t        g_prof_wait_us;
 
 /* Per host thread, so a nested park (an interrupt handler that waits) restores
  * its outer nesting on the way back. */
@@ -419,9 +423,11 @@ static int park_us(uint64_t timeout_us) {
         g_tls_depth = 0;
     }
 
+    if (g_prof_tm < 0) { const char *p = getenv("PSPRECOMP_PROFILE"); g_prof_tm = (p && p[0] == '1') ? 1 : 0; }
     int woken = 0;
     if (t) {
         uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+        uint64_t t0 = g_prof_tm ? host_deadline_us() : 0;
         host_mutex_lock(&t->wlock);
         if (!t->woken) {
             uint64_t dl = host_deadline_us() + real;
@@ -435,9 +441,11 @@ static int park_us(uint64_t timeout_us) {
         t->waiting = 0;
         t->wait_kind = W_NONE;
         host_mutex_unlock(&t->wlock);
+        if (g_prof_tm) g_prof_sleep_us += host_deadline_us() - t0;
     }
 
     if (depth) {
+        uint64_t h0 = g_prof_tm ? host_deadline_us() : 0;
         host_mutex_lock(&g_baton_m);
         /* The handover, before the CPU is taken back: a started thread that has
          * never run, or a host thread already queued for the baton, goes first.
@@ -446,7 +454,13 @@ static int park_us(uint64_t timeout_us) {
         int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
         int expired = 0;
         if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
+        uint64_t h1 = g_prof_tm ? host_deadline_us() : 0;
         while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
+        if (g_prof_tm) {
+            uint64_t h2 = host_deadline_us();
+            g_prof_handover_us += h1 - h0;
+            g_prof_wait_us += h2 - h1;
+        }
         g_baton_owned = 1;
         g_baton_takes++;
         g_switches++;
@@ -644,6 +658,15 @@ uint64_t psp_threadman_handovers(void)         { return g_handovers; }
 uint64_t psp_threadman_handover_expired(void)  { return g_handovers_expired; }
 
 void psp_threadman_dump(FILE *out) {
+    if (g_prof_tm > 0) {
+        fprintf(out, "prof_sched: parks=%llu sleep_ms=%.1f handover_ms=%.1f baton_wait_ms=%.1f handovers=%llu expired=%llu\n",
+                (unsigned long long)g_parks,
+                (double)g_prof_sleep_us / 1000.0,
+                (double)g_prof_handover_us / 1000.0,
+                (double)g_prof_wait_us / 1000.0,
+                (unsigned long long)g_handovers,
+                (unsigned long long)g_handovers_expired);
+    }
     fprintf(out, "CPU               : %s\n",
             g_current ? g_current->name : "(none)");
     for (int i = 0; i < MAX_THREADS; i++) {
