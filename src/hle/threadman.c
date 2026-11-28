@@ -287,6 +287,8 @@ static int             g_prof_tm = -1;
 static uint64_t        g_prof_sleep_us;
 static uint64_t        g_prof_handover_us;
 static uint64_t        g_prof_wait_us;
+static char            g_prof_mtx_name[32];
+static uint64_t        g_prof_mtx_parks;
 
 /* Per host thread, so a nested park (an interrupt handler that waits) restores
  * its outer nesting on the way back. */
@@ -680,13 +682,15 @@ uint64_t psp_threadman_handover_expired(void)  { return g_handovers_expired; }
 
 void psp_threadman_dump(FILE *out) {
     if (g_prof_tm > 0) {
-        fprintf(out, "prof_sched: parks=%llu sleep_ms=%.1f handover_ms=%.1f baton_wait_ms=%.1f handovers=%llu expired=%llu\n",
+        fprintf(out, "prof_sched: parks=%llu sleep_ms=%.1f handover_ms=%.1f baton_wait_ms=%.1f handovers=%llu expired=%llu top_mtx='%s'(%llu)\n",
                 (unsigned long long)g_parks,
                 (double)g_prof_sleep_us / 1000.0,
                 (double)g_prof_handover_us / 1000.0,
                 (double)g_prof_wait_us / 1000.0,
                 (unsigned long long)g_handovers,
-                (unsigned long long)g_handovers_expired);
+                (unsigned long long)g_handovers_expired,
+                g_prof_mtx_name,
+                (unsigned long long)g_prof_mtx_parks);
     }
     fprintf(out, "CPU               : %s\n",
             g_current ? g_current->name : "(none)");
@@ -1363,6 +1367,10 @@ static void hle_LockMutex(void) {
     if (rc != SCE_KERNEL_ERROR_MUTEX_LOCKED) { psp_ret(rc); return; }
 
     uint64_t timeout = timeout_ptr ? psp_read32(timeout_ptr) : 0;
+    if (g_prof_tm > 0) {
+        g_prof_mtx_parks++;
+        if (m->name[0]) { memcpy(g_prof_mtx_name, m->name, 31); g_prof_mtx_name[31] = '\0'; }
+    }
     struct mutex_ctx c = { m, self, count };
     rc = wait_loop(mutex_ready, &c, timeout, W_MUTEX, "sceKernelLockMutex", m->name);
     if (rc != SCE_KERNEL_ERROR_OK) { psp_ret(rc); return; }
